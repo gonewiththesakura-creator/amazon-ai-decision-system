@@ -1,0 +1,3 @@
+asin,sku,internalName,brand,title,marketName,marketplace,date,price,rating,reviewCount,bsr,estimatedSales,estimatedRevenue,sellerCount,growth7d,growth30d,growth90d,isOwned,monitoringEnabled,isEstimated,confidence
+B0EXAMPLE1,MF-001,示例护颈枕,Your Brand,Example Memory Foam Cervical Pillow,Memory Foam Pillow,US,2026-08-10,39.99,4.3,920,9200,1800,71982,1,-1.2,2.4,8.1,true,true,true,0.82
+B0EXAMPLE1,MF-001,示例护颈枕,Your Brand,Example Memory Foam Cervical Pillow,Memory Foam Pillow,US,2026-09-09,39.99,4.3,965,10400,1710,68382,1,-4.1,-5.0,1.9,true,true,true,0.82

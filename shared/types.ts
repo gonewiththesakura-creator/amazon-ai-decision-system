@@ -1,0 +1,625 @@
+export type DataMode = 'empty' | 'demo' | 'live';
+export type Role = 'admin' | 'viewer';
+export type TimeRange = '7D' | '30D' | '90D' | '180D' | '1Y';
+export type PerformanceLevel =
+  | 'insufficient_data'
+  | 'strong_outperform'
+  | 'outperform'
+  | 'in_line'
+  | 'underperform'
+  | 'strong_underperform';
+export type DecisionType = 'develop' | 'test' | 'watch' | 'reject';
+export type TaskStatus = 'pending' | 'running' | 'success' | 'partial' | 'failed';
+export type OpportunityStatus = 'pending_review' | 'researching' | 'promoted' | 'rejected';
+export type RelationType = 'direct' | 'top100' | 'benchmark' | 'fast_growth' | 'price_peer';
+
+export type ResearchJobType =
+  | 'existing_market'
+  | 'owned_product'
+  | 'adjacent_product'
+  | 'new_opportunity';
+export type ResearchJobStatus =
+  | 'draft'
+  | 'planned'
+  | 'collecting'
+  | 'normalizing'
+  | 'validating'
+  | 'calculating'
+  | 'analyzing'
+  | 'reverse_review'
+  | 'waiting_approval'
+  | 'approved'
+  | 'watch'
+  | 'rejected'
+  | 'monitoring'
+  | 'failed'
+  | 'needs_data';
+export type ResearchStepType =
+  | 'plan'
+  | 'collect_market'
+  | 'collect_products'
+  | 'collect_keywords'
+  | 'collect_reviews'
+  | 'normalize'
+  | 'validate'
+  | 'calculate'
+  | 'hard_gate'
+  | 'score'
+  | 'ai_analysis'
+  | 'review_gap'
+  | 'reverse_review'
+  | 'approval'
+  | 'snapshot'
+  | 'report';
+export type ResearchStepStatus =
+  | 'pending'
+  | 'running'
+  | 'completed'
+  | 'skipped'
+  | 'failed'
+  | 'needs_data';
+
+export interface Provenance {
+  source: string;
+  sourceType: 'mock' | 'import' | 'mcp' | 'amazon' | 'manual';
+  collectedAt: string;
+  period: string;
+  isEstimated: boolean;
+  confidence: number;
+}
+
+export interface EvidenceMetric {
+  name: string;
+  label: string;
+  value: number | string;
+  unit?: string;
+}
+
+export interface Evidence {
+  id: string;
+  claim: string;
+  metrics: EvidenceMetric[];
+  provenance: Provenance[];
+}
+
+export interface Insight {
+  id: string;
+  entityType: string;
+  entityId: string;
+  insightType: string;
+  status: string;
+  title: string;
+  summary: string;
+  score?: number;
+  facts: string[];
+  opportunities: string[];
+  risks: string[];
+  recommendedActions: string[];
+  evidence: Evidence[];
+  confidence: number;
+  model: string;
+  dataVersion: string;
+  generatedAt: string;
+  researchJobId?: string;
+  evidenceIds?: string[];
+  promptVersion?: string;
+  missingData?: string[];
+  possibleCauses?: string[];
+  hardGate?: 'pass' | 'reject' | 'needs_data';
+  decision?: 'develop' | 'test' | 'watch' | 'reject' | 'needs_data';
+}
+
+export interface MarketNode {
+  id: string;
+  name: string;
+  parentId: string | null;
+  level: number;
+  marketplace: string;
+  categoryId?: string;
+  keywords: string[];
+  status: string;
+  snapshotAvailable: boolean;
+  monthlySales: number | null;
+  monthlyRevenue: number | null;
+  growth30d: number | null;
+  growth30dAvailable: boolean;
+  productCount: number | null;
+  avgPrice: number | null;
+  competitionScore: number | null;
+  opportunityScore: number | null;
+  children?: MarketNode[];
+}
+
+export interface TrendPoint {
+  date: string;
+  sales: number | null;
+  revenue: number | null;
+  avgPrice: number | null;
+  productCount: number | null;
+  sellerCount: number | null;
+  medianReviews: number | null;
+}
+
+export interface MarketDetail {
+  node: MarketNode;
+  path: Array<{ id: string; name: string }>;
+  kpis: {
+    monthlySales: number | null;
+    monthlyRevenue: number | null;
+    productCount: number | null;
+    sellerCount: number | null;
+    brandCount: number | null;
+    avgPrice: number | null;
+    medianPrice: number | null;
+    top10Share: number | null;
+    top20Share: number | null;
+    newProductShare: number | null;
+    medianReviews: number | null;
+    avgRating: number | null;
+  };
+  trends: TrendPoint[];
+  tree: MarketNode[];
+  priceBands: Array<{
+    label: string;
+    productCount: number;
+    monthlySales: number;
+    revenue: number;
+    avgReviews: number;
+    newProducts: number;
+    growth: number;
+  }>;
+  concentration: Array<{ tier: string; share: number; avgPrice: number; avgSales: number }>;
+  insight: Insight;
+  provenance: Provenance;
+}
+
+export interface ProductSnapshot {
+  id: string;
+  snapshotAvailable: boolean;
+  productId: string;
+  date: string;
+  price: number | null;
+  rating: number | null;
+  reviewCount: number | null;
+  bsr: number | null;
+  estimatedSales: number | null;
+  estimatedRevenue: number | null;
+  sellerCount: number | null;
+  growth7d: number | null;
+  growth30d: number | null;
+  growth30dAvailable: boolean;
+  growth90d: number | null;
+  provenance: Provenance;
+}
+
+export interface Product {
+  id: string;
+  asin: string;
+  sku?: string;
+  internalName?: string;
+  brand: string;
+  title: string;
+  imageUrl: string;
+  marketplace: string;
+  productType: string;
+  isOwned: boolean;
+  marketNodeId: string;
+  marketPath?: Array<{ id: string; name: string }>;
+  keywords?: string[];
+  monitoringEnabled?: boolean;
+  latest: ProductSnapshot;
+}
+
+export interface OwnedProductSummary extends Product {
+  marketGrowth30d: number | null;
+  marketGrowth30dAvailable: boolean;
+  relativeDelta: number | null;
+  relativePerformanceAvailable: boolean;
+  performance: PerformanceLevel;
+  anomalyCount: number;
+  insight: Insight;
+}
+
+export interface Competitor extends Product {
+  relationType: RelationType;
+  similarityScore: number;
+  relationReason: string;
+  aiTags: string[];
+  relationCreatedAt: string;
+  lastVerifiedAt: string;
+}
+
+export interface OwnedProductDetail extends OwnedProductSummary {
+  snapshots: ProductSnapshot[];
+  percentiles: {
+    sales: number | null;
+    price: number | null;
+    reviews: number | null;
+    rating: number | null;
+    growth: number | null;
+  };
+  comparisons: {
+    market: { growth30d: number | null };
+    direct: { growth30d: number | null; sampleSize: number };
+    top20: { growth30d: number | null; sampleSize: number };
+  };
+  competitors: Competitor[];
+}
+
+export interface ScoreBreakdown {
+  demand: number;
+  growth: number;
+  competition: number;
+  newProductFriendly: number;
+  priceRoom: number;
+  concentration: number;
+  confidence: number;
+}
+
+export interface DevelopmentProject {
+  id: string;
+  marketNodeId: string;
+  name: string;
+  productType: string;
+  keywords: string[];
+  notes: string;
+  marketplace: string;
+  supplyChainRelation: string;
+  createdAt: string;
+  marketSize: number | null;
+  growth30d: number | null;
+  competitionScore: number | null;
+  opportunityScore: number | null;
+  status: DecisionType;
+  scoreBreakdown: ScoreBreakdown | null;
+  insight: Insight;
+  decision?: DecisionRecord;
+}
+
+export interface DecisionRecord {
+  id: string;
+  entityType: string;
+  entityId: string;
+  decision: DecisionType | 'approved' | 'needs_data';
+  reason: string;
+  aiInsightId: string;
+  dataVersion: string;
+  decidedBy: string;
+  decidedAt: string;
+  researchJobId?: string;
+  reverseReviewId?: string;
+  approvalId?: string;
+}
+
+export interface ResearchJobSummary {
+  id: string;
+  name: string;
+  type: ResearchJobType;
+  marketplace: string;
+  status: ResearchJobStatus;
+  entityType?: string;
+  entityId?: string;
+  ruleProfileId: string;
+  ruleProfileVersion: number;
+  isDemo: boolean;
+  createdBy: string;
+  dataVersion: string;
+  promptVersion: string;
+  missingDataCount: number;
+  createdAt: string;
+  updatedAt: string;
+  completedAt: string | null;
+  error: string | null;
+}
+
+export interface ResearchStep {
+  id: string;
+  researchJobId: string;
+  stepType: ResearchStepType;
+  status: ResearchStepStatus;
+  input: Record<string, unknown>;
+  output: Record<string, unknown>;
+  startedAt: string | null;
+  completedAt: string | null;
+  error: string | null;
+  retryCount: number;
+}
+
+export interface NormalizedField<T = unknown> {
+  value: T | null;
+  source: string;
+  sourceType: 'mock' | 'import' | 'mcp' | 'amazon' | 'manual';
+  collectedAt: string;
+  period: string;
+  originalUnit: string;
+  normalizedUnit: string;
+  isEstimated: boolean;
+  confidence: number;
+}
+
+export interface MissingDataItem {
+  id: string;
+  researchJobId: string;
+  fieldName: string;
+  label: string;
+  missingReason: string;
+  requiredForDecision: boolean;
+  manualValidationRequired: boolean;
+  status: 'open' | 'resolved' | 'waived';
+  resolvedValue?: unknown;
+  resolvedBy?: string;
+  resolvedAt?: string;
+  createdAt: string;
+}
+
+export interface WorkflowEvidence {
+  id: string;
+  researchJobId: string;
+  insightId?: string;
+  claim: string;
+  metricName: string;
+  metricValue: unknown;
+  source: string;
+  sourceType: 'mock' | 'import' | 'mcp' | 'amazon' | 'manual';
+  sourceRecordId?: string;
+  collectedAt: string;
+  period: string;
+  isEstimated: boolean;
+  calculation: string;
+  confidence: number;
+  dataVersion: string;
+}
+
+export interface RuleProfile {
+  id: string;
+  name: string;
+  version: number;
+  active: boolean;
+  jobTypes: ResearchJobType[];
+  hardGates: Record<string, unknown>;
+  scoring: Record<string, unknown>;
+  thresholds: Record<string, unknown>;
+  createdAt: string;
+}
+
+export interface RuleExecution {
+  id: string;
+  researchJobId: string;
+  ruleProfileId: string;
+  ruleVersion: number;
+  input: Record<string, unknown>;
+  output: Record<string, unknown>;
+  hardGateStatus: 'pass' | 'reject' | 'needs_data';
+  score: number | null;
+  dataVersion: string;
+  createdAt: string;
+}
+
+export interface ScoreResult {
+  id: string;
+  researchJobId: string;
+  ruleExecutionId: string;
+  total: number;
+  breakdown: {
+    demandQuality: number;
+    competitiveEntry: number;
+    profitAndCashEfficiency: number;
+    supplyChainFit: number;
+    riskControl: number;
+  };
+  calculation: Record<string, unknown>;
+  createdAt: string;
+}
+
+export interface ReverseReviewFailureMode {
+  risk: string;
+  severity: 'critical' | 'high' | 'medium' | 'low';
+  evidenceIds: string[];
+  resolved: boolean;
+  requiredAction: string;
+}
+
+export interface ReverseReview {
+  id: string;
+  researchJobId: string;
+  dataVersion: string;
+  ruleProfileId: string;
+  ruleProfileVersion: number;
+  promptVersion: string;
+  verdict: 'proceed' | 'proceed_with_caution' | 'needs_data' | 'reject';
+  topFailureModes: ReverseReviewFailureMode[];
+  unknowns: string[];
+  recommendation: string;
+  createdAt: string;
+}
+
+export interface ApprovalRecord {
+  id: string;
+  researchJobId: string;
+  dataVersion: string;
+  ruleProfileId: string;
+  ruleProfileVersion: number;
+  promptVersion: string;
+  reverseReviewId: string;
+  action: string;
+  status: 'pending' | 'approved' | 'watch' | 'needs_data' | 'rejected';
+  requestedBy: string;
+  requestedAt: string;
+  decidedBy?: string;
+  reason?: string;
+  decidedAt?: string;
+}
+
+export interface ReviewInsight {
+  id: string;
+  researchJobId: string;
+  issue: string;
+  frequency: number;
+  competitorsAffected: number;
+  isCrossMarketIssue: boolean;
+  supplyChainSolvable: boolean | null;
+  costImpact: string | null;
+  opportunityLevel: 'insufficient_evidence' | 'low' | 'medium' | 'high';
+  evidenceIds: string[];
+  dataVersion: string;
+  createdAt: string;
+}
+
+export interface ResearchJobDetail extends ResearchJobSummary {
+  input: Record<string, unknown>;
+  taskBook: Record<string, unknown>;
+  steps: ResearchStep[];
+  latestRuleExecution?: RuleExecution;
+  latestScoreResult?: ScoreResult;
+  latestInsight?: Insight;
+  reverseReview?: ReverseReview;
+  approval?: ApprovalRecord;
+  decision?: DecisionRecord;
+  reviewInsights: ReviewInsight[];
+}
+
+export interface ResearchNode extends MarketNode {
+  taskStatus: TaskStatus;
+}
+
+export interface Opportunity {
+  id: string;
+  name: string;
+  sourceType: string;
+  market: string;
+  opportunityScore: number;
+  marketGrowth: number;
+  competitionScore: number;
+  priceRoom: string;
+  recommendedAction: string;
+  status: OpportunityStatus;
+  summary: string;
+  evidence: Evidence[];
+  createdAt: string;
+  marketplace: string;
+  rejectionReason?: string;
+  decision?: DecisionRecord;
+}
+
+export interface ResearchResult {
+  id: string;
+  query: string;
+  summary: string;
+  nodes: ResearchNode[];
+  combinations: Array<{
+    name: string;
+    items: string[];
+    rationale: string;
+    fit: 'recommended' | 'watch' | 'avoid';
+  }>;
+  opportunities: Opportunity[];
+  tasksCreated: number;
+  generatedAt: string;
+  researchJobId?: string;
+  evidenceIds?: string[];
+  promptVersion?: string;
+}
+
+export interface WatchlistItem {
+  id: string;
+  itemType: string;
+  itemId: string;
+  name: string;
+  frequency: 'manual' | 'daily' | 'weekly';
+  status: 'active' | 'paused';
+  lastRunAt: string | null;
+  nextRunAt: string | null;
+  latestFinding: string;
+  anomaly: boolean;
+}
+
+export interface DataTask {
+  id: string;
+  name: string;
+  taskType: string;
+  target: string;
+  source: string;
+  marketplace: string;
+  status: TaskStatus;
+  startedAt: string | null;
+  completedAt: string | null;
+  total: number;
+  success: number;
+  failed: number;
+  errorLog: string | null;
+  researchJobId?: string;
+}
+
+export interface DataSource {
+  id: string;
+  name: string;
+  type: 'mock' | 'import' | 'mcp' | 'amazon' | 'manual';
+  status: 'connected' | 'disconnected' | 'needs_configuration';
+  lastSyncAt: string | null;
+  description: string;
+}
+
+export interface BriefingItem {
+  id: string;
+  severity: 'critical' | 'warning' | 'opportunity' | 'info';
+  category: string;
+  entityType: string;
+  entityId: string;
+  title: string;
+  summary: string;
+  metric: string;
+  action: string;
+  insight: Insight;
+}
+
+export interface DashboardData {
+  generatedAt: string;
+  briefing: BriefingItem[];
+  summaries: {
+    market: {
+      monthlyRevenue: number | null;
+      growth30d: number | null;
+      growth90d: number | null;
+      status: string;
+      snapshotAvailable: boolean;
+      growth30dAvailable: boolean;
+    };
+    skus: {
+      outperform: number;
+      inLine: number;
+      underperform: number;
+      anomalies: number;
+      analyzable: number;
+      pendingData: number;
+    };
+    development: {
+      watching: number;
+      recommended: number;
+      riskRising: number;
+      analyzable: number;
+      pendingData: number;
+    };
+    opportunities: { foundThisWeek: number; pending: number; pooled: number };
+  };
+  suggestedQuestions: string[];
+}
+
+export interface AppSettings {
+  mode: DataMode;
+  role: Role;
+  marketplace: string;
+  currency: string;
+  timezone: string;
+  defaultMarketId: string;
+  aiModel: string;
+  refreshFrequency: 'manual' | 'daily' | 'weekly';
+  lastSuccessfulSync: string | null;
+}
+
+export interface ApiResponse<T> {
+  data: T;
+  meta?: {
+    mode: DataMode;
+    generatedAt: string;
+  };
+}

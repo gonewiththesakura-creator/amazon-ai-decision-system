@@ -1,0 +1,18 @@
+{
+  "id": "amazon_owned_sku_relative_v1",
+  "name": "Amazon Owned SKU Relative Performance",
+  "version": 1,
+  "active": true,
+  "hardGates": {
+    "required": ["sku_growth_30d", "market_growth_30d", "market_growth_baseline"]
+  },
+  "scoring": {},
+  "thresholds": {
+    "strongOutperformMin": 10,
+    "outperformMin": 3,
+    "underperformMax": -3,
+    "strongUnderperformMax": -10,
+    "marketBaselineMinDays": 21,
+    "marketBaselineMaxDays": 45
+  }
+}

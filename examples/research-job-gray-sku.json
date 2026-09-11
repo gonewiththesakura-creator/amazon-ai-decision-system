@@ -1,0 +1,15 @@
+{
+  "name": "现有灰色枕头竞争诊断",
+  "type": "owned_product",
+  "entityType": "owned_product",
+  "entityId": "owned-sku-01",
+  "createdBy": "Acceptance Runner",
+  "input": {
+    "objective": "判断灰色枕头最近表现变化来自市场还是产品自身",
+    "keywords": [
+      "ergonomic pillow",
+      "cervical pillow"
+    ]
+  },
+  "taskBook": {}
+}

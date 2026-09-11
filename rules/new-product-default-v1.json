@@ -1,0 +1,64 @@
+{
+  "id": "amazon_us_new_product_default_v1",
+  "name": "Amazon New Product Default",
+  "version": 1,
+  "active": true,
+  "hardGates": {
+    "reject": {
+      "ipRisk": ["critical"],
+      "certificationAvailable": [false],
+      "contributionProfitBelowMinimum": true,
+      "moqBeyondBudget": true,
+      "logisticsCapabilityExceeded": true
+    },
+    "needsData": [
+      "ip_risk",
+      "certification_required",
+      "estimated_contribution_profit_rate",
+      "moq_cost",
+      "weight",
+      "dimensions",
+      "supply_chain_validation"
+    ]
+  },
+  "scoring": {
+    "demandQuality": {
+      "max": 25,
+      "components": [
+        {"field": "monthly_sales", "weight": 15, "direction": "higher", "min": 5000, "max": 50000},
+        {"field": "growth_30d", "weight": 10, "direction": "higher", "min": -5, "max": 20}
+      ]
+    },
+    "competitiveEntry": {
+      "max": 20,
+      "components": [
+        {"field": "top10_sales_share", "weight": 10, "direction": "lower", "min": 20, "max": 70},
+        {"field": "median_reviews", "weight": 10, "direction": "lower", "min": 100, "max": 1500}
+      ]
+    },
+    "profitAndCashEfficiency": {
+      "max": 25,
+      "components": [
+        {"field": "estimated_contribution_profit_rate", "weight": 15, "direction": "higher", "min": 10, "max": 35},
+        {"field": "moq_budget_ratio", "weight": 10, "direction": "lower", "min": 0.2, "max": 1}
+      ]
+    },
+    "supplyChainFit": {
+      "max": 15,
+      "components": [
+        {"field": "supply_chain_fit_score", "weight": 15, "direction": "higher", "min": 0, "max": 100}
+      ]
+    },
+    "riskControl": {
+      "max": 15,
+      "components": [
+        {"field": "risk_control_score", "weight": 15, "direction": "higher", "min": 0, "max": 100}
+      ]
+    }
+  },
+  "thresholds": {
+    "developMin": 80,
+    "testMin": 65,
+    "watchMin": 50
+  }
+}

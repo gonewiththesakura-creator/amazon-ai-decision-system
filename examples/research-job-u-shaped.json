@@ -1,0 +1,96 @@
+{
+  "name": "U 型记忆棉旅行枕开发决策",
+  "type": "adjacent_product",
+  "entityType": "development_project",
+  "entityId": "dev-travel",
+  "createdBy": "Acceptance Runner",
+  "input": {
+    "objective": "判断 U 型记忆棉旅行枕是否值得继续开发",
+    "keywords": [
+      "travel pillow",
+      "u shaped pillow"
+    ],
+    "ip_risk": "low",
+    "certification_required": false,
+    "estimated_contribution_profit_rate": 28,
+    "moq_cost": 6000,
+    "weight": 0.55,
+    "dimensions": {
+      "length": 30,
+      "width": 28,
+      "height": 12,
+      "unit": "cm"
+    },
+    "supply_chain_validation": true,
+    "monthly_sales": 48210,
+    "growth_30d": 6.8,
+    "top10_sales_share": 38,
+    "median_reviews": 1033,
+    "supply_chain_fit_score": 82,
+    "risk_control_score": 68,
+    "reviews": [
+      {
+        "reviewId": "u-review-01",
+        "productId": "competitor-u-01",
+        "text": "The pillow is too firm and presses against my neck.",
+        "rating": 2
+      },
+      {
+        "reviewId": "u-review-02",
+        "productId": "competitor-u-02",
+        "text": "Strong odor for the first several days and the cover is hard to clean.",
+        "rating": 2
+      },
+      {
+        "reviewId": "u-review-03",
+        "productId": "competitor-u-03",
+        "text": "Too firm for a long flight and the neck support feels narrow.",
+        "rating": 3
+      },
+      {
+        "reviewId": "u-review-04",
+        "productId": "competitor-u-04",
+        "text": "The package compressed the foam and there was a chemical smell.",
+        "rating": 2
+      }
+    ]
+  },
+  "taskBook": {
+    "marketplace": "US",
+    "category_scope": "Travel Pillows",
+    "product_idea": "可拆洗 U 型记忆棉旅行枕",
+    "price_range": {
+      "min": 24,
+      "max": 39,
+      "currency": "USD"
+    },
+    "total_budget": 30000,
+    "per_product_budget": 10000,
+    "min_profit_rate": 20,
+    "max_weight": 1,
+    "max_dimension": {
+      "length": 40,
+      "width": 35,
+      "height": 20,
+      "unit": "cm"
+    },
+    "allowed_materials": [
+      "memory foam",
+      "polyester cover"
+    ],
+    "supply_chain_capability": [
+      "foam molding",
+      "removable washable cover",
+      "compressed packaging"
+    ],
+    "prohibited_product_types": [
+      "medical claims",
+      "battery products"
+    ],
+    "compliance_tolerance": "low",
+    "seasonality_tolerance": "medium",
+    "target_customer": "长途飞机和火车出行用户",
+    "buyer_need": "支撑颈部、便携、低气味、可清洗",
+    "notes": "只批准下一阶段验证，不授权采购、付款或专利安全判断。"
+  }
+}

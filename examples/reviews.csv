@@ -1,0 +1,3 @@
+ReviewId,ProductId,ReviewText,Rating,Date,Marketplace
+review-example-01,B0COMP0001,"Too firm and presses against my neck.",2,2026-09-09,US
+review-example-02,B0COMP0002,"Strong odor for the first several days.",2,,US

@@ -1,0 +1,16 @@
+node_modules/
+dist/
+data/*.db
+data/*.db-*
+data/raw/*
+!data/raw/.gitkeep
+data/normalized/*
+!data/normalized/.gitkeep
+data/imports/*
+!data/imports/.gitkeep
+data/reports/*
+!data/reports/.gitkeep
+.env
+coverage/
+*.log
+.DS_Store

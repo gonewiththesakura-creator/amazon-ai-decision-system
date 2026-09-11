@@ -1,0 +1,32 @@
+{
+  "id": "amazon_us_memory_foam_market_v1",
+  "name": "Memory Foam Existing Market",
+  "version": 1,
+  "active": true,
+  "hardGates": {
+    "required": [
+      "monthly_sales",
+      "monthly_revenue",
+      "product_count",
+      "avg_price",
+      "median_reviews",
+      "top10_sales_share",
+      "top20_sales_share"
+    ]
+  },
+  "scoring": {
+    "demandMax": 20,
+    "growthMax": 20,
+    "competitionMax": 20,
+    "newProductFriendlyMax": 15,
+    "priceRoomMax": 10,
+    "concentrationMax": 10,
+    "confidenceMax": 5
+  },
+  "thresholds": {
+    "growthOpportunityMin": 5,
+    "highCompetitionMin": 70,
+    "marketBaselineMinDays": 21,
+    "marketBaselineMaxDays": 45
+  }
+}
