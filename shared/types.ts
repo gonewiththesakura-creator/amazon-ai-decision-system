@@ -604,6 +604,173 @@ export interface DashboardData {
   suggestedQuestions: string[];
 }
 
+export interface IndexedTrendPoint {
+  date: string;
+  index: number;
+}
+
+export interface IndexedTrendSeries {
+  id: string;
+  label: string;
+  kind: 'market' | 'owned_sku' | 'competitor_average';
+  points: IndexedTrendPoint[];
+}
+
+export type ExecutiveTrendSeries = IndexedTrendSeries;
+
+export interface ExecutiveDashboardKpis {
+  marketGrowth: number | null;
+  marketGrowthLabel: string;
+  outperformingSkus: number | null;
+  totalSkus: number;
+  attentionSkus: number | null;
+  fastGrowthCompetitors: number | null;
+}
+
+export interface ExecutiveSkuPerformance {
+  id: string;
+  name: string;
+  asin: string;
+  skuGrowth: number | null;
+  marketGrowth: number | null;
+  relativeDelta: number | null;
+  performance: PerformanceLevel;
+  label: '跑赢' | '同步' | '跑输' | '数据不足';
+  attention: boolean;
+}
+
+export interface ExecutiveDistributionItem {
+  label: string;
+  value: number;
+  productCount?: number;
+  monthlySales?: number;
+  revenue?: number;
+}
+
+export interface ExecutiveMarketDistribution {
+  concentration: ExecutiveDistributionItem[];
+  priceBands: ExecutiveDistributionItem[];
+}
+
+export interface ExecutiveCompetitorGrowth {
+  id: string;
+  name: string;
+  asin: string;
+  growth: number;
+  price: number | null;
+  rating: number | null;
+  reviews: number | null;
+  tags: string[];
+}
+
+export interface ExecutiveInsightEvidence {
+  claim: string;
+  metrics: Array<{
+    label: string;
+    value: number | string;
+    unit?: string;
+  }>;
+  sources: Provenance[];
+  calculation: string | null;
+}
+
+export interface ExecutiveInsightLineage {
+  dataVersion: string | null;
+  ruleProfileId: string | null;
+  ruleProfileVersion: number | null;
+  promptVersion: string | null;
+}
+
+export interface ExecutiveDailyInsight {
+  id: string;
+  type: 'risk' | 'opportunity' | 'competitor' | 'positive' | 'data_warning';
+  entityType: 'market' | 'owned_product' | 'development_project';
+  entityId: string;
+  entityName: string;
+  title: string;
+  summary: string;
+  evidence: ExecutiveInsightEvidence[];
+  lineage: ExecutiveInsightLineage;
+  researchJobHref: string | null;
+}
+
+export interface ExecutiveDevelopmentOpportunity {
+  id: string;
+  name: string;
+  status: 'scored' | 'needs_data' | 'rejected';
+  score: number | null;
+  hardGate: 'pass' | 'needs_data' | 'reject';
+  recommendation: 'develop' | 'test' | 'watch' | 'reject' | 'needs_data';
+}
+
+export interface ExecutiveResearchStatus {
+  key: 'recommend_develop' | 'small_test' | 'watch' | 'do_not_develop' | 'needs_data';
+  label: '建议开发' | '小规模验证' | '继续观察' | '暂不开发' | '待补数据';
+  count: number;
+}
+
+export interface ExecutiveDataStatus {
+  status: 'normal' | 'partial' | 'insufficient' | 'failed';
+  label: '正常' | '部分未更新' | '数据不足' | '同步失败';
+  message: string;
+  updatedAt: string | null;
+  isDemo: boolean;
+}
+
+export interface ExecutiveSkuFocusCompetitor {
+  id: string;
+  name: string;
+  asin: string;
+  growth: number | null;
+  price: number | null;
+  rating: number | null;
+  reviews: number | null;
+  estimatedSales: number | null;
+  tags: string[];
+}
+
+export interface ExecutiveSkuFocus {
+  sku: {
+    id: string;
+    name: string;
+    asin: string;
+    sku: string | null;
+  };
+  market: { id: string; name: string };
+  trendComparison: IndexedTrendSeries[];
+  operatingMetrics: {
+    estimatedSales: number | null;
+    estimatedRevenue: number | null;
+    price: number | null;
+    rating: number | null;
+    reviews: number | null;
+    bsr: number | null;
+    growth30d: number | null;
+    marketGrowth30d: number | null;
+    relativeDelta: number | null;
+  };
+  directCompetitors: ExecutiveSkuFocusCompetitor[];
+  insight: ExecutiveDailyInsight | null;
+  missingDataLabels: string[];
+}
+
+export interface ExecutiveDashboardViewModel {
+  generatedAt: string;
+  range: TimeRange;
+  marketplace: string;
+  market: { id: string; name: string } | null;
+  kpis: ExecutiveDashboardKpis;
+  trendComparison: IndexedTrendSeries[];
+  ownedSkuPerformance: ExecutiveSkuPerformance[];
+  marketDistribution: ExecutiveMarketDistribution;
+  fastGrowthCompetitors: ExecutiveCompetitorGrowth[];
+  dailyInsights: ExecutiveDailyInsight[];
+  developmentOpportunities: ExecutiveDevelopmentOpportunity[];
+  researchStatus: ExecutiveResearchStatus[];
+  dataStatus: ExecutiveDataStatus;
+  skuFocus: ExecutiveSkuFocus | null;
+}
+
 export interface AppSettings {
   mode: DataMode;
   role: Role;

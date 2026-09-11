@@ -257,6 +257,45 @@ summary:focus-visible {
   margin: 0 0 14px;
 }
 
+.nav-group--primary {
+  padding-bottom: 10px;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+}
+
+.nav-group__items {
+  display: grid;
+}
+
+.nav-group__toggle {
+  display: flex;
+  width: 100%;
+  min-height: 31px;
+  align-items: center;
+  justify-content: space-between;
+  padding: 7px 12px 5px;
+  color: #718580;
+  background: transparent;
+  border: 0;
+  font: inherit;
+  font-size: 10px;
+  font-weight: 700;
+  text-transform: uppercase;
+  cursor: pointer;
+}
+
+.nav-group__toggle:hover,
+.nav-group__toggle:focus-visible {
+  color: #bfd0cb;
+}
+
+.nav-group__toggle svg {
+  transition: transform 150ms ease;
+}
+
+.nav-group__toggle[aria-expanded="true"] svg {
+  transform: rotate(180deg);
+}
+
 .nav-group__label {
   display: block;
   padding: 7px 12px 5px;
@@ -400,7 +439,8 @@ summary:focus-visible {
   gap: 10px;
 }
 
-.topbar__left h1 {
+.topbar__page-name {
+  display: block;
   overflow: hidden;
   color: var(--ink);
   font-size: 16px;
@@ -2301,6 +2341,12 @@ button.metric {
 .comparison-legend strong { margin-left: auto; color: var(--ink); }
 .snapshot-footer { display: flex; align-items: center; gap: 5px; padding-top: 9px; color: var(--muted); border-top: 1px solid var(--line); font-size: 9px; }
 .competitor-section { overflow: hidden; }
+.competitor-section:focus,
+.competitor-table tbody tr[aria-current="true"]:focus {
+  outline: 3px solid var(--teal);
+  outline-offset: -3px;
+}
+.competitor-table tbody tr[aria-current="true"]:focus { background: var(--teal-soft); }
 .competitor-heading { display: flex; align-items: center; justify-content: space-between; gap: 16px; }
 .competitor-heading h2 { font-size: 17px; }
 .competitor-heading p { margin-top: 4px; color: var(--muted); font-size: 11px; }
@@ -2813,7 +2859,7 @@ button.metric {
   .has-demo-banner .app-column { padding-top: 40px; }
   .has-demo-banner .topbar { top: 40px; }
   .main-content { padding: 17px 12px 78px; }
-  .topbar__left h1 { max-width: 150px; }
+  .topbar__page-name { max-width: 150px; }
   .page-stack, .page { gap: 18px; }
   .page-heading h1, .page-header h1 { font-size: 21px; }
   .research-jobs-page > .page-header > div:first-child { width: 100%; min-width: 0; }

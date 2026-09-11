@@ -16,6 +16,7 @@ import { openDatabase, type AppDatabase } from './database/database.js';
 import { IntelligenceRepository } from './repository/intelligence-repository.js';
 import { WorkflowRepository } from './repository/workflow-repository.js';
 import { ImportService } from './services/import-service.js';
+import { ExecutiveDashboardService } from './services/executive-dashboard-service.js';
 import { IntelligenceService } from './services/intelligence-service.js';
 import { WorkflowOrchestrator } from './services/workflow-orchestrator.js';
 
@@ -116,6 +117,7 @@ export function createApp(options: CreateAppOptions = {}): express.Express {
   const service = new IntelligenceService(database);
   const repository = service.repository;
   const workflowRepository = new WorkflowRepository(database, repository);
+  const executiveDashboard = new ExecutiveDashboardService(database, repository, workflowRepository);
   const workflow = new WorkflowOrchestrator(database);
   const importer = new ImportService(database, new AdapterRegistry());
   const adminOnly = requireAdmin(repository);
@@ -163,6 +165,16 @@ export function createApp(options: CreateAppOptions = {}): express.Express {
   app.get('/api/data-sources', (_request, response) => sendData(response, repository.getDataSources(), repository));
 
   app.get('/api/dashboard/briefing', (_request, response) => sendData(response, service.getDashboard(), repository));
+  app.get('/api/dashboard/executive', (request, response) => {
+    const query = z.object({
+      range: z.enum(['7D', '30D', '90D', '180D', '1Y']).default('30D'),
+      skuId: z.string().trim().min(1).optional(),
+      marketplace: z.string().trim().min(1).optional(),
+    }).parse(request.query);
+    assertRequestedMarketplace(repository, query.marketplace);
+    if (query.skuId) requireOwnedProduct(repository, query.skuId);
+    sendData(response, executiveDashboard.getDashboard(query.range, query.skuId), repository);
+  });
 
   app.get('/api/markets', (_request, response) => sendData(response, repository.getMarkets(), repository));
   app.get('/api/markets/:id/snapshots', (request, response) => {

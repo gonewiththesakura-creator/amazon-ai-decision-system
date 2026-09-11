@@ -128,6 +128,42 @@ export class DeterministicAIService {
     if (/\bsku\s*[-:#]?\s*[a-z0-9][a-z0-9-]*\b/i.test(question) || /\bB0[A-Z0-9]{6,}\b/i.test(question)) {
       throw new Error('未找到问题中指定的 SKU 或 ASIN，请检查编号。');
     }
+    if (question.includes('竞品') || lower.includes('competitor')) {
+      const insight = this.repository.workflowRequiredInsight('dashboard', 'overview', '竞品增长');
+      return {
+        insight,
+        answer: '当前正式 Evidence 只支持竞品组均值，尚不能证明单个竞品的增长排名。',
+        cached: false,
+        formal: false,
+        notice: '请先运行包含单个竞品历史快照与 Evidence 的 Research Job。',
+      };
+    }
+    if (/今天.*(关注|重点)|今日.*(关注|重点)|最值得关注/.test(question)) {
+      const prioritized = [...owned].sort((left, right) => (
+        (left.relativeDelta ?? Number.POSITIVE_INFINITY)
+        - (right.relativeDelta ?? Number.POSITIVE_INFINITY)
+      ));
+      const product = prioritized.find((item) => (
+        this.repository.getCurrentWorkflowInsightForEntity('owned_product', item.id) !== null
+      ));
+      if (product) return this.answerFromWorkflow('owned_product', product.id);
+      const defaultMarket = this.repository.getSettings().defaultMarketId;
+      if (defaultMarket && this.repository.getCurrentWorkflowInsightForEntity('market', defaultMarket)) {
+        return this.answerFromWorkflow('market', defaultMarket);
+      }
+      const project = this.repository.getDevelopmentProjects().find((item) => (
+        this.repository.getCurrentWorkflowInsightForEntity('development_project', item.id) !== null
+      ));
+      if (project) return this.answerFromWorkflow('development_project', project.id);
+      const insight = this.repository.workflowRequiredInsight('dashboard', 'overview', '今日经营重点');
+      return {
+        insight,
+        answer: insight.summary,
+        cached: false,
+        formal: false,
+        notice: '当前没有可引用的正式工作流结论。',
+      };
+    }
     if (lower.includes('sku') || question.includes('跑输') || question.includes('最差')) {
       const underperforming = owned
         .filter((product) => product.relativeDelta !== null)
@@ -138,9 +174,18 @@ export class DeterministicAIService {
       const project = this.repository.getDevelopmentProjects().find((item) => item.productType.includes('lumbar'));
       if (project) return this.answerFromWorkflow('development_project', project.id);
     }
-    const defaultMarket = this.repository.getSettings().defaultMarketId;
-    if (defaultMarket) return this.answerFromWorkflow('market', defaultMarket);
-    throw new Error('当前没有可分析数据，请先进入 Demo 模式或导入快照。');
+    if (question.includes('市场') || question.includes('记忆棉') || lower.includes('market')) {
+      const defaultMarket = this.repository.getSettings().defaultMarketId;
+      if (defaultMarket) return this.answerFromWorkflow('market', defaultMarket);
+    }
+    const insight = this.repository.workflowRequiredInsight('dashboard', 'overview', '经营问答');
+    return {
+      insight,
+      answer: '当前 Evidence 无法回答这个问题。请指定市场、SKU、竞品或待开发方向，并先完成对应 Research Job。',
+      cached: false,
+      formal: false,
+      notice: '系统没有把无关的既有结论包装成该问题的答案。',
+    };
   }
 
   private answerFromWorkflow(entityType: string, entityId: string): AIAnalysisResult {

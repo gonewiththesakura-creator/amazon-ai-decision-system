@@ -1,5 +1,5 @@
-import { type FormEvent, useEffect, useMemo, useRef, useState } from 'react';
-import { Link, useNavigate, useParams } from 'react-router-dom';
+import { type FormEvent, useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { Link, useNavigate, useParams, useSearchParams } from 'react-router-dom';
 import {
   ArrowDown,
   ArrowUp,
@@ -162,6 +162,8 @@ function CompetitorTable({
   currency,
   canEdit,
   updatingId,
+  initialQuery,
+  focusCompetitorId,
   onReclassify,
   onRemove,
 }: {
@@ -169,14 +171,25 @@ function CompetitorTable({
   currency: string;
   canEdit: boolean;
   updatingId: string | null;
+  initialQuery?: string;
+  focusCompetitorId?: string;
   onReclassify: (competitor: Competitor, relationType: RelationType) => void;
   onRemove: (competitor: Competitor) => void;
 }) {
   const [relation, setRelation] = useState<RelationFilter>('all');
   const [growth, setGrowth] = useState<GrowthFilter>('all');
-  const [query, setQuery] = useState('');
+  const [query, setQuery] = useState(initialQuery ?? '');
   const [sortKey, setSortKey] = useState<SortKey>('sales');
   const [descending, setDescending] = useState(true);
+  const handledDeepLinkRef = useRef<string | null>(null);
+
+  useEffect(() => {
+    setQuery(initialQuery ?? '');
+    if (focusCompetitorId) {
+      setRelation('all');
+      setGrowth('all');
+    }
+  }, [focusCompetitorId, initialQuery]);
 
   const counts = useMemo(() => {
     const result: Record<RelationFilter, number> = { all: competitors.length, direct: 0, price_peer: 0, top100: 0, benchmark: 0, fast_growth: 0 };
@@ -198,13 +211,39 @@ function CompetitorTable({
       ) || a.asin.localeCompare(b.asin));
   }, [competitors, descending, growth, query, relation, sortKey]);
 
+  useEffect(() => {
+    if (!focusCompetitorId) handledDeepLinkRef.current = null;
+  }, [focusCompetitorId]);
+
+  const handleDeepLinkTarget = useCallback((target: HTMLElement | null) => {
+    if (!target || !focusCompetitorId || handledDeepLinkRef.current === focusCompetitorId) return;
+
+    handledDeepLinkRef.current = focusCompetitorId;
+    const reduceMotion = window.matchMedia?.('(prefers-reduced-motion: reduce)').matches ?? false;
+    target.focus({ preventScroll: true });
+    target.scrollIntoView?.({
+      behavior: reduceMotion ? 'auto' : 'smooth',
+      block: 'center',
+      inline: 'nearest',
+    });
+  }, [focusCompetitorId]);
+
+  const hasDeepLinkCompetitor = Boolean(
+    focusCompetitorId && competitors.some((item) => item.id === focusCompetitorId),
+  );
+
   const changeSort = (key: SortKey) => {
     if (key === sortKey) setDescending((value) => !value);
     else { setSortKey(key); setDescending(true); }
   };
 
   return (
-    <section className="competitor-section">
+    <section
+      ref={focusCompetitorId && !hasDeepLinkCompetitor ? handleDeepLinkTarget : undefined}
+      className="competitor-section"
+      aria-label="竞品筛选与列表"
+      tabIndex={-1}
+    >
       <div className="relation-tabs" aria-label="竞品分组">
         {relationOptions.map((option) => (
           <button type="button" key={option.value} className={relation === option.value ? 'is-active' : ''} onClick={() => setRelation(option.value)}>
@@ -244,8 +283,15 @@ function CompetitorTable({
               </tr>
             </thead>
             <tbody>
-              {filtered.map((item) => (
-                <tr key={`${item.id}:${item.relationType}`}>
+              {filtered.map((item) => {
+                const isDeepLinkTarget = item.id === focusCompetitorId;
+                return (
+                  <tr
+                    key={`${item.id}:${item.relationType}`}
+                    ref={isDeepLinkTarget ? handleDeepLinkTarget : undefined}
+                    aria-current={isDeepLinkTarget ? 'true' : undefined}
+                    tabIndex={isDeepLinkTarget ? -1 : undefined}
+                  >
                   <td>
                     <div className="product-cell">
                       <ProductImage src={item.imageUrl} alt={item.title} size="sm" />
@@ -264,8 +310,9 @@ function CompetitorTable({
                   <td><span className="similarity-value">{Math.round(item.similarityScore)}%</span></td>
                   <td><div className="tag-list">{item.aiTags.slice(0, 2).map((tag) => <span key={tag}>{tag}</span>)}</div></td>
                   {canEdit ? <td><div className="competitor-row-actions"><select aria-label={`调整 ${item.asin} 竞品分组`} value={item.relationType} disabled={updatingId !== null} onChange={(event) => onReclassify(item, event.target.value as RelationType)}>{relationOptions.filter((option) => option.value !== 'all').map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}</select><button className="icon-button" type="button" aria-label={`移除竞品 ${item.asin}`} title="移除竞品关系" disabled={updatingId !== null} onClick={() => onRemove(item)}>{updatingId === `${item.id}:${item.relationType}` ? <LoaderCircle className="spin" size={15} /> : <Trash2 size={15} />}</button></div></td> : null}
-                </tr>
-              ))}
+                  </tr>
+                );
+              })}
             </tbody>
           </table>
         </div>
@@ -279,6 +326,7 @@ function CompetitorTable({
 export default function OwnedProductsPage() {
   const { productId } = useParams<{ productId: string }>();
   const navigate = useNavigate();
+  const [searchParams] = useSearchParams();
   const { settings, loading: settingsLoading, refreshKey } = useApp();
   const previousMarketplace = useRef(settings.marketplace);
   const [tab, setTab] = useState<ProductTab>('performance');
@@ -290,13 +338,17 @@ export default function OwnedProductsPage() {
   const marketplaceQuery = encodeURIComponent(settings.marketplace);
   const listQuery = useApi<OwnedProductSummary[]>(settings.mode === 'empty' ? null : `/api/owned-products?marketplace=${marketplaceQuery}`, refreshKey);
   const selectedId = productId || listQuery.data?.[0]?.id || '';
+  const requestedTab = searchParams.get('tab');
+  const requestedCompetitorId = searchParams.get('competitor');
   const detailQuery = useApi<OwnedProductDetail>(selectedId ? `/api/owned-products/${encodeURIComponent(selectedId)}?marketplace=${marketplaceQuery}` : null, refreshKey);
 
   useEffect(() => {
     if (!productId && selectedId) navigate(`/owned-products/${selectedId}`, { replace: true });
   }, [navigate, productId, selectedId]);
 
-  useEffect(() => setTab('performance'), [selectedId]);
+  useEffect(() => {
+    setTab(requestedTab === 'competitors' || requestedTab === 'diagnosis' ? requestedTab : 'performance');
+  }, [requestedTab, selectedId]);
 
   useEffect(() => {
     if (previousMarketplace.current === settings.marketplace) return;
@@ -563,7 +615,16 @@ export default function OwnedProductsPage() {
             ) : <Badge tone="neutral">Viewer 只读</Badge>}
           </div>
           {competitorError && !showCompetitorForm ? <p className="form-error" role="alert">{competitorError}</p> : null}
-          <CompetitorTable competitors={detail.competitors} currency={settings.currency} canEdit={settings.role === 'admin'} updatingId={competitorUpdatingId} onReclassify={(competitor, relationType) => void reclassifyCompetitor(competitor, relationType)} onRemove={(competitor) => void removeCompetitor(competitor)} />
+          <CompetitorTable
+            competitors={detail.competitors}
+            currency={settings.currency}
+            canEdit={settings.role === 'admin'}
+            updatingId={competitorUpdatingId}
+            initialQuery={detail.competitors.find((item) => item.id === requestedCompetitorId)?.asin}
+            focusCompetitorId={requestedCompetitorId ?? undefined}
+            onReclassify={(competitor, relationType) => void reclassifyCompetitor(competitor, relationType)}
+            onRemove={(competitor) => void removeCompetitor(competitor)}
+          />
         </>
       ) : null}
 

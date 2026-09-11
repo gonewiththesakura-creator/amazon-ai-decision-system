@@ -1,4 +1,4 @@
-# Amazon AI Decision System V2
+# Amazon AI Decision System V2.1
 
 本地优先、可运行的 Amazon 经营研究与决策系统。V2 的核心不是页面数量，而是一条可重复、可恢复、可追溯的工作流：
 
@@ -7,7 +7,7 @@ Research Job -> Data -> Normalize -> Snapshot -> Rule -> AI Explanation
              -> Evidence -> Review Gap -> Reverse Review -> Approval -> Decision
 ```
 
-当前版本优先服务于记忆棉枕头市场和现有 4 个 SKU 的诊断，同时支持相邻产品与全新赛道的开发决策。
+当前版本优先服务于记忆棉枕头市场和现有 4 个 SKU 的诊断，同时支持相邻产品与全新赛道的开发决策。V2.1 将首页升级为图表优先的 AI 经营驾驶舱，并为日常经营复盘增加 SKU Focus、正式证据下钻和响应式移动视图。
 
 ## 本地运行
 
@@ -35,6 +35,12 @@ npm start
 
 ## 已实现
 
+- AI 经营驾驶舱：市场 30D、跑赢市场 SKU、需关注 SKU、高增长竞品四项经营 KPI，以及市场/4 SKU 指数趋势、市场结构、SKU 相对表现、竞品增长、开发机会、研究状态和数据新鲜度。
+- 驾驶舱支持 `7D`、`30D`、`90D`、`180D`、`1Y` 范围；每条有效趋势以范围内首个正数观测统一为 `100`，用于比较相对走势，不伪装成绝对体量。
+- SKU Focus：从相对表现图下钻单个 SKU，对比所属市场和直接竞品平均，集中查看经营指标、直接竞品 TOP5、正式 AI 判断与仍缺失的数据。
+- MarketPage 改为图表优先：先展示销量/销售额/平均价格趋势、价格带、集中度和细分市场机会，再提供完整市场树、TOP100 商品表、AI 判断和事实账本。
+- 顶栏“问 AI”只引用当前 Marketplace、当前版本的正式 ResearchJob/Rule/Evidence；证据抽屉展示指标、计算方法、来源时间及 data/rule/prompt 版本，并可回到对应研究任务。证据不足时明确拒绝形成正式结论。
+- 桌面侧栏与移动端底部导航自适应；抽屉/移动导航支持键盘焦点约束、`Escape` 关闭与焦点恢复，驾驶舱关键图表提供语义化数据表或文本明细，并适配减少动画偏好。
 - ResearchJob、ResearchStep 和集中式 Workflow Orchestrator；状态只能按状态机合法转换。
 - 现有市场、自有 SKU、相邻产品、全新机会四类研究任务。
 - 原始输入标准化、完整性校验、Missing Data Queue、可补数重试和 retry count。
@@ -129,6 +135,15 @@ DataSourceAdapter
   `- SellerSpriteMCPAdapter (stub)
 ```
 
+V2.1 驾驶舱聚合接口：
+
+```http
+GET /api/dashboard/executive?marketplace=US&range=30D
+GET /api/dashboard/executive?marketplace=US&range=30D&skuId=<owned-product-id>
+```
+
+`range` 只接受 `7D|30D|90D|180D|1Y`；`marketplace` 必须与当前工作区一致，`skuId` 必须是当前站点的自有 SKU。响应包含 KPI、指数趋势、结构分布、竞品增长、正式结论、开发/研究状态、数据状态和可选 SKU Focus。
+
 SQLite 默认位于 `data/opportunity-intelligence.db`，已被 `.gitignore` 排除。Migration 版本只向前推进并保留可验证的既有业务数据；当前 schema 为 V19。V14-V15 补齐审批版本链并用触发器强制 Decision 的完整工作流 lineage；V16-V19 将未知开发/市场指标改为 nullable、清理可精确识别且无 Evidence 的旧占位机会，并让已升级数据库收敛到相同语义。
 
 如需清空本地业务数据并重建 schema：
@@ -141,6 +156,7 @@ npm run db:reset
 
 ## 未实现
 
+- TOP100 商品缺少可信的上架日期或首次观测日期，因此“新品”排序在界面中禁用；系统不会根据 Review、销量或其他代理字段推断商品是否为新品。
 - SellerSprite MCP 真实连接：缺少账号、鉴权和正式 schema，目前为 Adapter stub。
 - 外部大模型调用：当前 `AI` 步骤使用可复现的 `rule-engine-v1` 生成结构化解释；`OPENAI_API_KEY` 仅为服务端预留。
 - 常驻 worker/scheduler：频率和任务记录已建模，当前由用户手动运行/重试。
@@ -150,6 +166,8 @@ npm run db:reset
 
 ## 质量检查
 
+交付前执行以下四项检查，并以当次命令输出为准。本次 V2.1 交付已完成全部检查：185 项全量测试通过，生产构建通过。
+
 ```powershell
 npm run lint
 npm run typecheck
@@ -157,4 +175,10 @@ npm test
 npm run build
 ```
 
-更多实现状态见 `CURRENT_STATE.md`，迁移记录与后续边界见 `V2_IMPLEMENTATION_PLAN.md`。
+## V2.1 截图
+
+- [AI 经营驾驶舱](artifacts/screenshots/v2.1-executive-dashboard.png)
+- [SKU Focus](artifacts/screenshots/v2.1-sku-focus.png)
+- [移动端驾驶舱](artifacts/screenshots/v2.1-mobile-dashboard.png)
+
+更多实现状态见 `CURRENT_STATE.md`，V2.1 交付说明见 `V2_1_IMPLEMENTATION_SUMMARY.md`，迁移记录与后续边界见 `V2_IMPLEMENTATION_PLAN.md`。

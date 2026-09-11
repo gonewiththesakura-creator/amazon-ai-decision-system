@@ -1,6 +1,6 @@
 # Current State
 
-记录时间：2026-09-11。本文描述 V2 完成后的仓库状态。
+记录时间：2026-09-11。本文描述 V2.1 完成后的仓库状态。
 
 ## 技术栈
 
@@ -11,7 +11,14 @@
 
 ## 产品能力
 
-- 今日简报、记忆棉市场、自有 SKU、待开发产品、新赛道实验室、机会池、研究任务、监控中心、数据任务和设置。
+- 首页为 AI 经营驾驶舱，按当前 Marketplace 聚合市场、现有 4 SKU、关联竞品、待开发项目、ResearchJob 和 DataTask；支持 `7D`、`30D`、`90D`、`180D`、`1Y` 时间范围。
+- 驾驶舱包括四项经营 KPI、市场与 4 SKU 指数趋势、市场集中度/价格带、SKU 相对表现、竞品增长 TOP10、正式 AI 今日判断、开发机会评分、产品研究状态和数据新鲜度。
+- 点击 SKU 相对表现进入 SKU Focus；该视图提供 SKU/市场/直接竞品平均趋势、九项当前经营指标、直接竞品 TOP5、正式结论和待补数据提示，并保留时间范围与 URL 状态。
+- MarketPage 使用图表优先的信息层级：趋势和市场结构先于明细表，并提供章节导航、空快照引导、来源/采集时间/可信度、细分机会排名、市场树、TOP100 与事实账本。
+- 顶栏“问 AI”支持建议问题和自由提问，但只把当前正式 ResearchJob 的 Insight/Evidence 作为正式回答；证据不足、问题歧义或竞品个体排名无证据时明确提示，不拿无关旧结论代答。
+- Dashboard Evidence 抽屉展示指标、计算方法、来源、采集时间、dataVersion、RuleProfile 及 Prompt 版本并链接到 ResearchJob；AI 问答证据视图同时展示 provenance、模型、dataVersion 和生成时间。
+- 桌面、平板和移动端均有响应式布局；移动端使用导航对话框与底部快捷导航。对话框支持焦点约束、`Escape`、焦点恢复和背景滚动锁定，驾驶舱关键图表提供可访问数据表或等价文本明细，并尊重 `prefers-reduced-motion`。
+- 除驾驶舱外，还包括记忆棉市场、自有 SKU、待开发产品、新赛道实验室、机会池、研究任务、监控中心、数据任务和设置。
 - 空数据库引导、明确标记的 Demo 模式、Admin/Viewer 本地权限预览、桌面和移动端布局。
 - 四类 ResearchJob：`existing_market`、`owned_product`、`adjacent_product`、`new_opportunity`。
 - 可查看步骤状态、数据版本、规则版本、Prompt 版本、缺失数据、Evidence、Review Gap、Reverse Review、Approval 和最终 Decision。
@@ -41,6 +48,7 @@
 
 ## 主要 API
 
+- `/api/dashboard/executive?marketplace=<current>&range=7D|30D|90D|180D|1Y[&skuId=<owned-product-id>]`
 - `/api/research-jobs` 及 `/:id/run|retry|approve|reject|steps|evidence|missing-data`
 - `/api/rules/profiles`
 - `/api/markets`、`/api/owned-products`、`/api/development-projects`、`/api/opportunities`
@@ -59,6 +67,7 @@
 
 ## 当前边界
 
+- TOP100 商品数据尚无可信的上架/首见日期；“新品”排序已禁用，不根据销量、Review 或标签推断新品身份。
 - SellerSprite MCP 没有真实账号/schema，只有显式 unavailable 的 Adapter stub；文件导入可用。
 - 外部 LLM 尚未接入，当前解释完全可重复；确定性指标始终由代码计算。
 - 常驻 scheduler/worker 尚未启用，监控和 DataTask 当前由人工触发。
@@ -73,4 +82,10 @@
 - Hard Gate 拒绝、不可降级 safety floor、严格输入域与 Evidence 当前版本引用：已覆盖。
 - Review Gap、Reverse Review、Approval、Decision：已覆盖。
 - 灰色 SKU 与 U 型枕两个 V2 端到端任务：已覆盖。
-- lint、typecheck、全量测试和生产 build：已通过；最终文件数和测试数以交付时命令输出为准。
+- 本轮 lint、typecheck、185 项全量测试和生产 build 已于 2026-09-11 通过；V2 专项验收集的 123 项测试同时通过。
+
+## V2.1 视觉验收
+
+- `artifacts/screenshots/v2.1-executive-dashboard.png`：桌面经营驾驶舱。
+- `artifacts/screenshots/v2.1-sku-focus.png`：单 SKU 聚焦视图。
+- `artifacts/screenshots/v2.1-mobile-dashboard.png`：移动端经营驾驶舱。
