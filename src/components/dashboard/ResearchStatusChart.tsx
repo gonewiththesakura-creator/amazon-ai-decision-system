@@ -15,12 +15,12 @@ export function ResearchStatusChart({ statuses }: ResearchStatusChartProps) {
   const maxCount = Math.max(1, ...visible.map((item) => item.count));
 
   return (
-    <ChartCard title="产品研究状态" eyebrow="RESEARCH OUTCOMES">
+    <ChartCard title="产品研究建议" eyebrow="SYSTEM RECOMMENDATIONS" description="仅统计系统建议，不混入人工审批结果。">
       {!visible.length ? (
-        <ChartEmptyState title="暂无产品研究状态" description="完成产品研究流程后展示决策状态分布。" />
+        <ChartEmptyState title="暂无产品研究建议" description="完成产品研究流程后展示系统建议分布。" />
       ) : visible.length <= 5 ? (
         <div className="dashboard-donut-layout dashboard-donut-layout--status">
-          <div className="dashboard-donut" aria-label="产品研究状态环形图">
+          <div className="dashboard-donut" aria-label="产品研究建议环形图">
             <ResponsiveContainer width="100%" height="100%">
               <PieChart>
                 <Pie data={visible} dataKey="count" nameKey="label" innerRadius="62%" outerRadius="88%" paddingAngle={2} stroke="#fff" strokeWidth={2} isAnimationActive={false}>
@@ -42,7 +42,7 @@ export function ResearchStatusChart({ statuses }: ResearchStatusChartProps) {
           </div>
         </div>
       ) : (
-        <div className="dashboard-status-bars" aria-label="产品研究状态水平条">
+        <div className="dashboard-status-bars" aria-label="产品研究建议水平条">
           {visible.map((item, index) => (
             <div key={item.key}>
               <span>{item.label}</span>

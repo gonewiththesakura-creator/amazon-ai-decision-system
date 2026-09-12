@@ -1,5 +1,5 @@
 import clsx from 'clsx';
-import { AlertTriangle, CheckCircle2, CircleHelp, RefreshCw } from 'lucide-react';
+import { AlertTriangle, CheckCircle2, CircleHelp, ClockAlert } from 'lucide-react';
 import { formatDashboardDate } from './format';
 import type { DataFreshnessState } from './types';
 
@@ -7,7 +7,7 @@ const stateMeta = {
   normal: { label: '数据正常', icon: CheckCircle2 },
   partial: { label: '部分数据未更新', icon: AlertTriangle },
   insufficient: { label: '数据不足', icon: CircleHelp },
-  failed: { label: '同步失败', icon: RefreshCw },
+  stale: { label: '数据陈旧', icon: ClockAlert },
 } satisfies Record<DataFreshnessState, { label: string; icon: typeof CheckCircle2 }>;
 
 export interface DataFreshnessBadgeProps {

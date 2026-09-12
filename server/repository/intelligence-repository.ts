@@ -923,6 +923,7 @@ export class IntelligenceRepository {
       name: stringValue(row.name),
       taskType: stringValue(row.task_type),
       target: stringValue(row.target),
+      sourceId: row.source_id === null ? null : stringValue(row.source_id),
       source: stringValue(row.source),
       marketplace: stringValue(row.marketplace, 'US'),
       status: stringValue(row.status) as DataTask['status'],
@@ -933,6 +934,7 @@ export class IntelligenceRepository {
       failed: numberValue(row.failed),
       errorLog: row.error_log === null ? null : stringValue(row.error_log),
       researchJobId: row.research_job_id === null ? undefined : stringValue(row.research_job_id),
+      createdAt: stringValue(row.created_at),
     };
   }
 }

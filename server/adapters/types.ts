@@ -1,14 +1,33 @@
-import type { Product, Provenance } from '../../shared/types.js';
+import type { MarketDetail, Product, ProductSnapshot, Provenance } from '../../shared/types.js';
+
+export interface MarketRefreshBaseline {
+  productCount: number | null;
+  sellerCount: number | null;
+  brandCount: number | null;
+  monthlySales: number | null;
+  monthlyRevenue: number | null;
+  avgPrice: number | null;
+  medianPrice: number | null;
+  avgRating: number | null;
+  medianReviews: number | null;
+  top10Share: number | null;
+  top20Share: number | null;
+  newProductShare: number | null;
+  priceBands: MarketDetail['priceBands'];
+  concentration: MarketDetail['concentration'];
+}
 
 export interface MarketInput {
   marketId?: string;
   marketplace: string;
   keywords: string[];
+  previousSnapshot?: MarketRefreshBaseline;
 }
 
 export interface ProductInput {
   asin: string;
   marketplace: string;
+  previousSnapshot?: ProductSnapshot;
 }
 
 export interface KeywordInput {
@@ -26,6 +45,11 @@ export interface MarketOverviewRecord {
   medianPrice: number;
   avgRating: number;
   medianReviews: number;
+  top10Share: number;
+  top20Share: number;
+  newProductShare: number;
+  priceBands: MarketDetail['priceBands'];
+  concentration: MarketDetail['concentration'];
   provenance: Provenance;
 }
 

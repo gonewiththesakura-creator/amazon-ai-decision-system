@@ -4,7 +4,6 @@ import type {
   ExecutiveCompetitorGrowth,
   ExecutiveDailyInsight,
   ExecutiveDashboardViewModel,
-  ExecutiveDataStatus,
   ExecutiveDevelopmentOpportunity,
   ExecutiveDistributionItem,
   ExecutiveMarketDistribution,
@@ -13,6 +12,8 @@ import type {
   ExecutiveSkuFocusCompetitor,
   ExecutiveSkuPerformance,
   IndexedTrendPoint,
+  IndexedTrendComparisonMeta,
+  IndexedTrendExcludedSeries,
   IndexedTrendSeries,
   Insight,
   MarketDetail,
@@ -26,6 +27,7 @@ import type {
 import type { AppDatabase } from '../database/database.js';
 import { IntelligenceRepository } from '../repository/intelligence-repository.js';
 import { WorkflowRepository } from '../repository/workflow-repository.js';
+import { DashboardFreshnessService } from './dashboard-freshness-service.js';
 
 export interface RawTrendPoint {
   date: string;
@@ -37,6 +39,10 @@ export interface RawTrendSeries {
   label: string;
   kind: IndexedTrendSeries['kind'];
   points: RawTrendPoint[];
+}
+
+export interface IndexedTrendComparisonResult extends IndexedTrendComparisonMeta {
+  series: IndexedTrendSeries[];
 }
 
 const RANGE_DAYS: Record<TimeRange, number> = {
@@ -55,7 +61,7 @@ const RESEARCH_STATUS_DEFINITIONS: ExecutiveResearchStatus[] = [
   { key: 'needs_data', label: '待补数据', count: 0 },
 ];
 
-/** Indexes a series against its first valid positive observation. */
+/** Standalone helper retained for non-comparative callers. Comparative charts use a shared baseline. */
 export function indexTrendSeries(points: RawTrendPoint[]): IndexedTrendPoint[] | null {
   const byDate = new Map<string, number>();
   for (const point of points) {
@@ -71,16 +77,21 @@ export function indexTrendSeries(points: RawTrendPoint[]): IndexedTrendPoint[] |
   const indexed = valid.slice(baseIndex).map((point) => ({
     date: point.date,
     index: round1(point.value / valid[baseIndex].value * 100),
+    relativeToMarket: null,
   }));
   return indexed.length >= 2 ? indexed : null;
 }
 
 export class ExecutiveDashboardService {
+  private readonly freshness: DashboardFreshnessService;
+
   constructor(
-    private readonly database: AppDatabase,
+    database: AppDatabase,
     private readonly intelligence: IntelligenceRepository,
     private readonly workflow: WorkflowRepository,
-  ) {}
+  ) {
+    this.freshness = new DashboardFreshnessService(database);
+  }
 
   getDashboard(range: TimeRange, skuId?: string): ExecutiveDashboardViewModel {
     const settings = this.intelligence.getSettings();
@@ -93,7 +104,7 @@ export class ExecutiveDashboardService {
       this.intelligence.getCurrentWorkflowInsightForEntity('owned_product', product.id),
     ]));
     const rawTrend = this.generalTrendSeries(market, owned);
-    const trendComparison = buildIndexedSeries(rawTrend, range);
+    const trendComparison = buildIndexedSeries(rawTrend, range, 'overview');
     const marketGrowth = market?.node.growth30dAvailable
       ? market.node.growth30d
       : null;
@@ -107,6 +118,18 @@ export class ExecutiveDashboardService {
       owned,
       formalOwnedInsights,
     );
+    const competitorProductIds = unique(owned.flatMap((product) => (
+      this.intelligence.getCompetitors(product.id)
+        .filter((competitor) => competitor.relationType === 'direct')
+        .map((competitor) => competitor.id)
+    )));
+    const freshness = this.freshness.getStatus({
+      marketplace: settings.marketplace,
+      mode: settings.mode,
+      marketId: market?.node.id ?? null,
+      ownedProductIds: owned.map((product) => product.id),
+      competitorProductIds,
+    });
 
     return {
       generatedAt: new Date().toISOString(),
@@ -125,14 +148,15 @@ export class ExecutiveDashboardService {
         )) ? ownedSkuPerformance.filter((item) => item.attention).length : null,
         fastGrowthCompetitors: fastGrowth.total,
       },
-      trendComparison,
+      trendComparison: trendComparison.series,
+      trendComparisonMeta: comparisonMeta(trendComparison),
       ownedSkuPerformance,
       marketDistribution: buildMarketDistribution(market),
       fastGrowthCompetitors: fastGrowth.items,
       dailyInsights,
       developmentOpportunities,
       researchStatus: buildResearchStatus(developmentOpportunities),
-      dataStatus: this.dataStatus(market, owned),
+      ...freshness,
       skuFocus: skuId ? this.skuFocus(skuId, range) : null,
     };
   }
@@ -290,101 +314,6 @@ export class ExecutiveDashboardService {
     }).sort(compareDevelopmentOpportunities);
   }
 
-  private dataStatus(
-    market: MarketDetail | null,
-    owned: OwnedProductSummary[],
-  ): ExecutiveDataStatus {
-    const settings = this.intelligence.getSettings();
-    const latestTask = this.database.prepare(`
-      SELECT status, started_at, completed_at, created_at
-      FROM data_tasks WHERE marketplace = ?
-      ORDER BY julianday(COALESCE(completed_at, started_at, created_at)) DESC, rowid DESC LIMIT 1
-    `).get(settings.marketplace) as {
-      status: string;
-      started_at: string | null;
-      completed_at: string | null;
-      created_at: string;
-    } | undefined;
-    const latestSuccessfulTask = this.database.prepare(`
-      SELECT started_at, completed_at, created_at
-      FROM data_tasks WHERE marketplace = ? AND status = 'success'
-      ORDER BY julianday(COALESCE(completed_at, started_at, created_at)) DESC, rowid DESC LIMIT 1
-    `).get(settings.marketplace) as {
-      started_at: string | null;
-      completed_at: string | null;
-      created_at: string;
-    } | undefined;
-    const latestCoreSnapshotAt = newestTimestamp([
-      market?.provenance.collectedAt,
-      ...owned
-        .filter((product) => product.latest.snapshotAvailable)
-        .map((product) => product.latest.provenance.collectedAt),
-    ].filter((value): value is string => Boolean(value)));
-    const latestSuccessfulTaskAt = latestSuccessfulTask
-      ? newestTimestamp([
-          latestSuccessfulTask.completed_at,
-          latestSuccessfulTask.started_at,
-          latestSuccessfulTask.created_at,
-        ].filter((value): value is string => Boolean(value)))
-      : null;
-    const updatedAt = newestTimestamp([
-      latestCoreSnapshotAt,
-      latestSuccessfulTaskAt,
-    ].filter((value): value is string => Boolean(value)));
-    const taskAt = latestTask
-      ? newestTimestamp([
-          latestTask.completed_at,
-          latestTask.started_at,
-          latestTask.created_at,
-        ].filter((value): value is string => Boolean(value)))
-      : null;
-    const taskIsNewer = Boolean(taskAt && (!updatedAt || dateTime(taskAt) >= dateTime(updatedAt)));
-    const marketReady = Boolean(market?.trends.some((point) => isUsableMetric(point.sales)));
-    const skuSnapshots = owned.filter((product) => (
-      product.latest.snapshotAvailable && isUsableMetric(product.latest.estimatedSales)
-    )).length;
-    const comparableSkus = owned.filter((product) => (
-      product.latest.growth30dAvailable && product.relativeDelta !== null
-    )).length;
-    const allCoreDataReady = marketReady && owned.length > 0
-      && skuSnapshots === owned.length && comparableSkus === owned.length;
-
-    if (latestTask?.status === 'failed' && taskIsNewer) {
-      return {
-        status: 'failed', label: '同步失败',
-        message: updatedAt
-          ? '最近一次同步失败，当前仍展示上一次合法快照。'
-          : '最近一次同步失败，当前还没有可展示的合法快照。',
-        updatedAt, isDemo: settings.mode === 'demo',
-      };
-    }
-    if (latestTask && ['partial', 'pending', 'running'].includes(latestTask.status) && taskIsNewer) {
-      return {
-        status: 'partial', label: '部分未更新',
-        message: '部分数据尚未更新，当前继续展示已完成校验的快照。',
-        updatedAt, isDemo: settings.mode === 'demo',
-      };
-    }
-    if (!marketReady || owned.length === 0 || skuSnapshots === 0 || comparableSkus === 0) {
-      return {
-        status: 'insufficient', label: '数据不足',
-        message: '市场或自有 SKU 缺少可用快照。',
-        updatedAt, isDemo: settings.mode === 'demo',
-      };
-    }
-    if (!allCoreDataReady) {
-      return {
-        status: 'partial', label: '部分未更新',
-        message: '部分 SKU 尚无可用快照，已保留其余合法数据。',
-        updatedAt, isDemo: settings.mode === 'demo',
-      };
-    }
-    return {
-      status: 'normal', label: '正常', message: '市场与自有 SKU 数据可用。',
-      updatedAt, isDemo: settings.mode === 'demo',
-    };
-  }
-
   private skuFocus(skuId: string, range: TimeRange): ExecutiveSkuFocus | null {
     const product = this.intelligence.getOwnedProduct(skuId);
     if (!product) return null;
@@ -420,6 +349,7 @@ export class ExecutiveDashboardService {
     const formalInsight = this.intelligence.getCurrentWorkflowInsightForEntity('owned_product', product.id);
     const currentJob = this.workflow.getCurrentResearchJobForEntity('owned_product', product.id);
     const missingDataLabels = this.focusMissingData(product, market, direct.length, currentJob);
+    const trendComparison = buildIndexedSeries(rawSeries, range, 'sku_focus');
     return {
       sku: {
         id: product.id,
@@ -431,7 +361,8 @@ export class ExecutiveDashboardService {
         id: market?.node.id ?? '',
         name: market?.node.name ?? '所属市场数据不可用',
       },
-      trendComparison: buildIndexedSeries(rawSeries, range),
+      trendComparison: trendComparison.series,
+      trendComparisonMeta: comparisonMeta(trendComparison),
       operatingMetrics: {
         estimatedSales: product.latest.estimatedSales,
         estimatedRevenue: product.latest.estimatedRevenue,
@@ -480,18 +411,180 @@ export class ExecutiveDashboardService {
   }
 }
 
-export function buildIndexedSeries(series: RawTrendSeries[], range: TimeRange): IndexedTrendSeries[] {
-  const anchor = newestTrendTime(series.flatMap((item) => item.points));
-  if (anchor === null) return [];
+type TrendComparisonContext = 'overview' | 'sku_focus';
+
+interface PreparedTrendSeries extends RawTrendSeries {
+  values: Map<string, number>;
+  baselineDates: string[];
+}
+
+export function buildIndexedSeries(
+  series: RawTrendSeries[],
+  range: TimeRange,
+  context: TrendComparisonContext = 'overview',
+): IndexedTrendComparisonResult {
+  const marketInput = series.find((item) => item.kind === 'market');
+  const anchor = newestTrendTime(marketInput?.points ?? []);
+  if (anchor === null) return emptyTrendComparison(series, 'insufficient_history');
   const cutoff = anchor - RANGE_DAYS[range] * 24 * 60 * 60 * 1_000;
-  return series.flatMap((item) => {
-    const points = item.points.filter((point) => {
+  const prepared = series.map((item): PreparedTrendSeries => {
+    const values = new Map<string, number>();
+    for (const point of item.points) {
       const time = dateTime(point.date);
-      return Number.isFinite(time) && time >= cutoff && time <= anchor;
-    });
-    const indexed = indexTrendSeries(points);
-    return indexed ? [{ id: item.id, label: item.label, kind: item.kind, points: indexed }] : [];
+      if (!Number.isFinite(time) || time < cutoff || time > anchor
+        || point.value === null || !Number.isFinite(point.value) || point.value < 0) continue;
+      values.set(observationDate(point.date), point.value);
+    }
+    const dates = [...values.keys()].sort(compareDates);
+    const baselineDates = dates.filter((date) => (
+      (values.get(date) ?? 0) > 0
+      && dates.filter((candidate) => compareDates(candidate, date) >= 0).length >= 2
+    ));
+    return { ...item, values, baselineDates };
   });
+  const eligible = prepared.filter((item) => item.baselineDates.length > 0);
+  const market = eligible.find((item) => item.kind === 'market');
+  if (!market) return emptyTrendComparisonFromPrepared(prepared);
+
+  let participants: PreparedTrendSeries[] = [];
+  let commonBaselineDate: string | null = null;
+  if (context === 'sku_focus') {
+    const sku = eligible.find((item) => item.kind === 'owned_sku');
+    if (!sku) return emptyTrendComparisonFromPrepared(prepared);
+    commonBaselineDate = firstCommonBaseline(eligible);
+    participants = commonBaselineDate ? eligible : [market, sku];
+    commonBaselineDate ??= firstCommonBaseline(participants);
+  } else {
+    const owned = eligible.filter((item) => item.kind === 'owned_sku');
+    if (owned.length < 2) return emptyTrendComparisonFromPrepared(prepared);
+    commonBaselineDate = firstCommonBaseline(eligible);
+    participants = commonBaselineDate ? eligible : [];
+    if (!commonBaselineDate) {
+      const best = bestOverviewCohort(market, owned);
+      if (best && best.series.length >= 3) {
+        commonBaselineDate = best.date;
+        participants = best.series;
+      }
+    }
+  }
+  if (!commonBaselineDate || participants.length === 0) {
+    return emptyTrendComparisonFromPrepared(prepared);
+  }
+
+  const marketIndexed = indexPreparedSeries(market, commonBaselineDate);
+  if (!marketIndexed) return emptyTrendComparisonFromPrepared(prepared);
+  const marketByDate = new Map(marketIndexed.points.map((point) => [point.date, point.index]));
+  const indexed = participants.flatMap((item) => {
+    const result = item.id === market.id ? marketIndexed : indexPreparedSeries(item, commonBaselineDate);
+    if (!result) return [];
+    return [{
+      ...result,
+      points: result.points.map((point) => ({
+        ...point,
+        relativeToMarket: item.kind === 'market' || !marketByDate.has(point.date)
+          ? null
+          : round1(point.index - marketByDate.get(point.date)!),
+      })),
+    }];
+  });
+  const participantIds = new Set(indexed.map((item) => item.id));
+  return {
+    series: indexed,
+    commonBaselineDate,
+    excludedSeries: prepared
+      .filter((item) => !participantIds.has(item.id))
+      .map((item) => ({
+        id: item.id,
+        label: item.label,
+        reason: item.baselineDates.length
+          ? 'no_common_baseline' as const
+          : 'insufficient_history' as const,
+      })),
+  };
+}
+
+function bestOverviewCohort(
+  market: PreparedTrendSeries,
+  owned: PreparedTrendSeries[],
+): { date: string; series: PreparedTrendSeries[] } | null {
+  return market.baselineDates
+    .map((date) => ({
+      date,
+      series: [
+        market,
+        ...owned.filter((item) => item.baselineDates.includes(date)),
+      ],
+    }))
+    .sort((left, right) => (
+      right.series.length - left.series.length || compareDates(left.date, right.date)
+    ))[0] ?? null;
+}
+
+function firstCommonBaseline(series: PreparedTrendSeries[]): string | null {
+  if (!series.length) return null;
+  return [...series[0].baselineDates]
+    .sort(compareDates)
+    .find((date) => series.every((item) => item.baselineDates.includes(date))) ?? null;
+}
+
+function indexPreparedSeries(
+  item: PreparedTrendSeries,
+  baselineDate: string,
+): IndexedTrendSeries | null {
+  const baseline = item.values.get(baselineDate);
+  if (baseline === undefined || baseline <= 0) return null;
+  const points = [...item.values.entries()]
+    .filter(([date]) => compareDates(date, baselineDate) >= 0)
+    .sort(([left], [right]) => compareDates(left, right))
+    .map(([date, value]) => ({
+      date,
+      index: round1(value / baseline * 100),
+      relativeToMarket: null,
+    }));
+  return points.length >= 2
+    ? { id: item.id, label: item.label, kind: item.kind, points }
+    : null;
+}
+
+function emptyTrendComparison(
+  series: RawTrendSeries[],
+  reason: IndexedTrendExcludedSeries['reason'],
+): IndexedTrendComparisonResult {
+  return {
+    series: [],
+    commonBaselineDate: null,
+    excludedSeries: series.map((item) => ({ id: item.id, label: item.label, reason })),
+  };
+}
+
+function emptyTrendComparisonFromPrepared(
+  series: PreparedTrendSeries[],
+): IndexedTrendComparisonResult {
+  return {
+    series: [],
+    commonBaselineDate: null,
+    excludedSeries: series.map((item) => ({
+      id: item.id,
+      label: item.label,
+      reason: item.baselineDates.length ? 'no_common_baseline' : 'insufficient_history',
+    })),
+  };
+}
+
+function comparisonMeta(result: IndexedTrendComparisonResult): IndexedTrendComparisonMeta {
+  return {
+    commonBaselineDate: result.commonBaselineDate,
+    excludedSeries: result.excludedSeries,
+  };
+}
+
+function observationDate(value: string): string {
+  const match = /^(\d{4}-\d{2}-\d{2})/.exec(value);
+  return match?.[1] ?? new Date(value).toISOString().slice(0, 10);
+}
+
+function compareDates(left: string, right: string): number {
+  return dateTime(left) - dateTime(right);
 }
 
 function buildMarketDistribution(market: MarketDetail | null): ExecutiveMarketDistribution {
@@ -560,37 +653,89 @@ function developmentOpportunity(
       && execution.ruleProfileId === job.ruleProfileId
       && execution.ruleVersion === job.ruleProfileVersion,
   );
-  const recommendation = researchRecommendation(job);
-  if (lineageValid && (execution?.hardGateStatus === 'reject' || job?.status === 'rejected'
-    || recommendation === 'reject')) {
+  const systemRecommendation = researchRecommendation(job, lineageValid);
+  const approval = approvalState(job, lineageValid, systemRecommendation);
+  if (lineageValid && execution?.hardGateStatus === 'reject') {
     return {
-      id: project.id, name: project.name, status: 'rejected', score: null,
-      hardGate: execution?.hardGateStatus ?? 'reject', recommendation: 'reject',
+      id: project.id,
+      name: project.name,
+      scoreStatus: 'rejected',
+      score: null,
+      hardGate: 'reject',
+      systemRecommendation: 'reject',
+      ...approval,
     };
   }
   if (lineageValid && execution?.hardGateStatus === 'pass' && score
     && score.ruleExecutionId === execution.id && Number.isFinite(score.total)) {
     return {
-      id: project.id, name: project.name, status: 'scored', score: score.total,
-      hardGate: 'pass', recommendation,
+      id: project.id,
+      name: project.name,
+      scoreStatus: 'scored',
+      score: score.total,
+      hardGate: 'pass',
+      systemRecommendation,
+      ...approval,
     };
   }
   return {
-    id: project.id, name: project.name, status: 'needs_data', score: null,
+    id: project.id,
+    name: project.name,
+    scoreStatus: 'needs_data',
+    score: null,
     hardGate: execution?.hardGateStatus === 'reject' ? 'reject' : 'needs_data',
-    recommendation: 'needs_data',
+    systemRecommendation: 'needs_data',
+    ...approvalState(job, lineageValid, 'needs_data'),
   };
 }
 
 function researchRecommendation(
   job: ResearchJobDetail | null,
-): ExecutiveDevelopmentOpportunity['recommendation'] {
-  const candidate = job?.approval?.status === 'approved'
-    ? job.approval.action
-    : 'watch';
-  return ['develop', 'test', 'watch', 'reject', 'needs_data'].includes(candidate ?? '')
-    ? candidate as ExecutiveDevelopmentOpportunity['recommendation']
-    : 'watch';
+  lineageValid: boolean,
+): ExecutiveDevelopmentOpportunity['systemRecommendation'] {
+  if (!job || !lineageValid) return 'needs_data';
+  const executionCandidate = job.latestRuleExecution?.output.suggestedDecision;
+  const insightCandidate = job.latestInsight?.dataVersion === job.dataVersion
+    ? job.latestInsight.decision
+    : undefined;
+  const candidate = executionCandidate ?? insightCandidate;
+  return typeof candidate === 'string'
+    && ['develop', 'test', 'watch', 'reject', 'needs_data'].includes(candidate)
+    ? candidate as ExecutiveDevelopmentOpportunity['systemRecommendation']
+    : 'needs_data';
+}
+
+function approvalState(
+  job: ResearchJobDetail | null,
+  lineageValid: boolean,
+  systemRecommendation: ExecutiveDevelopmentOpportunity['systemRecommendation'],
+): Pick<ExecutiveDevelopmentOpportunity, 'approvalStatus' | 'approvedAction'> {
+  const approval = lineageValid && approvalLineageMatches(job) ? job?.approval : undefined;
+  if (approval) {
+    return {
+      approvalStatus: approval.status === 'pending' ? 'waiting' : approval.status,
+      approvedAction: approval.status === 'approved' ? approval.action : null,
+    };
+  }
+  if (job?.status === 'waiting_approval' && lineageValid) {
+    return { approvalStatus: 'waiting', approvedAction: null };
+  }
+  if (job?.status === 'needs_data' || systemRecommendation === 'needs_data') {
+    return { approvalStatus: 'needs_data', approvedAction: null };
+  }
+  return { approvalStatus: 'not_required', approvedAction: null };
+}
+
+function approvalLineageMatches(job: ResearchJobDetail | null): boolean {
+  const approval = job?.approval;
+  return Boolean(
+    job
+    && approval
+    && approval.dataVersion === job.dataVersion
+    && approval.ruleProfileId === job.ruleProfileId
+    && approval.ruleProfileVersion === job.ruleProfileVersion
+    && approval.promptVersion === job.promptVersion,
+  );
 }
 
 function compareDevelopmentOpportunities(
@@ -598,7 +743,9 @@ function compareDevelopmentOpportunities(
   right: ExecutiveDevelopmentOpportunity,
 ): number {
   const rank = { scored: 0, needs_data: 1, rejected: 2 } as const;
-  if (rank[left.status] !== rank[right.status]) return rank[left.status] - rank[right.status];
+  if (rank[left.scoreStatus] !== rank[right.scoreStatus]) {
+    return rank[left.scoreStatus] - rank[right.scoreStatus];
+  }
   return compareNullableDescending(left.score, right.score);
 }
 
@@ -608,10 +755,10 @@ function buildResearchStatus(
   const counts = new Map(RESEARCH_STATUS_DEFINITIONS.map((item) => [item.key, 0]));
   for (const opportunity of opportunities) {
     let key: ExecutiveResearchStatus['key'];
-    if (opportunity.status === 'needs_data') key = 'needs_data';
-    else if (opportunity.status === 'rejected') key = 'do_not_develop';
-    else if (opportunity.recommendation === 'develop') key = 'recommend_develop';
-    else if (opportunity.recommendation === 'test') key = 'small_test';
+    if (opportunity.systemRecommendation === 'needs_data') key = 'needs_data';
+    else if (opportunity.systemRecommendation === 'reject') key = 'do_not_develop';
+    else if (opportunity.systemRecommendation === 'develop') key = 'recommend_develop';
+    else if (opportunity.systemRecommendation === 'test') key = 'small_test';
     else key = 'watch';
     counts.set(key, (counts.get(key) ?? 0) + 1);
   }
@@ -822,14 +969,6 @@ function newestTrendTime(points: RawTrendPoint[]): number | null {
     .map((point) => dateTime(point.date))
     .filter(Number.isFinite);
   return valid.length ? Math.max(...valid) : null;
-}
-
-function newestTimestamp(values: string[]): string | null {
-  return values.reduce<string | null>((latest, value) => {
-    if (!Number.isFinite(dateTime(value))) return latest;
-    if (!latest || dateTime(value) > dateTime(latest)) return value;
-    return latest;
-  }, null);
 }
 
 function dateTime(value: string): number {

@@ -366,11 +366,11 @@ export default function SettingsPage() {
 
     await reloadAppSettings();
     setBatchSaving(false);
-    if (failures === 0 && completed === 4) {
+    if (failures === 0 && completed === batchRows.length) {
       setShowBatchForm(false);
-      setNotice('4 个自有 SKU 已完成初始化，可以继续导入快照并建立竞品关系。');
+      setNotice(`${completed} 个自有 SKU 已完成初始化，可以继续导入快照并建立竞品关系。`);
     } else {
-      setNotice(`已完成 ${completed}/4 行；失败行已保留，可修正后再次提交。`);
+      setNotice(`已完成 ${completed}/${batchRows.length} 行；失败行已保留，可修正后再次提交。`);
     }
   }
 
@@ -481,9 +481,9 @@ export default function SettingsPage() {
 
           {tab === 'products' && (
             <section className="panel settings-section">
-              <div className="panel-header"><div><span className="eyebrow">Owned Products</span><h2>自有产品</h2><p>SKU 不写死在系统中，可按实际业务增减并关联 MarketNode。</p></div><button className="button button-primary" type="button" disabled={isViewer} onClick={() => products.length >= 4 ? openProductEditor() : openBatchForm()}><Plus size={16} />{products.length >= 4 ? '添加产品' : products.length ? '继续初始化 4 SKU' : '初始化 4 SKU'}</button></div>
+              <div className="panel-header"><div><span className="eyebrow">Owned Products</span><h2>自有产品</h2><p>SKU 不写死在系统中，可按实际业务增减并关联 MarketNode。</p></div><button className="button button-primary" type="button" disabled={isViewer} onClick={() => products.length >= 4 ? openProductEditor() : openBatchForm()}><Plus size={16} />{products.length >= 4 ? '添加产品' : products.length ? '继续批量初始化' : '批量初始化自有 SKU'}</button></div>
               {products.length === 0 ? (
-                <div className="empty-state compact"><PackagePlus size={27} /><h3>尚未录入自有 SKU</h3><p>使用四行向导一次初始化现有业务；每行独立保存，完成后再导入快照与设置竞品。</p><button className="button button-primary" type="button" disabled={isViewer} onClick={openBatchForm}><Plus size={16} />初始化现有 4 SKU</button></div>
+                <div className="empty-state compact"><PackagePlus size={27} /><h3>尚未录入自有 SKU</h3><p>使用批量向导初始化现有业务；每行独立保存，完成后再导入快照与设置竞品。</p><button className="button button-primary" type="button" disabled={isViewer} onClick={openBatchForm}><Plus size={16} />批量初始化自有 SKU</button></div>
               ) : (
                 <div className="data-table-wrap"><table className="data-table"><thead><tr><th>产品</th><th>ASIN / SKU</th><th>类型</th><th>Marketplace</th><th>市场节点</th><th>监控</th><th><span className="visually-hidden">管理</span></th></tr></thead><tbody>{products.map((product) => <tr key={product.id}><td><div className="product-cell"><ProductImage src={product.imageUrl} alt={product.title} size="sm" /><div><strong>{product.internalName || product.title}</strong><small>{product.brand}</small></div></div></td><td><span>{product.asin}</span><small>{product.sku || '未设置 SKU'}</small></td><td>{product.productType}</td><td>{product.marketplace}</td><td>{product.marketNodeId}</td><td><span className={`status-badge ${product.monitoringEnabled ? 'success' : 'neutral'}`}>{product.monitoringEnabled ? '已启用' : '未启用'}</span></td><td><div className="row-actions"><button className="icon-button" type="button" aria-label={`编辑 ${product.internalName || product.asin}`} title="编辑产品" disabled={isViewer || deletingProductId !== null} onClick={() => openProductEditor(product)}><Pencil size={15} /></button><button className="icon-button danger-text" type="button" aria-label={`删除 ${product.internalName || product.asin}`} title="删除产品" disabled={isViewer || deletingProductId !== null} onClick={() => void removeProduct(product)}>{deletingProductId === product.id ? <Loader2 className="spin" size={15} /> : <Trash2 size={15} />}</button></div></td></tr>)}</tbody></table></div>
               )}
@@ -560,7 +560,7 @@ export default function SettingsPage() {
       {showBatchForm && !isViewer && (
         <div className="modal-backdrop" role="presentation" onMouseDown={(event) => event.target === event.currentTarget && !batchSaving && setShowBatchForm(false)}>
           <form className="modal modal-batch-products" role="dialog" aria-modal="true" aria-labelledby="batch-products-title" onSubmit={(event) => void initializeProducts(event)}>
-            <div className="modal-header"><div><span className="eyebrow">OWNED BUSINESS SETUP</span><h2 id="batch-products-title">初始化现有 4 SKU</h2><p>当前站点：Amazon {appSettings.marketplace}。成功行会保留，失败行可单独修正后重试。</p></div><button className="icon-button" type="button" aria-label="关闭" disabled={batchSaving} onClick={() => setShowBatchForm(false)}><X size={18} /></button></div>
+            <div className="modal-header"><div><span className="eyebrow">OWNED BUSINESS SETUP</span><h2 id="batch-products-title">批量初始化自有 SKU</h2><p>当前站点：Amazon {appSettings.marketplace}。成功行会保留，失败行可单独修正后重试。</p></div><button className="icon-button" type="button" aria-label="关闭" disabled={batchSaving} onClick={() => setShowBatchForm(false)}><X size={18} /></button></div>
             <div className="batch-product-list">
               {batchRows.map((row, index) => (
                 <fieldset className={`batch-product-row batch-product-row--${row.status}`} key={row.rowKey} disabled={batchSaving || row.status === 'success'}>

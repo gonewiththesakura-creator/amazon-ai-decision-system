@@ -29,6 +29,21 @@
   font-size: 11px;
 }
 
+.executive-dashboard-header__missing-market {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.executive-dashboard-header__missing-market a {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  color: var(--teal);
+  font-weight: 700;
+}
+
 .executive-dashboard-header__meta {
   display: flex;
   min-width: 0;
@@ -51,6 +66,24 @@
   font-size: 11px;
   white-space: nowrap;
 }
+
+.executive-system-sync {
+  display: inline-flex;
+  min-height: 30px;
+  align-items: center;
+  gap: 5px;
+  padding: 0 8px;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  background: var(--surface);
+  color: var(--muted);
+  font-size: 10px;
+}
+
+.executive-system-sync:hover { background: var(--surface-soft); }
+.executive-system-sync--failed { color: var(--red); }
+.executive-system-sync--partial,
+.executive-system-sync--running { color: var(--amber); }
 
 .executive-dashboard-grid {
   display: grid;
@@ -110,7 +143,8 @@
 
   .executive-dashboard-header__meta > span,
   .executive-dashboard-header__meta > .executive-segmented-control,
-  .executive-dashboard-header__meta > .executive-data-state {
+  .executive-dashboard-header__meta > .executive-data-state,
+  .executive-dashboard-header__meta > .executive-system-sync {
     width: 100%;
   }
 

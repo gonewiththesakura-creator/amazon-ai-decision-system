@@ -7,9 +7,10 @@ function result(status: FileImportResult['task']['status'], successCount: number
     batchId: 'batch', entityType: 'product', rowCount: successCount + failureCount,
     successCount, failureCount, errors: failureCount ? ['第 2 行字段无效'] : [],
     task: {
-      id: 'task', name: 'import', taskType: 'file_import', target: 'file.csv', source: 'Amazon',
+      id: 'task', name: 'import', taskType: 'file_import', target: 'file.csv',
+      sourceId: 'source-amazon-import', source: 'Amazon',
       marketplace: 'US', status, startedAt: null, completedAt: null, total: successCount + failureCount,
-      success: successCount, failed: failureCount, errorLog: null,
+      success: successCount, failed: failureCount, errorLog: null, createdAt: '2026-09-12T00:00:00Z',
     },
   };
 }

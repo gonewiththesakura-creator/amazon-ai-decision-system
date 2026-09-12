@@ -11,6 +11,8 @@ import type {
   Insight,
   Opportunity,
   Product,
+  ProductSnapshot,
+  Provenance,
   RelationType,
   ResearchJobDetail,
   ResearchNode,
@@ -18,7 +20,12 @@ import type {
   ScoreBreakdown,
   WatchlistItem,
 } from '../../shared/types.js';
-import { MockAdapter } from '../adapters/mock-adapter.js';
+import { AdapterRegistry, DataSourceRouter } from '../adapters/index.js';
+import type {
+  MarketDataAdapter,
+  MarketOverviewRecord,
+  ProductDetailRecord,
+} from '../adapters/types.js';
 import { disableDemoMode, seedDemoData } from '../database/demo-seed.js';
 import type { AppDatabase } from '../database/database.js';
 import { transaction } from '../database/database.js';
@@ -26,8 +33,6 @@ import { calculateMarketOpportunityMetrics, calculateOpportunityScore } from '..
 import { IntelligenceRepository } from '../repository/intelligence-repository.js';
 import { WorkflowRepository } from '../repository/workflow-repository.js';
 import { DeterministicAIService } from './ai-service.js';
-
-type SqlRow = Record<string, string | number | bigint | null>;
 
 export interface OwnedProductInput {
   asin: string;
@@ -70,9 +75,11 @@ export class IntelligenceService {
   readonly repository: IntelligenceRepository;
   readonly ai: DeterministicAIService;
   private readonly workflowRepository: WorkflowRepository;
-  private readonly mockAdapter = new MockAdapter();
 
-  constructor(private readonly database: AppDatabase) {
+  constructor(
+    private readonly database: AppDatabase,
+    private readonly dataSourceRouter = new DataSourceRouter(new AdapterRegistry()),
+  ) {
     this.repository = new IntelligenceRepository(database);
     this.ai = new DeterministicAIService(this.repository);
     this.workflowRepository = new WorkflowRepository(database, this.repository);
@@ -356,8 +363,16 @@ export class IntelligenceService {
     const expandedKeywords = expandDevelopmentKeywords(input);
     const id = randomUUID();
     const now = new Date().toISOString();
-    const metrics = settings.mode === 'demo'
-      ? await this.mockAdapter.fetchMarketOverview({ marketplace, keywords: expandedKeywords })
+    const demoAdapter = settings.mode === 'demo'
+      ? this.dataSourceRouter.resolve({
+        taskType: 'development_research',
+        entityType: 'development_project',
+        marketplace,
+        mode: settings.mode,
+      })
+      : null;
+    const metrics = demoAdapter
+      ? await demoAdapter.fetchMarketOverview({ marketplace, keywords: expandedKeywords })
       : null;
     const breakdown = metrics
       ? deterministicBreakdown(`${input.name}:${input.keywords.join('|')}`)
@@ -387,7 +402,8 @@ export class IntelligenceService {
       const recomputed = this.recomputeDevelopmentProjectMetrics(id);
       this.createDataTaskRecord({
         name: `${input.name} 市场研究`, taskType: 'development_research', target: id,
-        source: settings.mode === 'demo' ? this.mockAdapter.name : '待配置数据源',
+        source: demoAdapter?.name ?? '待配置数据源',
+        sourceId: demoAdapter?.id,
         status: settings.mode === 'demo' || recomputed ? 'success' : 'pending',
         total: settings.mode === 'demo' || recomputed ? 1 : 0,
         success: settings.mode === 'demo' || recomputed ? 1 : 0,
@@ -395,7 +411,8 @@ export class IntelligenceService {
       if (!linkedMarket) {
         research.nodeIds.forEach((nodeId) => this.createDataTaskRecord({
           name: `${input.name} 节点数据采集`, taskType: 'development_market_research', target: nodeId,
-          source: settings.mode === 'demo' ? this.mockAdapter.name : '待配置数据源',
+          source: demoAdapter?.name ?? '待配置数据源',
+          sourceId: demoAdapter?.id,
           status: settings.mode === 'demo' ? 'success' : 'pending',
           total: settings.mode === 'demo' ? 1 : 0, success: settings.mode === 'demo' ? 1 : 0,
         }));
@@ -491,6 +508,14 @@ export class IntelligenceService {
     const id = randomUUID();
     const now = new Date().toISOString();
     const hasDemoData = settings.mode === 'demo';
+    const demoAdapter = hasDemoData
+      ? this.dataSourceRouter.resolve({
+        taskType: 'opportunity_research',
+        entityType: 'opportunity',
+        marketplace: settings.marketplace,
+        mode: settings.mode,
+      })
+      : null;
     const labels = researchLabels(query);
     const nodes: ResearchNode[] = labels.map((name, index) => {
       const key = `${query}:${index}`;
@@ -581,7 +606,8 @@ export class IntelligenceService {
       nodes.forEach((node) => {
         this.createDataTaskRecord({
           name: `${node.name} 数据任务`, taskType: 'opportunity_research', target: node.id,
-          source: hasDemoData ? this.mockAdapter.name : '待配置数据源',
+          source: demoAdapter?.name ?? '待配置数据源',
+          sourceId: demoAdapter?.id,
           status: hasDemoData ? 'success' : 'pending', total: hasDemoData ? 1 : 0,
           success: hasDemoData ? 1 : 0,
         });
@@ -780,12 +806,13 @@ export class IntelligenceService {
     taskType?: string;
     target?: string;
     source?: string;
+    sourcePreference?: string;
     watchlistId?: string;
     retryTaskId?: string;
   }): Promise<DataTask> {
     let taskType = input.taskType ?? 'manual_refresh';
     let target = input.target ?? '';
-    let source = input.source ?? this.mockAdapter.name;
+    let sourcePreference = input.sourcePreference ?? input.source;
     if (input.retryTaskId) {
       const previous = this.repository.getDataTask(input.retryTaskId);
       if (!previous) throw new Error('要重试的任务不存在。');
@@ -798,30 +825,43 @@ export class IntelligenceService {
       }
       taskType = previous.taskType;
       target = previous.target;
-      source = previous.source;
+      sourcePreference = previous.sourceId ?? previous.source;
     }
+    let watchItem: WatchlistItem | undefined;
     if (input.watchlistId) {
-      const item = this.repository.getWatchlist().find((candidate) => candidate.id === input.watchlistId);
-      if (!item) throw new Error('监控项不存在。');
-      target = item.itemId;
+      watchItem = this.repository.getWatchlist().find((candidate) => candidate.id === input.watchlistId);
+      if (!watchItem) throw new Error('监控项不存在。');
+      target = watchItem.itemId;
+    } else if (target) {
+      watchItem = this.repository.getWatchlist().find((candidate) => candidate.itemId === target);
     }
-    const mode = this.repository.getSettings().mode;
-    if (mode === 'demo' && /^configured[_\s-]?adapter$/i.test(source)) {
-      source = this.mockAdapter.name;
+    const settings = this.repository.getSettings();
+    let adapter: MarketDataAdapter | null = null;
+    let routeError: unknown;
+    try {
+      adapter = this.dataSourceRouter.resolve({
+        taskType,
+        entityType: watchItem?.itemType ?? this.refreshEntityType(taskType, target),
+        sourcePreference,
+        marketplace: settings.marketplace,
+        mode: settings.mode,
+      });
+    } catch (error) {
+      routeError = error;
     }
     const taskId = this.createDataTaskRecord({
-      name: `${taskType}: ${target || '全部'}`, taskType, target: target || 'all', source,
+      name: `${taskType}: ${target || '全部'}`,
+      taskType,
+      target: target || 'all',
+      source: adapter?.name ?? 'DataSourceRouter',
+      sourceId: adapter?.id ?? null,
       status: 'running', total: 0, success: 0,
     });
     const startedAt = new Date().toISOString();
     try {
-      if (mode !== 'demo') {
-        throw new Error('当前未连接可执行刷新的真实数据 Adapter；本次未写入任何 Mock 快照。');
-      }
-      if (/seller\s*sprite|mcp/i.test(source) && !/mock/i.test(source)) {
-        throw new Error('SellerSprite MCP 尚未配置可用账号连接。');
-      }
-      const refreshed = await this.refreshTarget(target, input.watchlistId);
+      if (routeError) throw routeError;
+      if (!adapter) throw new Error('当前任务没有可用真实数据源，请先配置数据源。');
+      const refreshed = await this.refreshTarget(taskType, target, input.watchlistId, adapter);
       const completedAt = new Date().toISOString();
       this.database.prepare(`
         UPDATE data_tasks SET status = 'success', started_at = ?, completed_at = ?,
@@ -830,8 +870,14 @@ export class IntelligenceService {
       this.database.prepare(`
         UPDATE app_settings SET last_successful_sync = ? WHERE id = 1
       `).run(completedAt);
+      this.database.prepare(`
+        UPDATE data_sources SET last_sync_at = ? WHERE id = ?
+      `).run(completedAt, adapter.id);
     } catch (error) {
-      const message = error instanceof Error ? error.message : '未知刷新错误';
+      const rawMessage = error instanceof Error ? error.message : '未知刷新错误';
+      const message = settings.mode === 'demo' || /未写入任何 Mock/.test(rawMessage)
+        ? rawMessage
+        : `${rawMessage} 本次未写入任何 Mock 快照。`;
       this.database.prepare(`
         UPDATE data_tasks SET status = 'failed', started_at = ?, completed_at = ?,
           total = 1, success = 0, failed = 1, error_log = ? WHERE id = ?
@@ -1108,13 +1154,16 @@ export class IntelligenceService {
     taskType: string;
     target: string;
     source: string;
+    sourceId?: string | null;
     status: DataTask['status'];
     total: number;
     success: number;
   }): string {
     const id = randomUUID();
     const now = new Date().toISOString();
-    const sourceId = /mock/i.test(input.source) ? 'source-mock' : null;
+    const sourceId = input.sourceId === undefined
+      ? (/mock/i.test(input.source) ? 'source-mock' : null)
+      : input.sourceId;
     const done = ['success', 'partial', 'failed'].includes(input.status);
     this.database.prepare(`
       INSERT INTO data_tasks (
@@ -1130,42 +1179,123 @@ export class IntelligenceService {
     return id;
   }
 
-  private async refreshTarget(target: string, watchlistId?: string): Promise<number> {
+  private refreshEntityType(taskType: string, target: string): string | undefined {
+    const normalizedTaskType = taskType.trim().toLowerCase();
+    if (normalizedTaskType === 'dashboard_core_refresh') return 'dashboard_core';
+    if (normalizedTaskType === 'market_refresh') return 'market';
+    if (['owned_sku_refresh', 'product_refresh'].includes(normalizedTaskType)) return 'owned_product';
+    if (normalizedTaskType === 'competitor_refresh') return 'competitor';
+    if (normalizedTaskType === 'keyword_refresh') return 'keyword';
+    if (normalizedTaskType === 'review_refresh') return 'review';
+    if (normalizedTaskType === 'amazon_internal') return 'amazon_internal';
+    if (normalizedTaskType === 'file_import') return 'file_import';
+    if (this.repository.getMarket(target)) return 'market';
+    const product = this.database.prepare(`
+      SELECT is_owned FROM products WHERE id = ? AND marketplace = ?
+    `).get(target, this.repository.getSettings().marketplace) as { is_owned: number } | undefined;
+    if (product) return product.is_owned === 1 ? 'owned_product' : 'competitor';
+    return undefined;
+  }
+
+  private async refreshTarget(
+    taskType: string,
+    target: string,
+    watchlistId: string | undefined,
+    adapter: MarketDataAdapter,
+  ): Promise<number> {
     const watchItem = watchlistId
       ? this.repository.getWatchlist().find((item) => item.id === watchlistId)
       : this.repository.getWatchlist().find((item) => item.itemId === target);
     let refreshed = 0;
     let latestFinding = '';
-    if (watchItem) {
+    const normalizedTaskType = taskType.trim().toLowerCase();
+    if (normalizedTaskType === 'keyword_refresh') {
+      throw new Error('关键词刷新持久化尚未实现，任务已安全终止且未写入任何数据。');
+    }
+    if (normalizedTaskType === 'review_refresh') {
+      throw new Error('评论刷新持久化尚未实现，任务已安全终止且未写入任何数据。');
+    }
+    if (normalizedTaskType === 'dashboard_core_refresh') {
+      refreshed = await this.refreshDashboardCore(adapter);
+    } else if (watchItem) {
       if (watchItem.itemType === 'market') {
         if (!this.repository.getMarket(watchItem.itemId)) throw new Error('监控市场不存在于当前站点。');
-        refreshed = await this.appendMarketSnapshot(watchItem.itemId);
+        refreshed = await this.appendMarketSnapshot(watchItem.itemId, adapter);
       } else if (['owned_product', 'competitor'].includes(watchItem.itemType)) {
         const product = this.database.prepare(`
           SELECT id FROM products WHERE id = ? AND marketplace = ?
         `).get(watchItem.itemId, this.repository.getSettings().marketplace);
         if (!product) throw new Error('监控产品不存在于当前站点。');
-        refreshed = this.appendProductSnapshot(watchItem.itemId);
+        refreshed = await this.appendProductSnapshot(watchItem.itemId, adapter);
       } else if (['development_project', 'opportunity'].includes(watchItem.itemType)) {
-        const result = this.ai.analyze({ entityType: watchItem.itemType, entityId: watchItem.itemId });
-        refreshed = 1;
-        latestFinding = result.insight.summary;
+        const table = watchItem.itemType === 'development_project' ? 'development_projects' : 'opportunities';
+        const linked = this.database.prepare(`
+          SELECT market_node_id AS marketNodeId FROM ${table}
+          WHERE id = ? AND marketplace = ?
+        `).get(watchItem.itemId, this.repository.getSettings().marketplace) as {
+          marketNodeId: string | null;
+        } | undefined;
+        if (!linked?.marketNodeId) {
+          if (adapter.sourceType !== 'mock') {
+            throw new Error('监控对象尚未关联可刷新的市场，未生成新的分析结论。');
+          }
+          const result = this.ai.analyze({ entityType: watchItem.itemType, entityId: watchItem.itemId });
+          refreshed = 1;
+          latestFinding = result.insight.summary;
+        } else {
+          refreshed = await this.appendMarketSnapshot(linked.marketNodeId, adapter);
+          if (watchItem.itemType === 'development_project') {
+            this.recomputeDevelopmentProjectMetrics(watchItem.itemId);
+          }
+          const result = this.ai.analyze({ entityType: watchItem.itemType, entityId: watchItem.itemId });
+          latestFinding = result.insight.summary;
+        }
       } else {
         throw new Error(`暂不支持刷新监控类型：${watchItem.itemType}`);
       }
+    } else if (normalizedTaskType === 'market_refresh' && (target === '' || target === 'all')) {
+      const defaultMarketId = this.repository.getSettings().defaultMarketId;
+      if (defaultMarketId) refreshed = await this.appendMarketSnapshot(defaultMarketId, adapter);
+    } else if (
+      ['owned_sku_refresh', 'product_refresh'].includes(normalizedTaskType)
+      && (target === '' || target === 'all' || target === 'owned-products')
+    ) {
+      for (const owned of this.repository.getOwnedProducts()) {
+        refreshed += await this.appendProductSnapshot(owned.id, adapter);
+      }
+    } else if (
+      normalizedTaskType === 'competitor_refresh'
+      && (target === '' || target === 'all' || target === 'watched-competitors')
+    ) {
+      const competitors = this.database.prepare(`
+        SELECT DISTINCT relation.competitor_product_id AS id
+        FROM competitor_relations relation
+        JOIN products owned ON owned.id = relation.owned_product_id
+        JOIN products competitor ON competitor.id = relation.competitor_product_id
+        WHERE relation.relation_type = 'direct'
+          AND owned.marketplace = ? AND competitor.marketplace = ?
+      `).all(
+        this.repository.getSettings().marketplace,
+        this.repository.getSettings().marketplace,
+      ) as Array<{ id: string }>;
+      for (const competitor of competitors) {
+        refreshed += await this.appendProductSnapshot(competitor.id, adapter);
+      }
     } else if (this.repository.getMarket(target)) {
-      refreshed = await this.appendMarketSnapshot(target);
+      refreshed = await this.appendMarketSnapshot(target, adapter);
     } else {
       const product = this.database.prepare(`
         SELECT id FROM products WHERE id = ? AND marketplace = ?
       `).get(target, this.repository.getSettings().marketplace);
-      if (product) refreshed += this.appendProductSnapshot(target);
+      if (product) refreshed += await this.appendProductSnapshot(target, adapter);
       else if (target === 'owned-products' || target === 'all') {
         if (target === 'all') {
           const defaultMarketId = this.repository.getSettings().defaultMarketId;
-          if (defaultMarketId) refreshed += await this.appendMarketSnapshot(defaultMarketId);
+          if (defaultMarketId) refreshed += await this.appendMarketSnapshot(defaultMarketId, adapter);
         }
-        for (const owned of this.repository.getOwnedProducts()) refreshed += this.appendProductSnapshot(owned.id);
+        for (const owned of this.repository.getOwnedProducts()) {
+          refreshed += await this.appendProductSnapshot(owned.id, adapter);
+        }
       } else {
         throw new Error('刷新目标不存在或不属于当前站点。');
       }
@@ -1185,35 +1315,138 @@ export class IntelligenceService {
     return refreshed;
   }
 
-  private async appendMarketSnapshot(marketId: string): Promise<number> {
+  private async appendMarketSnapshot(marketId: string, adapter: MarketDataAdapter): Promise<number> {
+    const prepared = await this.prepareMarketSnapshot(marketId, adapter);
+    if (!prepared) return 0;
+    return transaction(this.database, () => {
+      this.persistMarketSnapshot(prepared);
+      this.analyzeMarketSnapshot(prepared.marketId);
+      return 1;
+    });
+  }
+
+  private async appendProductSnapshot(productId: string, adapter: MarketDataAdapter): Promise<number> {
+    const prepared = await this.prepareProductSnapshot(productId, adapter);
+    if (!prepared) return 0;
+    return transaction(this.database, () => {
+      this.persistProductSnapshot(prepared);
+      this.analyzeProductSnapshot(prepared);
+      return 1;
+    });
+  }
+
+  private async refreshDashboardCore(adapter: MarketDataAdapter): Promise<number> {
+    const settings = this.repository.getSettings();
+    const market = settings.defaultMarketId
+      ? await this.prepareMarketSnapshot(settings.defaultMarketId, adapter)
+      : null;
+    const productIds = this.database.prepare(`
+      SELECT id FROM products WHERE is_owned = 1 AND marketplace = ?
+      UNION
+      SELECT relation.competitor_product_id AS id
+      FROM competitor_relations relation
+      JOIN products owned ON owned.id = relation.owned_product_id
+      JOIN products competitor ON competitor.id = relation.competitor_product_id
+      WHERE relation.relation_type = 'direct'
+        AND owned.marketplace = ? AND competitor.marketplace = ?
+      ORDER BY id
+    `).all(settings.marketplace, settings.marketplace, settings.marketplace) as Array<{ id: string }>;
+    const products: PreparedProductSnapshot[] = [];
+    for (const { id } of productIds) {
+      const prepared = await this.prepareProductSnapshot(id, adapter);
+      if (prepared) products.push(prepared);
+    }
+    if (!market && products.length === 0) return 0;
+
+    return transaction(this.database, () => {
+      if (market) this.persistMarketSnapshot(market);
+      products.forEach((product) => this.persistProductSnapshot(product));
+
+      // Keep derived insights in the same commit as the complete core snapshot set.
+      if (market) this.analyzeMarketSnapshot(market.marketId);
+      products.forEach((product) => this.analyzeProductSnapshot(product));
+      return (market ? 1 : 0) + products.length;
+    });
+  }
+
+  private async prepareMarketSnapshot(
+    marketId: string,
+    adapter: MarketDataAdapter,
+  ): Promise<PreparedMarketSnapshot | null> {
     const market = this.repository.getMarket(marketId);
-    if (!market) return 0;
-    const overview = await this.mockAdapter.fetchMarketOverview({
+    if (!market) return null;
+    const overview = await adapter.fetchMarketOverview({
       marketId,
       marketplace: market.node.marketplace,
       keywords: market.node.keywords,
+      previousSnapshot: {
+        productCount: market.kpis.productCount,
+        sellerCount: market.kpis.sellerCount,
+        brandCount: market.kpis.brandCount,
+        monthlySales: market.kpis.monthlySales,
+        monthlyRevenue: market.kpis.monthlyRevenue,
+        avgPrice: market.kpis.avgPrice,
+        medianPrice: market.kpis.medianPrice,
+        avgRating: market.kpis.avgRating,
+        medianReviews: market.kpis.medianReviews,
+        top10Share: market.kpis.top10Share,
+        top20Share: market.kpis.top20Share,
+        newProductShare: market.kpis.newProductShare,
+        priceBands: market.priceBands,
+        concentration: market.concentration,
+      },
     });
-    const latest = market.trends.at(-1);
-    const now = new Date().toISOString();
-    const sales = latest?.sales !== null && latest?.sales !== undefined
-      ? Math.round(latest.sales * 1.003)
-      : overview.monthlySales;
-    const avgPrice = latest?.avgPrice ?? overview.avgPrice;
+    validateAdapterProvenance(adapter, overview.provenance);
+    validateMarketOverview(overview);
+    return { marketId, overview };
+  }
+
+  private async prepareProductSnapshot(
+    productId: string,
+    adapter: MarketDataAdapter,
+  ): Promise<PreparedProductSnapshot | null> {
+    const product = this.database.prepare(`
+      SELECT asin, marketplace, is_owned AS isOwned
+      FROM products WHERE id = ? AND marketplace = ?
+    `).get(productId, this.repository.getSettings().marketplace) as LocalProductIdentity | undefined;
+    if (!product) return null;
+    const detail = await adapter.fetchProductDetail({
+      asin: product.asin,
+      marketplace: product.marketplace,
+      previousSnapshot: this.repository.getProductSnapshots(productId).at(-1),
+    });
+    validateProductIdentity(adapter, product, detail);
+    validateAdapterProvenance(adapter, detail.provenance);
+    validateAdapterProvenance(adapter, detail.latest.provenance);
+    if (!sameProvenance(detail.provenance, detail.latest.provenance)) {
+      throw new Error(`Adapter ${adapter.id} 返回的产品级与快照级 provenance 不一致。`);
+    }
+    validateProductSnapshot(detail.latest);
+    return { productId, product, snapshot: detail.latest };
+  }
+
+  private persistMarketSnapshot({ marketId, overview }: PreparedMarketSnapshot): void {
+    const collectedAt = overview.provenance.collectedAt;
     this.database.prepare(`
       INSERT INTO market_snapshots (
         id, market_node_id, date, product_count, seller_count, brand_count, monthly_sales,
         monthly_revenue, avg_price, median_price, avg_rating, median_reviews, top10_share,
         top20_share, new_product_share, price_bands_json, concentration_json, source,
         source_type, collected_at, period, is_estimated, confidence
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'mock', ?, '30D', 1, ?)
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).run(
-      randomUUID(), marketId, now.slice(0, 10), overview.productCount, overview.sellerCount,
-      overview.brandCount, sales, Math.round(sales * avgPrice * 100) / 100, avgPrice,
+      randomUUID(), marketId, collectedAt.slice(0, 10), overview.productCount, overview.sellerCount,
+      overview.brandCount, overview.monthlySales, overview.monthlyRevenue, overview.avgPrice,
       overview.medianPrice, overview.avgRating, overview.medianReviews,
-      market.kpis.top10Share, market.kpis.top20Share, market.kpis.newProductShare,
-      JSON.stringify(market.priceBands), JSON.stringify(market.concentration),
-      `${this.mockAdapter.name} @ ${now}`, now, overview.provenance.confidence,
+      overview.top10Share, overview.top20Share, overview.newProductShare,
+      JSON.stringify(overview.priceBands), JSON.stringify(overview.concentration),
+      overview.provenance.source, overview.provenance.sourceType, collectedAt,
+      overview.provenance.period, overview.provenance.isEstimated ? 1 : 0,
+      overview.provenance.confidence,
     );
+  }
+
+  private analyzeMarketSnapshot(marketId: string): void {
     this.ai.analyze({ entityType: 'market', entityId: marketId });
     const ownedRows = this.database.prepare(`
       SELECT id FROM products WHERE is_owned = 1 AND market_node_id = ? AND marketplace = ?
@@ -1226,42 +1459,238 @@ export class IntelligenceService {
       this.recomputeDevelopmentProjectMetrics(row.id);
       this.ai.analyze({ entityType: 'development_project', entityId: row.id });
     });
-    return 1;
   }
 
-  private appendProductSnapshot(productId: string): number {
-    const row = this.database.prepare(`
-      SELECT * FROM product_snapshots WHERE product_id = ? ORDER BY date DESC, collected_at DESC LIMIT 1
-    `).get(productId) as SqlRow | undefined;
-    if (!row) return 0;
-    const now = new Date().toISOString();
-    const sales = Number(row.estimated_sales) * 1.002;
+  private persistProductSnapshot({ productId, snapshot }: PreparedProductSnapshot): void {
+    const provenance = snapshot.provenance;
     this.database.prepare(`
       INSERT INTO product_snapshots (
         id, product_id, date, price, rating, review_count, bsr, estimated_sales,
         estimated_revenue, seller_count, growth_7d, growth_30d, growth_90d,
         source, source_type, collected_at, period, is_estimated, confidence
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'mock', ?, ?, 1, ?)
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).run(
-      randomUUID(), productId, now.slice(0, 10), Number(row.price), Number(row.rating),
-      Number(row.review_count), Number(row.bsr), Math.round(sales),
-      Math.round(sales * Number(row.price) * 100) / 100, Number(row.seller_count),
-      Number(row.growth_7d), Number(row.growth_30d), Number(row.growth_90d),
-      `${this.mockAdapter.name} @ ${now}`, now, String(row.period), Number(row.confidence),
+      randomUUID(), productId, snapshot.date, snapshot.price, snapshot.rating,
+      snapshot.reviewCount, snapshot.bsr, snapshot.estimatedSales,
+      snapshot.estimatedRevenue, snapshot.sellerCount, snapshot.growth7d,
+      snapshot.growth30d, snapshot.growth90d, provenance.source, provenance.sourceType,
+      provenance.collectedAt, provenance.period, provenance.isEstimated ? 1 : 0,
+      provenance.confidence,
     );
-    const product = this.database.prepare(`SELECT is_owned FROM products WHERE id = ?`).get(productId) as {
-      is_owned: number;
-    } | undefined;
-    if (product?.is_owned === 1) {
+  }
+
+  private analyzeProductSnapshot({ productId, product }: PreparedProductSnapshot): void {
+    if (product.isOwned) {
       this.ai.analyze({ entityType: 'owned_product', entityId: productId });
     } else {
       const owners = this.database.prepare(`
-        SELECT owned_product_id AS id FROM competitor_relations WHERE competitor_product_id = ?
-      `).all(productId) as Array<{ id: string }>;
+        SELECT relation.owned_product_id AS id
+        FROM competitor_relations relation
+        JOIN products owned ON owned.id = relation.owned_product_id
+        WHERE relation.competitor_product_id = ? AND owned.marketplace = ?
+      `).all(productId, this.repository.getSettings().marketplace) as Array<{ id: string }>;
       owners.forEach((owner) => this.ai.analyze({ entityType: 'owned_product', entityId: owner.id }));
     }
-    return 1;
   }
+}
+
+type PersistableProductSnapshot = ProductSnapshot & {
+  price: number;
+  rating: number;
+  reviewCount: number;
+  bsr: number;
+  estimatedSales: number;
+  estimatedRevenue: number;
+  sellerCount: number;
+  growth7d: number;
+  growth30d: number;
+  growth90d: number;
+};
+
+interface LocalProductIdentity {
+  asin: string;
+  marketplace: string;
+  isOwned: number;
+}
+
+interface PreparedMarketSnapshot {
+  marketId: string;
+  overview: MarketOverviewRecord;
+}
+
+interface PreparedProductSnapshot {
+  productId: string;
+  product: LocalProductIdentity;
+  snapshot: PersistableProductSnapshot;
+}
+
+function validateAdapterProvenance(adapter: MarketDataAdapter, provenance: Provenance): void {
+  if (provenance.sourceType !== adapter.sourceType) {
+    throw new Error(`Adapter ${adapter.id} 返回的 sourceType 与注册信息不一致。`);
+  }
+  if (typeof provenance.source !== 'string' || !provenance.source.trim()
+    || typeof provenance.period !== 'string' || !provenance.period.trim()
+    || typeof provenance.isEstimated !== 'boolean') {
+    throw new Error(`Adapter ${adapter.id} 返回的来源追溯信息不完整。`);
+  }
+  if (!isStrictIsoTimestamp(provenance.collectedAt)) {
+    throw new Error(`Adapter ${adapter.id} 返回的 collectedAt 必须是有效 ISO-8601 时间。`);
+  }
+  if (!Number.isFinite(provenance.confidence) || provenance.confidence < 0 || provenance.confidence > 1) {
+    throw new Error(`Adapter ${adapter.id} 返回的 confidence 必须在 0 到 1 之间。`);
+  }
+}
+
+function validateMarketOverview(overview: MarketOverviewRecord): void {
+  const nonNegativeFields: Array<[string, number]> = [
+    ['productCount', overview.productCount],
+    ['sellerCount', overview.sellerCount],
+    ['brandCount', overview.brandCount],
+    ['monthlySales', overview.monthlySales],
+    ['monthlyRevenue', overview.monthlyRevenue],
+    ['avgPrice', overview.avgPrice],
+    ['medianPrice', overview.medianPrice],
+    ['medianReviews', overview.medianReviews],
+  ];
+  for (const [field, value] of nonNegativeFields) {
+    if (!Number.isFinite(value) || value < 0) {
+      throw new Error(`Adapter 返回的市场字段 ${field} 无效。`);
+    }
+  }
+  for (const [field, value] of [
+    ['productCount', overview.productCount],
+    ['sellerCount', overview.sellerCount],
+    ['brandCount', overview.brandCount],
+  ] as Array<[string, number]>) {
+    if (!Number.isInteger(value)) throw new Error(`Adapter 返回的市场字段 ${field} 必须为整数。`);
+  }
+  if (!Number.isFinite(overview.avgRating) || overview.avgRating < 0 || overview.avgRating > 5) {
+    throw new Error('Adapter 返回的市场字段 avgRating 无效。');
+  }
+  for (const [field, value] of [
+    ['top10Share', overview.top10Share],
+    ['top20Share', overview.top20Share],
+    ['newProductShare', overview.newProductShare],
+  ] as Array<[string, number]>) {
+    if (!Number.isFinite(value) || value < 0 || value > 100) {
+      throw new Error(`Adapter 返回的市场字段 ${field} 无效。`);
+    }
+  }
+  if (overview.top20Share < overview.top10Share) {
+    throw new Error('Adapter 返回的市场集中度无效：Top 20 份额不能低于 Top 10。');
+  }
+  if (!Array.isArray(overview.priceBands) || !Array.isArray(overview.concentration)) {
+    throw new Error('Adapter 返回的市场分布字段缺失。');
+  }
+  const invalidPriceBand = overview.priceBands.some((band) => (
+    typeof band.label !== 'string'
+    || !band.label.trim()
+    || !Number.isInteger(band.productCount)
+    || !Number.isInteger(band.newProducts)
+    || [band.productCount, band.monthlySales, band.revenue, band.avgReviews, band.newProducts]
+      .some((value) => !Number.isFinite(value) || value < 0)
+    || !Number.isFinite(band.growth)
+  ));
+  const invalidConcentration = overview.concentration.some((tier) => (
+    typeof tier.tier !== 'string'
+    || !tier.tier.trim()
+    || !Number.isFinite(tier.share) || tier.share < 0 || tier.share > 100
+    || [tier.avgPrice, tier.avgSales].some((value) => !Number.isFinite(value) || value < 0)
+  ));
+  if (invalidPriceBand || invalidConcentration) {
+    throw new Error('Adapter 返回的市场分布字段无效。');
+  }
+}
+
+function validateProductIdentity(
+  adapter: MarketDataAdapter,
+  expected: LocalProductIdentity,
+  detail: ProductDetailRecord,
+): void {
+  if (normalizeIdentity(detail.asin) !== normalizeIdentity(expected.asin)) {
+    throw new Error(`Adapter ${adapter.id} 返回的 ASIN 与刷新目标不一致。`);
+  }
+  if (normalizeIdentity(detail.marketplace) !== normalizeIdentity(expected.marketplace)) {
+    throw new Error(`Adapter ${adapter.id} 返回的 marketplace 与刷新目标不一致。`);
+  }
+  if (typeof detail.id !== 'string' || !detail.id.trim()
+    || typeof detail.latest?.productId !== 'string'
+    || detail.latest.productId !== detail.id) {
+    throw new Error(`Adapter ${adapter.id} 返回的产品与快照身份不一致。`);
+  }
+}
+
+function sameProvenance(left: Provenance, right: Provenance): boolean {
+  return left.source === right.source
+    && left.sourceType === right.sourceType
+    && left.collectedAt === right.collectedAt
+    && left.period === right.period
+    && left.isEstimated === right.isEstimated
+    && left.confidence === right.confidence;
+}
+
+function validateProductSnapshot(
+  snapshot: ProductSnapshot,
+): asserts snapshot is PersistableProductSnapshot {
+  if (!snapshot.snapshotAvailable || !isStrictIsoDate(snapshot.date)) {
+    throw new Error('Adapter 返回的产品快照缺少有效日期。');
+  }
+  const requiredFields: Array<[string, number | null]> = [
+    ['price', snapshot.price],
+    ['rating', snapshot.rating],
+    ['reviewCount', snapshot.reviewCount],
+    ['bsr', snapshot.bsr],
+    ['estimatedSales', snapshot.estimatedSales],
+    ['estimatedRevenue', snapshot.estimatedRevenue],
+    ['sellerCount', snapshot.sellerCount],
+    ['growth7d', snapshot.growth7d],
+    ['growth30d', snapshot.growth30d],
+    ['growth90d', snapshot.growth90d],
+  ];
+  for (const [field, value] of requiredFields) {
+    if (value === null || !Number.isFinite(value)) {
+      throw new Error(`Adapter 返回的产品字段 ${field} 缺失或无效。`);
+    }
+  }
+  const nonNegativeFields: Array<[string, number | null]> = [
+    ['price', snapshot.price],
+    ['reviewCount', snapshot.reviewCount],
+    ['bsr', snapshot.bsr],
+    ['estimatedSales', snapshot.estimatedSales],
+    ['estimatedRevenue', snapshot.estimatedRevenue],
+    ['sellerCount', snapshot.sellerCount],
+  ];
+  for (const [field, value] of nonNegativeFields) {
+    if (value === null || value < 0) throw new Error(`Adapter 返回的产品字段 ${field} 不能为负数。`);
+  }
+  if (snapshot.rating === null || snapshot.rating < 0 || snapshot.rating > 5) {
+    throw new Error('Adapter 返回的产品字段 rating 必须在 0 到 5 之间。');
+  }
+  for (const [field, value] of [
+    ['reviewCount', snapshot.reviewCount],
+    ['bsr', snapshot.bsr],
+    ['sellerCount', snapshot.sellerCount],
+  ] as Array<[string, number | null]>) {
+    if (value === null || !Number.isInteger(value)) {
+      throw new Error(`Adapter 返回的产品字段 ${field} 必须为整数。`);
+    }
+  }
+}
+
+function normalizeIdentity(value: unknown): string {
+  return typeof value === 'string' ? value.trim().toUpperCase() : '';
+}
+
+function isStrictIsoTimestamp(value: unknown): value is string {
+  if (typeof value !== 'string') return false;
+  const match = /^(\d{4}-\d{2}-\d{2})T(?:[01]\d|2[0-3]):[0-5]\d:[0-5]\d(?:\.\d{1,9})?(?:Z|[+-](?:0\d|1[0-4]):[0-5]\d)$/.exec(value);
+  return Boolean(match && isStrictIsoDate(match[1]) && Number.isFinite(Date.parse(value)));
+}
+
+function isStrictIsoDate(value: unknown): value is string {
+  if (typeof value !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(value)) return false;
+  const parsed = new Date(`${value}T00:00:00.000Z`);
+  return Number.isFinite(parsed.getTime()) && parsed.toISOString().slice(0, 10) === value;
 }
 
 function expandDevelopmentKeywords(input: DevelopmentInput): string[] {

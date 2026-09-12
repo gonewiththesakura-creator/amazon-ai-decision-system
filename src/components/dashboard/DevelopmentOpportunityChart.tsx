@@ -1,19 +1,49 @@
 import { useMemo } from 'react';
 import { Bar, BarChart, CartesianGrid, Cell, ResponsiveContainer, Tooltip, XAxis, YAxis } from 'recharts';
+import type { ExecutiveDevelopmentOpportunity } from '../../../shared/types';
 import { ChartCard } from './ChartCard';
 import { ChartEmptyState } from './ChartEmptyState';
-import type { DevelopmentOpportunityItem } from './types';
+
+const recommendationLabels: Record<ExecutiveDevelopmentOpportunity['systemRecommendation'], string> = {
+  develop: '建议开发',
+  test: '小规模验证',
+  watch: '继续观察',
+  reject: '暂不开发',
+  needs_data: '待补数据',
+};
+
+function approvalLabel(item: ExecutiveDevelopmentOpportunity): string {
+  if (item.approvalStatus === 'waiting') return '待审批';
+  if (item.approvalStatus === 'approved') {
+    const action = item.approvedAction && item.approvedAction in recommendationLabels
+      ? recommendationLabels[item.approvedAction as ExecutiveDevelopmentOpportunity['systemRecommendation']]
+      : item.approvedAction;
+    return action ? `已批准（${action}）` : '已批准';
+  }
+  if (item.approvalStatus === 'watch') return '审批结论：继续观察';
+  if (item.approvalStatus === 'rejected') return '已拒绝';
+  if (item.approvalStatus === 'needs_data') return '已退回补数据';
+  return '无需审批';
+}
+
+function statusTone(item: ExecutiveDevelopmentOpportunity): string | undefined {
+  if (item.approvalStatus === 'rejected' || item.systemRecommendation === 'reject') return 'is-rejected';
+  if (item.approvalStatus === 'waiting' || item.approvalStatus === 'watch'
+    || item.approvalStatus === 'needs_data' || item.systemRecommendation === 'needs_data') {
+    return 'is-pending';
+  }
+  return undefined;
+}
 
 export interface DevelopmentOpportunityChartProps {
-  opportunities: DevelopmentOpportunityItem[];
+  opportunities: ExecutiveDevelopmentOpportunity[];
   onSelectOpportunity?: (opportunityId: string) => void;
 }
 
 export function DevelopmentOpportunityChart({ opportunities, onSelectOpportunity }: DevelopmentOpportunityChartProps) {
   const scored = useMemo(() => opportunities
-    .filter((item): item is DevelopmentOpportunityItem & { status: 'scored'; score: number } => item.status === 'scored' && item.score !== null && Number.isFinite(item.score))
+    .filter((item): item is ExecutiveDevelopmentOpportunity & { scoreStatus: 'scored'; score: number } => item.scoreStatus === 'scored' && item.score !== null && Number.isFinite(item.score))
     .sort((left, right) => right.score - left.score), [opportunities]);
-  const unavailable = opportunities.filter((item) => item.status !== 'scored' || item.score === null || !Number.isFinite(item.score));
 
   return (
     <ChartCard title="开发机会评分" eyebrow="FUTURE PRODUCTS" description="只绘制已通过前置约束且有有效评分的项目。">
@@ -44,19 +74,26 @@ export function DevelopmentOpportunityChart({ opportunities, onSelectOpportunity
             </>
           ) : null}
 
-          {unavailable.length ? (
-            <div className="dashboard-opportunity-status" aria-label="未评分项目状态">
-              {unavailable.map((item) => {
-                const rejected = item.status === 'rejected';
-                return (
-                  <button type="button" key={item.id} disabled={!onSelectOpportunity} onClick={() => onSelectOpportunity?.(item.id)}>
-                    <span>{item.name}</span>
-                    <strong className={rejected ? 'is-rejected' : 'is-pending'}>{rejected ? '已淘汰' : '待补数据'}</strong>
-                  </button>
-                );
-              })}
-            </div>
-          ) : null}
+          <div className="dashboard-opportunity-status" aria-label="开发机会建议与审批状态">
+            {opportunities.map((item) => (
+              <button
+                type="button"
+                key={item.id}
+                disabled={!onSelectOpportunity}
+                onClick={() => onSelectOpportunity?.(item.id)}
+                aria-label={`${item.name}，AI 建议：${recommendationLabels[item.systemRecommendation]}，审批状态：${approvalLabel(item)}`}
+              >
+                <span>
+                  {item.name} · {item.scoreStatus === 'scored' && item.score !== null
+                    ? `${item.score.toFixed(0)} 分`
+                    : item.hardGate === 'reject' ? 'Hard Gate 未通过' : '待补数据'}
+                </span>
+                <strong className={statusTone(item)}>
+                  AI 建议：{recommendationLabels[item.systemRecommendation]} · 审批状态：{approvalLabel(item)}
+                </strong>
+              </button>
+            ))}
+          </div>
         </div>
       )}
     </ChartCard>

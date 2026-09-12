@@ -1,6 +1,6 @@
 import { useEffect, useRef } from 'react';
-import { useNavigate, useSearchParams } from 'react-router-dom';
-import { Store } from 'lucide-react';
+import { Link, useNavigate, useSearchParams } from 'react-router-dom';
+import { RefreshCw, Settings2, Store } from 'lucide-react';
 import type { ExecutiveDashboardViewModel, TimeRange } from '../../shared/types';
 import {
   CompetitorGrowthChart,
@@ -79,7 +79,14 @@ export default function DashboardPage() {
         <div>
           <span className="eyebrow">EXECUTIVE OPERATING VIEW</span>
           <h1 id="executive-dashboard-title">AI 经营驾驶舱</h1>
-          <p>{data.market?.name ?? 'Memory Foam Pillow'} · Amazon {data.marketplace}</p>
+          {data.market ? (
+            <p>{data.market.name} · Amazon {data.marketplace}</p>
+          ) : (
+            <p className="executive-dashboard-header__missing-market">
+              尚未设置主市场
+              <Link to="/settings"><Settings2 size={14} aria-hidden="true" />前往设置</Link>
+            </p>
+          )}
         </div>
         <div className="executive-dashboard-header__meta">
           <span><Store size={14} aria-hidden="true" />Amazon {data.marketplace}</span>
@@ -97,13 +104,22 @@ export default function DashboardPage() {
             ))}
           </div>
           <DataFreshnessBadge
-            status={data.dataStatus.status}
-            updatedAt={data.dataStatus.updatedAt}
-            isDemo={data.dataStatus.isDemo}
-            label={data.dataStatus.label}
-            message={data.dataStatus.message}
+            status={data.coreBusinessFreshness.status}
+            updatedAt={data.coreBusinessFreshness.oldestRequiredSnapshotAt}
+            isDemo={data.coreBusinessFreshness.isDemo}
+            label={data.coreBusinessFreshness.label}
+            message={data.coreBusinessFreshness.message}
             onClick={() => navigate('/data-tasks')}
           />
+          <button
+            className={`executive-system-sync executive-system-sync--${data.systemSyncStatus.status}`}
+            type="button"
+            title={data.systemSyncStatus.message ?? undefined}
+            onClick={() => navigate('/data-tasks')}
+          >
+            <RefreshCw size={14} aria-hidden="true" />
+            系统同步：{systemSyncLabel(data.systemSyncStatus.status)}
+          </button>
         </div>
       </section>
 
@@ -123,6 +139,9 @@ export default function DashboardPage() {
           <div className="executive-dashboard-grid executive-dashboard-grid--lead">
             <MarketSkuTrendChart
               series={data.trendComparison}
+              commonBaselineDate={data.trendComparisonMeta.commonBaselineDate}
+              excludedSeries={data.trendComparisonMeta.excludedSeries}
+              marketConfigured={Boolean(data.market)}
               range={range}
               onRangeChange={(nextRange) => updateParameter('range', nextRange)}
               marketHref={data.market ? `/market?market=${encodeURIComponent(data.market.id)}` : undefined}
@@ -151,4 +170,15 @@ export default function DashboardPage() {
       )}
     </div>
   );
+}
+
+function systemSyncLabel(status: ExecutiveDashboardViewModel['systemSyncStatus']['status']): string {
+  const labels = {
+    idle: '尚无任务',
+    running: '进行中',
+    partial: '部分完成',
+    failed: '失败',
+    success: '已完成',
+  } as const;
+  return labels[status];
 }

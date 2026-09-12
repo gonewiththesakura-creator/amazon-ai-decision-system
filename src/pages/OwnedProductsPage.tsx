@@ -471,10 +471,10 @@ export default function OwnedProductsPage() {
       <section className="page-heading page-heading--compact">
         <div>
           <span className="eyebrow">OWNED BUSINESS · WAR ROOM</span>
-          <h1>4 SKU 相对市场表现</h1>
+          <h1>自有 SKU 相对市场表现</h1>
           <p>不要只看绝对涨跌；先判断每个 SKU 是否跑赢它所在的市场。</p>
         </div>
-        <Badge tone={listQuery.data.length === 4 ? 'positive' : 'warning'}>{listQuery.data.length} 个 SKU 已启用</Badge>
+        <Badge tone={listQuery.data.length > 0 ? 'positive' : 'warning'}>{listQuery.data.length} 个 SKU 已启用</Badge>
       </section>
 
       <section className="sku-selector-grid" aria-label="选择自有 SKU">

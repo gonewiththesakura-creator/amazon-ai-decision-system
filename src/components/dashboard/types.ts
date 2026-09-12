@@ -1,3 +1,5 @@
+import type { IndexedTrendSeries as SharedIndexedTrendSeries } from '../../../shared/types';
+
 export type DashboardRange = '7D' | '30D' | '90D' | '180D' | '1Y';
 export type DashboardTone = 'neutral' | 'positive' | 'warning' | 'critical' | 'info';
 
@@ -10,20 +12,7 @@ export interface ExecutiveKpiData {
   fastGrowthCompetitors: number | null;
 }
 
-export interface IndexedTrendPoint {
-  date: string;
-  index: number | null;
-  relativeToMarket?: number | null;
-}
-
-export interface IndexedTrendSeries {
-  id: string;
-  key?: string;
-  label: string;
-  color?: string;
-  kind?: 'market' | 'owned_sku' | 'sku' | 'competitor_average';
-  points: IndexedTrendPoint[];
-}
+export type IndexedTrendSeries = SharedIndexedTrendSeries;
 
 export interface SkuRelativePerformanceItem {
   id: string;
@@ -85,13 +74,6 @@ export interface DashboardInsightItem {
   researchJobHref: string | null;
 }
 
-export interface DevelopmentOpportunityItem {
-  id: string;
-  name: string;
-  status: 'scored' | 'needs_data' | 'rejected';
-  score: number | null;
-}
-
 export interface ResearchStatusItem {
   key: string;
   label: string;
@@ -99,41 +81,4 @@ export interface ResearchStatusItem {
   color?: string;
 }
 
-export type DataFreshnessState = 'normal' | 'partial' | 'insufficient' | 'failed';
-
-export interface SkuFocusCompetitor {
-  id: string;
-  name: string;
-  asin: string;
-  growth: number | null;
-  price: number | null;
-  rating: number | null;
-  reviews: number | null;
-  estimatedSales: number | null;
-  tags: string[];
-}
-
-export interface SkuFocusData {
-  sku: {
-    id: string;
-    name: string;
-    asin: string;
-    sku: string | null;
-  };
-  market: { id: string; name: string };
-  trendComparison: IndexedTrendSeries[];
-  operatingMetrics: {
-    price: number | null;
-    rating: number | null;
-    reviews: number | null;
-    bsr: number | null;
-    estimatedSales: number | null;
-    estimatedRevenue: number | null;
-    growth30d: number | null;
-    marketGrowth30d: number | null;
-    relativeDelta: number | null;
-  };
-  directCompetitors: SkuFocusCompetitor[];
-  insight: DashboardInsightItem | null;
-  missingDataLabels: string[];
-}
+export type DataFreshnessState = 'normal' | 'partial' | 'insufficient' | 'stale';

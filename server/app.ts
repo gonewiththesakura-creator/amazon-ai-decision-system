@@ -351,7 +351,7 @@ export function createApp(options: CreateAppOptions = {}): express.Express {
   });
   app.post('/api/watchlist/:id/refresh', adminOnly, asyncHandler(async (request, response) => {
     sendData(response, await service.runDataTask({
-      taskType: 'watchlist_refresh', watchlistId: routeParam(request, 'id'), source: 'Mock Adapter',
+      taskType: 'watchlist_refresh', watchlistId: routeParam(request, 'id'),
     }), repository, 201);
   }));
   app.delete('/api/watchlist/:id', adminOnly, (request, response) => {
@@ -367,6 +367,7 @@ export function createApp(options: CreateAppOptions = {}): express.Express {
       taskType: z.string().optional(),
       target: z.string().optional(),
       source: z.string().optional(),
+      sourcePreference: z.string().optional(),
       watchlistId: z.string().optional(),
       retryTaskId: z.string().optional(),
     }).parse(request.body ?? {});

@@ -1,13 +1,14 @@
 import clsx from 'clsx';
 import { ArrowLeft, DatabaseZap } from 'lucide-react';
+import type { ExecutiveSkuFocus } from '../../../shared/types';
 import { ChartCard } from './ChartCard';
 import { DailyInsights } from './DailyInsights';
 import { MarketSkuTrendChart } from './MarketSkuTrendChart';
 import { formatCurrency, formatInteger, formatSignedPercent } from './format';
-import type { DashboardRange, SkuFocusData } from './types';
+import type { DashboardRange } from './types';
 
 export interface SkuFocusViewProps {
-  data: SkuFocusData;
+  data: ExecutiveSkuFocus;
   range?: DashboardRange;
   currency?: string;
   onRangeChange?: (range: DashboardRange) => void;
@@ -43,7 +44,7 @@ export function SkuFocusView({ data, range, currency = 'USD', onRangeChange, onB
   return (
     <section className="executive-sku-focus" aria-label={`${data.sku.name}聚焦视图`}>
       <header className="executive-sku-focus__header">
-        <button type="button" onClick={onBack}><ArrowLeft size={16} aria-hidden="true" />返回全部 4 SKU</button>
+        <button type="button" onClick={onBack}><ArrowLeft size={16} aria-hidden="true" />返回全部自有 SKU</button>
         <div>
           <span>SKU FOCUS</span>
           <h2>{data.sku.name}</h2>
@@ -54,6 +55,9 @@ export function SkuFocusView({ data, range, currency = 'USD', onRangeChange, onB
       <div className="executive-sku-focus__lead">
         <MarketSkuTrendChart
           series={data.trendComparison}
+          commonBaselineDate={data.trendComparisonMeta.commonBaselineDate}
+          excludedSeries={data.trendComparisonMeta.excludedSeries}
+          marketConfigured={Boolean(data.market.id)}
           range={range}
           onRangeChange={onRangeChange}
           title="本 SKU VS 市场"

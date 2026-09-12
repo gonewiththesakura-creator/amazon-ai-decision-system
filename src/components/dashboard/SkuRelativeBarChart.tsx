@@ -38,7 +38,7 @@ export function SkuRelativeBarChart({ items, onSelectSku }: SkuRelativeBarChartP
 
   return (
     <ChartCard
-      title="4 SKU 相对市场表现"
+      title="自有 SKU 相对市场表现"
       eyebrow="RELATIVE PERFORMANCE"
       description="SKU 30D 增长减去所属市场 30D 增长。"
       footer={pendingCount ? <span className="dashboard-chart-note">{pendingCount} 个 SKU 因历史数据不足未参与比较</span> : null}
@@ -84,7 +84,7 @@ export function SkuRelativeBarChart({ items, onSelectSku }: SkuRelativeBarChartP
             ))}
           </div>
           <table className="dashboard-chart-data-table">
-            <caption>4 SKU 相对市场表现完整数据</caption>
+            <caption>自有 SKU 相对市场表现完整数据</caption>
             <thead>
               <tr>
                 <th scope="col">SKU</th>

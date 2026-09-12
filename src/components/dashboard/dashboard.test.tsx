@@ -3,6 +3,7 @@
 import '@testing-library/jest-dom/vitest';
 import { cleanup, fireEvent, render, screen, within } from '@testing-library/react';
 import { afterEach, describe, expect, it, vi } from 'vitest';
+import { MemoryRouter } from 'react-router-dom';
 import {
   DataFreshnessBadge,
   DailyInsights,
@@ -57,26 +58,36 @@ describe('executive dashboard presentation invariants', () => {
   });
 
   it('shows the trend empty state when no series has two valid points', () => {
-    render(<MarketSkuTrendChart series={[{
-      id: 'market',
-      label: '记忆棉枕头市场',
-      kind: 'market',
-      points: [{ date: '2026-09-11', index: null }],
-    }]} />);
+    render(<MarketSkuTrendChart
+      commonBaselineDate={null}
+      excludedSeries={[{ id: 'market', label: '记忆棉枕头市场', reason: 'insufficient_history' }]}
+      marketConfigured
+      series={[{
+        id: 'market',
+        label: '记忆棉枕头市场',
+        kind: 'market',
+        points: [],
+      }]}
+    />);
 
     expect(screen.getByText('历史快照不足')).toBeInTheDocument();
-    expect(screen.getByText('完成至少两个有效时间点后自动生成趋势。')).toBeInTheDocument();
+    expect(screen.getByText('市场与自有 SKU 形成共同有效基准后自动生成趋势。')).toBeInTheDocument();
   });
 
   it('exposes every plotted trend observation as an accessible data table', () => {
-    render(<MarketSkuTrendChart range="30D" series={[
+    render(<MarketSkuTrendChart
+      range="30D"
+      commonBaselineDate="2026-09-01T00:00:00.000Z"
+      excludedSeries={[{ id: 'sku-b', label: '历史较短 SKU', reason: 'no_common_baseline' }]}
+      marketConfigured
+      series={[
       {
         id: 'market',
         label: '记忆棉枕头市场',
         kind: 'market',
         points: [
-          { date: '2026-09-01T00:00:00.000Z', index: 100 },
-          { date: '2026-09-11T00:00:00.000Z', index: 106 },
+          { date: '2026-09-01T00:00:00.000Z', index: 100, relativeToMarket: null },
+          { date: '2026-09-11T00:00:00.000Z', index: 106, relativeToMarket: null },
         ],
       },
       {
@@ -88,14 +99,72 @@ describe('executive dashboard presentation invariants', () => {
           { date: '2026-09-11T00:00:00.000Z', index: 111, relativeToMarket: 5 },
         ],
       },
-    ]} />);
+      ]}
+    />);
 
-    const table = screen.getByRole('table', { name: '市场 VS 4 SKU 趋势完整数据，时间范围 30D' });
+    const table = screen.getByRole('table', { name: '市场 VS 自有 SKU 趋势完整数据，时间范围 30D' });
     expect(within(table).getAllByRole('row')).toHaveLength(5);
     expect(within(table).getByRole('columnheader', { name: '指数' })).toBeInTheDocument();
     expect(within(table).getAllByText('灰色人体工学枕')).toHaveLength(2);
-    expect(within(table).getByText('+5.0%')).toBeInTheDocument();
+    expect(within(table).getByText('+5.0 点')).toBeInTheDocument();
     expect(screen.getByLabelText('趋势时间范围')).toBeInTheDocument();
+    expect(screen.getByText(/共同基准：09\/01/)).toBeInTheDocument();
+    expect(screen.getByText(/历史较短 SKU因历史数据不足未参与当前周期比较/)).toBeInTheDocument();
+  });
+
+  it('never treats the first SKU as a market series when no primary market is configured', () => {
+    render(
+      <MemoryRouter>
+        <MarketSkuTrendChart
+          commonBaselineDate={null}
+          excludedSeries={[]}
+          marketConfigured={false}
+          series={[{
+            id: 'sku-a',
+            label: '灰色人体工学枕',
+            kind: 'owned_sku',
+            points: [
+              { date: '2026-09-01T00:00:00.000Z', index: 100, relativeToMarket: null },
+              { date: '2026-09-11T00:00:00.000Z', index: 108, relativeToMarket: null },
+            ],
+          }]}
+        />
+      </MemoryRouter>,
+    );
+
+    expect(screen.getByText('尚未设置主市场')).toBeInTheDocument();
+    expect(screen.getByRole('link', { name: '前往设置主市场' })).toHaveAttribute('href', '/settings');
+    expect(screen.queryByRole('table')).not.toBeInTheDocument();
+    expect(screen.queryByText('市场基准')).not.toBeInTheDocument();
+  });
+
+  it('does not calculate relative-to-market values in the browser', () => {
+    render(<MarketSkuTrendChart
+      commonBaselineDate="2026-09-01T00:00:00.000Z"
+      excludedSeries={[]}
+      marketConfigured
+      series={[
+        {
+          id: 'market', label: '主市场', kind: 'market',
+          points: [
+            { date: '2026-09-01T00:00:00.000Z', index: 100, relativeToMarket: null },
+            { date: '2026-09-11T00:00:00.000Z', index: 105, relativeToMarket: null },
+          ],
+        },
+        {
+          id: 'sku-a', label: '自有 SKU A', kind: 'owned_sku',
+          points: [
+            { date: '2026-09-01T00:00:00.000Z', index: 100, relativeToMarket: null },
+            { date: '2026-09-11T00:00:00.000Z', index: 110, relativeToMarket: null },
+          ],
+        },
+      ]}
+    />);
+
+    const table = screen.getByRole('table', { name: '市场 VS 自有 SKU 趋势完整数据，时间范围 30D' });
+    const skuRows = within(table).getAllByText('自有 SKU A').map((cell) => cell.closest('tr'));
+    expect(skuRows).toHaveLength(2);
+    expect(skuRows.every((row) => row?.textContent?.endsWith('不可用'))).toBe(true);
   });
 
   it('exposes the sorted competitor Top10 and nullable fields in a data table', () => {
@@ -118,21 +187,50 @@ describe('executive dashboard presentation invariants', () => {
       { id: 'sku-b', name: '白色枕', relativeDelta: null, performance: 'insufficient_data' },
     ]} />);
 
-    const table = screen.getByRole('table', { name: '4 SKU 相对市场表现完整数据' });
+    const table = screen.getByRole('table', { name: '自有 SKU 相对市场表现完整数据' });
     expect(within(table).getByText('白色枕').closest('tr')).toHaveTextContent('白色枕不可用数据不足');
     expect(within(table).getByText('灰色枕').closest('tr')).toHaveTextContent('灰色枕+8.0%跑赢');
   });
 
   it('labels unavailable opportunities without manufacturing zero scores', () => {
     const { container } = render(<DevelopmentOpportunityChart opportunities={[
-      { id: 'massage', name: '按摩枕', status: 'needs_data', score: null },
-      { id: 'leg', name: '腿枕', status: 'rejected', score: null },
+      {
+        id: 'massage', name: '按摩枕', scoreStatus: 'needs_data', score: null,
+        hardGate: 'needs_data', systemRecommendation: 'needs_data', approvalStatus: 'not_required',
+        approvedAction: null,
+      },
+      {
+        id: 'leg', name: '腿枕', scoreStatus: 'rejected', score: null,
+        hardGate: 'reject', systemRecommendation: 'reject', approvalStatus: 'not_required',
+        approvedAction: null,
+      },
     ]} />);
 
-    expect(screen.getByText('待补数据')).toBeInTheDocument();
-    expect(screen.getByText('已淘汰')).toBeInTheDocument();
+    expect(screen.getByText(/按摩枕 · 待补数据/)).toBeInTheDocument();
+    expect(screen.getByText(/腿枕 · Hard Gate 未通过/)).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /按摩枕，AI 建议：待补数据，审批状态：无需审批/ })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /腿枕，AI 建议：暂不开发，审批状态：无需审批/ })).toBeInTheDocument();
     expect(container.textContent).not.toContain('0 分');
     expect(container.querySelector('.recharts-responsive-container')).not.toBeInTheDocument();
+  });
+
+  it('keeps a system recommendation separate from its pending approval', () => {
+    render(<DevelopmentOpportunityChart opportunities={[{
+      id: 'travel',
+      name: 'U 型旅行枕',
+      scoreStatus: 'scored',
+      score: 78,
+      hardGate: 'pass',
+      systemRecommendation: 'test',
+      approvalStatus: 'waiting',
+      approvedAction: null,
+    }]} />);
+
+    expect(screen.getByRole('button', {
+      name: 'U 型旅行枕，AI 建议：小规模验证，审批状态：待审批',
+    })).toBeInTheDocument();
+    expect(screen.getByText(/AI 建议：小规模验证 · 审批状态：待审批/)).toBeInTheDocument();
+    expect(screen.queryByText('继续观察')).not.toBeInTheDocument();
   });
 
   it('uses horizontal status bars instead of a donut above five categories', () => {
@@ -145,8 +243,9 @@ describe('executive dashboard presentation invariants', () => {
       { key: 'archived', label: '已归档', count: 4 },
     ]} />);
 
-    expect(screen.getByLabelText('产品研究状态水平条')).toBeInTheDocument();
-    expect(screen.queryByLabelText('产品研究状态环形图')).not.toBeInTheDocument();
+    expect(screen.getByLabelText('产品研究建议水平条')).toBeInTheDocument();
+    expect(screen.queryByLabelText('产品研究建议环形图')).not.toBeInTheDocument();
+    expect(screen.getByText('仅统计系统建议，不混入人工审批结果。')).toBeInTheDocument();
   });
 
   it('keeps evidence details behind an accessible drawer without exposing evidence ids', () => {
@@ -228,6 +327,7 @@ describe('executive dashboard presentation invariants', () => {
       sku: { id: 'sku-a', name: '灰色人体工学枕', asin: 'B0TEST', sku: 'GRAY-01' },
       market: { id: 'market-a', name: '记忆棉枕头市场' },
       trendComparison: [],
+      trendComparisonMeta: { commonBaselineDate: null, excludedSeries: [] },
       operatingMetrics: {
         estimatedSales: null,
         estimatedRevenue: null,
@@ -248,5 +348,6 @@ describe('executive dashboard presentation invariants', () => {
     expect(screen.getByText('月销售额').closest('div')).toHaveTextContent('—');
     expect(screen.getByText('市场 30D').closest('div')).toHaveTextContent('—');
     expect(screen.getByText('进一步诊断仍需：广告、流量和转化数据')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /返回全部自有 SKU/ })).toBeInTheDocument();
   });
 });

@@ -538,6 +538,7 @@ export interface DataTask {
   name: string;
   taskType: string;
   target: string;
+  sourceId: string | null;
   source: string;
   marketplace: string;
   status: TaskStatus;
@@ -548,6 +549,7 @@ export interface DataTask {
   failed: number;
   errorLog: string | null;
   researchJobId?: string;
+  createdAt: string;
 }
 
 export interface DataSource {
@@ -607,6 +609,7 @@ export interface DashboardData {
 export interface IndexedTrendPoint {
   date: string;
   index: number;
+  relativeToMarket: number | null;
 }
 
 export interface IndexedTrendSeries {
@@ -614,6 +617,17 @@ export interface IndexedTrendSeries {
   label: string;
   kind: 'market' | 'owned_sku' | 'competitor_average';
   points: IndexedTrendPoint[];
+}
+
+export interface IndexedTrendExcludedSeries {
+  id: string;
+  label: string;
+  reason: 'insufficient_history' | 'no_common_baseline';
+}
+
+export interface IndexedTrendComparisonMeta {
+  commonBaselineDate: string | null;
+  excludedSeries: IndexedTrendExcludedSeries[];
 }
 
 export type ExecutiveTrendSeries = IndexedTrendSeries;
@@ -697,10 +711,12 @@ export interface ExecutiveDailyInsight {
 export interface ExecutiveDevelopmentOpportunity {
   id: string;
   name: string;
-  status: 'scored' | 'needs_data' | 'rejected';
+  scoreStatus: 'scored' | 'needs_data' | 'rejected';
   score: number | null;
   hardGate: 'pass' | 'needs_data' | 'reject';
-  recommendation: 'develop' | 'test' | 'watch' | 'reject' | 'needs_data';
+  systemRecommendation: 'develop' | 'test' | 'watch' | 'reject' | 'needs_data';
+  approvalStatus: 'not_required' | 'waiting' | 'approved' | 'watch' | 'rejected' | 'needs_data';
+  approvedAction: string | null;
 }
 
 export interface ExecutiveResearchStatus {
@@ -709,12 +725,24 @@ export interface ExecutiveResearchStatus {
   count: number;
 }
 
-export interface ExecutiveDataStatus {
-  status: 'normal' | 'partial' | 'insufficient' | 'failed';
-  label: '正常' | '部分未更新' | '数据不足' | '同步失败';
+export interface CoreBusinessFreshness {
+  status: 'normal' | 'partial' | 'insufficient' | 'stale';
+  label: '正常' | '部分未更新' | '数据不足' | '数据陈旧';
   message: string;
-  updatedAt: string | null;
+  marketUpdatedAt: string | null;
+  ownedProductsUpdatedAt: string | null;
+  competitorsUpdatedAt: string | null;
+  oldestRequiredSnapshotAt: string | null;
+  newestRequiredSnapshotAt: string | null;
+  missingEntityIds: string[];
   isDemo: boolean;
+}
+
+export interface SystemSyncStatus {
+  status: 'idle' | 'running' | 'partial' | 'failed' | 'success';
+  latestTaskAt: string | null;
+  source: string | null;
+  message: string | null;
 }
 
 export interface ExecutiveSkuFocusCompetitor {
@@ -738,6 +766,7 @@ export interface ExecutiveSkuFocus {
   };
   market: { id: string; name: string };
   trendComparison: IndexedTrendSeries[];
+  trendComparisonMeta: IndexedTrendComparisonMeta;
   operatingMetrics: {
     estimatedSales: number | null;
     estimatedRevenue: number | null;
@@ -761,13 +790,15 @@ export interface ExecutiveDashboardViewModel {
   market: { id: string; name: string } | null;
   kpis: ExecutiveDashboardKpis;
   trendComparison: IndexedTrendSeries[];
+  trendComparisonMeta: IndexedTrendComparisonMeta;
   ownedSkuPerformance: ExecutiveSkuPerformance[];
   marketDistribution: ExecutiveMarketDistribution;
   fastGrowthCompetitors: ExecutiveCompetitorGrowth[];
   dailyInsights: ExecutiveDailyInsight[];
   developmentOpportunities: ExecutiveDevelopmentOpportunity[];
   researchStatus: ExecutiveResearchStatus[];
-  dataStatus: ExecutiveDataStatus;
+  coreBusinessFreshness: CoreBusinessFreshness;
+  systemSyncStatus: SystemSyncStatus;
   skuFocus: ExecutiveSkuFocus | null;
 }
 

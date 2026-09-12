@@ -7,7 +7,7 @@ export default defineConfig({
     port: 5173,
     strictPort: false,
     proxy: {
-      '/api': 'http://127.0.0.1:8787',
+      '/api': process.env.API_PROXY_TARGET ?? 'http://127.0.0.1:8787',
     },
   },
   preview: {

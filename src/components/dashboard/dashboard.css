@@ -739,7 +739,13 @@
 .dashboard-opportunity-status button:disabled,
 .executive-focus-competitors button:disabled { cursor: default; opacity: 1; }
 
-.dashboard-opportunity-status strong { flex: 0 0 auto; font-size: 10px; }
+.dashboard-opportunity-status strong {
+  min-width: 0;
+  flex: 1 1 auto;
+  font-size: 10px;
+  overflow-wrap: anywhere;
+  text-align: right;
+}
 .dashboard-opportunity-status .is-pending { color: var(--amber, #a86120); }
 .dashboard-opportunity-status .is-rejected { color: var(--red, #b5433f); }
 
@@ -800,7 +806,7 @@ button.executive-freshness:hover { background: var(--surface-soft, #f0f4f2); }
 .executive-freshness--normal svg { color: var(--teal, #147763); }
 .executive-freshness--partial svg,
 .executive-freshness--insufficient svg { color: var(--amber, #a86120); }
-.executive-freshness--failed svg { color: var(--red, #b5433f); }
+.executive-freshness--stale svg { color: var(--red, #b5433f); }
 
 .executive-sku-focus { display: grid; gap: 14px; min-width: 0; }
 
@@ -975,4 +981,6 @@ button.executive-freshness:hover { background: var(--surface-soft, #f0f4f2); }
   .executive-data-state { justify-content: flex-start; }
   .executive-freshness { white-space: normal; }
   .executive-focus-metrics { grid-template-columns: 1fr; }
+  .dashboard-opportunity-status button { align-items: flex-start; flex-direction: column; gap: 4px; padding: 7px 8px; }
+  .dashboard-opportunity-status strong { width: 100%; text-align: left; }
 }

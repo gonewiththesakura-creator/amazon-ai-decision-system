@@ -86,7 +86,7 @@ export function Onboarding() {
       <div className="onboarding-actions">
         <button type="button" onClick={() => navigate('/settings?tab=products')}>
           <span><PackagePlus size={21} aria-hidden="true" /></span>
-          <strong>初始化现有 4 SKU</strong>
+          <strong>批量初始化自有 SKU</strong>
           <small>录入 ASIN、市场与直接竞品</small>
         </button>
         <button type="button" onClick={() => navigate('/settings?tab=sources')}>

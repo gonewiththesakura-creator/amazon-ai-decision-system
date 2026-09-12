@@ -10,17 +10,20 @@ import {
   XAxis,
   YAxis,
 } from 'recharts';
+import type { IndexedTrendExcludedSeries } from '../../../shared/types';
 import { ChartCard } from './ChartCard';
 import { ChartEmptyState } from './ChartEmptyState';
-import { formatDashboardDate, formatSignedPercent, indexedTrendDomain } from './format';
+import { formatDashboardDate, indexedTrendDomain } from './format';
 import type { DashboardRange, IndexedTrendSeries } from './types';
 
 const ranges: DashboardRange[] = ['7D', '30D', '90D', '180D', '1Y'];
-const rangeDays: Record<DashboardRange, number> = { '7D': 7, '30D': 30, '90D': 90, '180D': 180, '1Y': 365 };
 const ownedSkuColors = ['#147763', '#a86120', '#775b8c', '#3d7782', '#8b5b45'];
 
 export interface MarketSkuTrendChartProps {
   series: IndexedTrendSeries[];
+  commonBaselineDate: string | null;
+  excludedSeries: IndexedTrendExcludedSeries[];
+  marketConfigured: boolean;
   range?: DashboardRange;
   onRangeChange?: (range: DashboardRange) => void;
   title?: string;
@@ -31,27 +34,21 @@ export interface MarketSkuTrendChartProps {
 type ChartTrendRow = Record<string, string | number | null> & { date: string };
 
 function seriesKey(series: IndexedTrendSeries): string {
-  return series.key ?? series.id;
+  return series.id;
 }
 
 function seriesColor(series: IndexedTrendSeries, ownedIndex: number): string {
-  if (series.color) return series.color;
   if (series.kind === 'market') return '#2e689f';
   if (series.kind === 'competitor_average') return '#61706d';
   return ownedSkuColors[ownedIndex % ownedSkuColors.length];
 }
 
-function buildChartRows(series: IndexedTrendSeries[], range: DashboardRange): ChartTrendRow[] {
-  const allDates = series.flatMap((item) => item.points.map((point) => new Date(point.date).getTime())).filter(Number.isFinite);
-  const latest = allDates.length ? Math.max(...allDates) : null;
-  const threshold = latest === null ? null : latest - rangeDays[range] * 24 * 60 * 60 * 1000;
+function buildChartRows(series: IndexedTrendSeries[]): ChartTrendRow[] {
   const rows = new Map<string, ChartTrendRow>();
 
   series.forEach((item) => {
     const key = seriesKey(item);
     item.points.forEach((point) => {
-      const timestamp = new Date(point.date).getTime();
-      if (threshold !== null && Number.isFinite(timestamp) && timestamp < threshold) return;
       const row = rows.get(point.date) ?? { date: point.date };
       row[key] = point.index !== null && Number.isFinite(point.index) ? point.index : null;
       row[`${key}__relative`] = point.relativeToMarket !== null
@@ -71,29 +68,32 @@ function relativeToMarketLabel(
   key: string,
   marketKey: string | null,
 ): string {
-  if (key === marketKey) return '市场基准';
+  if (marketKey !== null && key === marketKey) return '市场基准';
   const explicitRelative = row[`${key}__relative`];
-  if (typeof explicitRelative === 'number') return formatSignedPercent(explicitRelative);
-  const value = row[key];
-  const marketValue = marketKey ? row[marketKey] : null;
-  return typeof value === 'number' && typeof marketValue === 'number'
-    ? formatSignedPercent(value - marketValue)
-    : '不可用';
+  if (typeof explicitRelative === 'number') return formatIndexDelta(explicitRelative);
+  return '不可用';
+}
+
+function formatIndexDelta(value: number): string {
+  return `${value > 0 ? '+' : ''}${value.toFixed(1)} 点`;
 }
 
 export function MarketSkuTrendChart({
   series,
+  commonBaselineDate,
+  excludedSeries,
+  marketConfigured,
   range,
   onRangeChange,
-  title = '市场 VS 4 SKU 趋势',
-  description = '选定时间范围起点统一为 100，比较走势而非绝对体量。',
+  title = '市场 VS 自有 SKU 趋势',
+  description = '所有参与序列使用同一有效日期作为 100 基准，比较走势而非绝对体量。',
   marketHref,
 }: MarketSkuTrendChartProps) {
   const [internalRange, setInternalRange] = useState<DashboardRange>('30D');
   const activeRange = range ?? internalRange;
-  const rows = useMemo(() => buildChartRows(series, activeRange), [activeRange, series]);
+  const rows = useMemo(() => buildChartRows(series), [series]);
   const visibleSeries = series.filter((item) => rows.filter((row) => typeof row[seriesKey(item)] === 'number').length >= 2);
-  const marketSeries = visibleSeries.find((item) => item.kind === 'market') ?? visibleSeries[0];
+  const marketSeries = visibleSeries.find((item) => item.kind === 'market');
   const marketKey = marketSeries ? seriesKey(marketSeries) : null;
   const labelByKey = new Map(series.map((item) => [seriesKey(item), item.label]));
   const chartDomain = indexedTrendDomain(visibleSeries.flatMap((item) => (
@@ -101,6 +101,16 @@ export function MarketSkuTrendChart({
   )));
   let legendOwnedIndex = 0;
   let lineOwnedIndex = 0;
+  const canCompare = Boolean(marketSeries) && visibleSeries.length >= 2 && rows.length >= 2 && commonBaselineDate !== null;
+  const baselineLabel = commonBaselineDate
+    ? `共同基准：${formatDashboardDate(commonBaselineDate)}`
+    : null;
+  const excludedLabel = excludedSeries.length
+    ? `${excludedSeries.map((item) => item.label).join('、')}因历史数据不足未参与当前周期比较`
+    : null;
+  const footer = baselineLabel || excludedLabel ? (
+    <span className="dashboard-chart-note">{[baselineLabel, excludedLabel].filter(Boolean).join(' · ')}</span>
+  ) : null;
 
   const changeRange = (nextRange: DashboardRange) => {
     if (range === undefined) setInternalRange(nextRange);
@@ -130,8 +140,9 @@ export function MarketSkuTrendChart({
       eyebrow="INDEXED PERFORMANCE"
       description={description}
       action={rangeControl}
+      footer={footer}
     >
-      {visibleSeries.length && rows.length >= 2 ? (
+      {canCompare ? (
         <>
           <div className="dashboard-chart-legend" aria-hidden="true">
             {visibleSeries.map((item) => {
@@ -155,14 +166,11 @@ export function MarketSkuTrendChart({
                     const row = item.payload as ChartTrendRow;
                     const key = String(name);
                     const explicitRelative = row[`${key}__relative`];
-                    const marketValue = marketKey ? row[marketKey] : null;
                     const relative = typeof explicitRelative === 'number'
                       ? explicitRelative
-                      : key !== marketKey && typeof marketValue === 'number'
-                        ? numericValue - marketValue
-                        : null;
+                      : null;
                     return [
-                      `${numericValue.toFixed(1)}${relative !== null ? ` · 相对市场 ${formatSignedPercent(relative)}` : ''}`,
+                      `${numericValue.toFixed(1)}${relative !== null ? ` · 相对市场 ${formatIndexDelta(relative)}` : ''}`,
                       labelByKey.get(key) ?? key,
                     ];
                   }}
@@ -217,7 +225,17 @@ export function MarketSkuTrendChart({
           </table>
         </>
       ) : (
-        <ChartEmptyState title="历史快照不足" description="完成至少两个有效时间点后自动生成趋势。" />
+        <>
+          <ChartEmptyState
+            title={marketConfigured ? '历史快照不足' : '尚未设置主市场'}
+            description={marketConfigured
+              ? '市场与自有 SKU 形成共同有效基准后自动生成趋势。'
+              : '设置主市场后才能比较市场与自有 SKU。'}
+          />
+          {!marketConfigured ? (
+            <Link className="dashboard-chart-link" to="/settings">前往设置主市场</Link>
+          ) : null}
+        </>
       )}
     </ChartCard>
   );

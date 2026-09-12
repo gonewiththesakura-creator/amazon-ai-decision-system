@@ -36,18 +36,44 @@ export class MockAdapter implements MarketDataAdapter {
 
   async fetchMarketOverview(input: MarketInput): Promise<MarketOverviewRecord> {
     const seed = numericSeed(`${input.marketplace}:${input.keywords.join('|')}`);
-    const monthlySales = Math.round(18_000 + fraction(seed, 2) * 110_000);
-    const avgPrice = Math.round((22 + fraction(seed, 7) * 38) * 100) / 100;
+    const previous = input.previousSnapshot;
+    const seededSales = Math.round(18_000 + fraction(seed, 2) * 110_000);
+    const seededPrice = Math.round((22 + fraction(seed, 7) * 38) * 100) / 100;
+    const seededTop10Share = Math.round((24 + fraction(seed, 11) * 30) * 10) / 10;
+    const seededTop20Share = Math.round(
+      Math.min(82, seededTop10Share + 14 + fraction(seed, 15) * 12) * 10,
+    ) / 10;
+    const monthlySales = previous?.monthlySales !== null && previous?.monthlySales !== undefined
+      ? Math.round(previous.monthlySales * 1.003)
+      : seededSales;
+    const avgPrice = previous?.avgPrice ?? seededPrice;
+    const top10Share = previous?.top10Share ?? seededTop10Share;
+    const top20Share = previous?.top20Share ?? seededTop20Share;
+    const defaultPriceBands: MarketOverviewRecord['priceBands'] = [
+      { label: '< $30', productCount: 74, monthlySales: Math.round(monthlySales * 0.24), revenue: Math.round(monthlySales * 0.24 * 24), avgReviews: 420, newProducts: 12, growth: 2.4 },
+      { label: '$30-49', productCount: 96, monthlySales: Math.round(monthlySales * 0.52), revenue: Math.round(monthlySales * 0.52 * 39), avgReviews: 760, newProducts: 18, growth: 8.1 },
+      { label: '$50+', productCount: 43, monthlySales: Math.round(monthlySales * 0.24), revenue: Math.round(monthlySales * 0.24 * 61), avgReviews: 1_240, newProducts: 7, growth: 4.6 },
+    ];
+    const defaultConcentration: MarketOverviewRecord['concentration'] = [
+      { tier: 'Top 10', share: top10Share, avgPrice, avgSales: Math.round(monthlySales * top10Share / 1_000) },
+      { tier: 'Top 20', share: top20Share, avgPrice, avgSales: Math.round(monthlySales * top20Share / 2_000) },
+    ];
     return {
-      productCount: Math.round(120 + fraction(seed, 1) * 1_100),
-      sellerCount: Math.round(80 + fraction(seed, 4) * 700),
-      brandCount: Math.round(45 + fraction(seed, 8) * 380),
+      productCount: previous?.productCount ?? Math.round(120 + fraction(seed, 1) * 1_100),
+      sellerCount: previous?.sellerCount ?? Math.round(80 + fraction(seed, 4) * 700),
+      brandCount: previous?.brandCount ?? Math.round(45 + fraction(seed, 8) * 380),
       monthlySales,
       monthlyRevenue: Math.round(monthlySales * avgPrice * 100) / 100,
       avgPrice,
-      medianPrice: Math.round(avgPrice * 0.94 * 100) / 100,
-      avgRating: Math.round((4.1 + fraction(seed, 13) * 0.35) * 100) / 100,
-      medianReviews: Math.round(180 + fraction(seed, 17) * 1_400),
+      medianPrice: previous?.medianPrice ?? Math.round(avgPrice * 0.94 * 100) / 100,
+      avgRating: previous?.avgRating ?? Math.round((4.1 + fraction(seed, 13) * 0.35) * 100) / 100,
+      medianReviews: previous?.medianReviews ?? Math.round(180 + fraction(seed, 17) * 1_400),
+      top10Share,
+      top20Share,
+      newProductShare: previous?.newProductShare
+        ?? Math.round((7 + fraction(seed, 21) * 18) * 10) / 10,
+      priceBands: previous?.priceBands ?? defaultPriceBands,
+      concentration: previous?.concentration ?? defaultConcentration,
       provenance: this.provenance(),
     };
   }
@@ -64,9 +90,35 @@ export class MockAdapter implements MarketDataAdapter {
 
   async fetchProductDetail(input: ProductInput): Promise<ProductDetailRecord> {
     const provenance = this.provenance();
+    const generated = this.productFromSeed(input.asin, input.marketplace, 'unassigned', provenance);
+    const previous = input.previousSnapshot?.snapshotAvailable ? input.previousSnapshot : null;
+    const price = previous?.price ?? generated.latest.price;
+    const previousSales = previous?.estimatedSales;
+    const estimatedSales = previousSales !== null && previousSales !== undefined
+      ? Math.round(previousSales * 1.002)
+      : generated.latest.estimatedSales;
+    const latest: ProductSnapshot = previous ? {
+      ...generated.latest,
+      date: provenance.collectedAt.slice(0, 10),
+      price,
+      rating: previous.rating ?? generated.latest.rating,
+      reviewCount: previous.reviewCount ?? generated.latest.reviewCount,
+      bsr: previous.bsr ?? generated.latest.bsr,
+      estimatedSales,
+      estimatedRevenue: price !== null && estimatedSales !== null
+        ? Math.round(price * estimatedSales * 100) / 100
+        : generated.latest.estimatedRevenue,
+      sellerCount: previous.sellerCount ?? generated.latest.sellerCount,
+      growth7d: previous.growth7d ?? generated.latest.growth7d,
+      growth30d: previous.growth30d ?? generated.latest.growth30d,
+      growth30dAvailable: previous.growth30dAvailable || generated.latest.growth30dAvailable,
+      growth90d: previous.growth90d ?? generated.latest.growth90d,
+      provenance,
+    } : generated.latest;
     return {
-      ...this.productFromSeed(input.asin, input.marketplace, 'unassigned', provenance),
+      ...generated,
       asin: input.asin,
+      latest,
       provenance,
     };
   }

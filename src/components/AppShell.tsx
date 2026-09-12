@@ -57,8 +57,8 @@ const navGroups: NavGroup[] = [
     id: 'current',
     label: '现有业务',
     items: [
-      { to: '/market', label: '记忆棉市场', icon: ChartNoAxesCombined },
-      { to: '/owned-products', label: '自有 4 SKU', icon: Boxes },
+      { to: '/market', label: '市场情报', icon: ChartNoAxesCombined },
+      { to: '/owned-products', label: '自有产品', icon: Boxes },
     ],
   },
   {
@@ -89,14 +89,14 @@ const navGroups: NavGroup[] = [
 
 const pageNames: Array<[string, string]> = [
   ['/research-jobs', '研究任务工作流'],
-  ['/owned-products', '自有 4 SKU 战情室'],
+  ['/owned-products', '自有产品战情室'],
   ['/opportunity-lab', '新赛道机会实验室'],
   ['/opportunities', '机会池 / 淘汰池'],
   ['/development', '待开发产品'],
   ['/monitoring', '监控中心'],
   ['/data-tasks', '数据任务中心'],
   ['/settings', '系统设置'],
-  ['/market', '记忆棉枕头市场'],
+  ['/market', '市场情报'],
   ['/', 'AI 经营驾驶舱'],
 ];
 
@@ -234,7 +234,7 @@ export function AppShell() {
     setSyncing(true);
     try {
       if (settings.mode !== 'empty' && settings.role === 'admin') {
-        const task = await api.post<DataTask>('/api/data-tasks/run', { taskType: 'manual_refresh', target: 'all' });
+        const task = await api.post<DataTask>('/api/data-tasks/run', { taskType: 'dashboard_core_refresh', target: 'all' });
         if (task.status === 'failed' || task.status === 'partial') {
           throw new Error(task.errorLog || (task.status === 'failed' ? '刷新任务执行失败' : '刷新任务仅部分完成'));
         }
@@ -308,7 +308,7 @@ export function AppShell() {
           <div className="sidebar-footer__status">
             <span className={clsx('status-dot', settings.mode === 'live' ? 'is-live' : settings.mode === 'demo' ? 'is-demo' : '')} />
             <div>
-              <strong>{settings.mode === 'live' ? '真实数据已连接' : settings.mode === 'demo' ? 'Demo 数据源' : '等待数据接入'}</strong>
+              <strong>{settings.mode === 'live' ? 'Live 工作区' : settings.mode === 'demo' ? 'Demo 数据源' : '等待数据接入'}</strong>
               <small>{formatFreshness(settings.lastSuccessfulSync)}</small>
             </div>
           </div>
@@ -349,7 +349,7 @@ export function AppShell() {
             <div className="freshness-control" title={settings.lastSuccessfulSync ?? '尚未同步'}>
               <DatabaseZap size={16} aria-hidden="true" />
               <span>
-                <small>{settings.mode === 'demo' ? 'Mock Adapter' : settings.mode === 'live' ? '已连接数据源' : '未连接'}</small>
+                <small>{settings.mode === 'demo' ? 'Mock Adapter' : settings.mode === 'live' ? '系统最近同步' : '尚未同步'}</small>
                 <strong>{formatFreshness(settings.lastSuccessfulSync)}</strong>
               </span>
             </div>
