@@ -1390,6 +1390,275 @@ const migrations = [
       );
     `,
   },
+  {
+    version: 20,
+    apply(database: DatabaseSync): void {
+      // Some narrow historical test fixtures intentionally model only the V13
+      // workflow tables while marking later migrations applied. A real V19
+      // database always has this foundational table pair.
+      const hasProductSnapshots = database.prepare(`
+        SELECT 1 AS present FROM sqlite_master WHERE type = 'table' AND name = 'product_snapshots'
+      `).get();
+      if (!hasProductSnapshots) return;
+
+      database.exec(`
+        ALTER TABLE products ADD COLUMN status TEXT NOT NULL DEFAULT 'active'
+          CHECK (status IN ('active', 'inactive'));
+        ALTER TABLE products ADD COLUMN updated_at TEXT;
+        ALTER TABLE products ADD COLUMN variation_family_id TEXT;
+        ALTER TABLE products ADD COLUMN parent_asin TEXT;
+        ALTER TABLE products ADD COLUMN is_parent INTEGER NOT NULL DEFAULT 0;
+        ALTER TABLE products ADD COLUMN variation_attributes_json TEXT NOT NULL DEFAULT '{}';
+
+        CREATE TABLE variation_families (
+          id TEXT PRIMARY KEY,
+          marketplace TEXT NOT NULL,
+          parent_asin TEXT NOT NULL,
+          variation_theme TEXT,
+          attributes_json TEXT NOT NULL DEFAULT '{}',
+          status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'inactive')),
+          created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL,
+          UNIQUE(marketplace, parent_asin)
+        );
+        CREATE INDEX idx_variation_families_market_parent
+          ON variation_families(marketplace, parent_asin);
+        CREATE INDEX idx_products_identity_asin
+          ON products(marketplace, asin);
+        CREATE INDEX idx_products_identity_sku
+          ON products(marketplace, sku);
+        CREATE INDEX idx_products_variation_family
+          ON products(variation_family_id);
+
+        ALTER TABLE market_snapshots ADD COLUMN observation_date TEXT;
+        ALTER TABLE market_snapshots ADD COLUMN dedup_key TEXT;
+        ALTER TABLE product_snapshots ADD COLUMN observation_date TEXT;
+        ALTER TABLE product_snapshots ADD COLUMN dedup_key TEXT;
+
+        UPDATE market_snapshots
+        SET observation_date = date,
+            dedup_key = 'market|'
+              || COALESCE((SELECT marketplace FROM market_nodes WHERE market_nodes.id = market_snapshots.market_node_id), '')
+              || '|' || market_node_id || '|' || date || '|' || lower(trim(source_type))
+              || '|' || lower(trim(source)) || '|' || period || '|legacy|' || id
+        WHERE observation_date IS NULL OR dedup_key IS NULL;
+        CREATE UNIQUE INDEX idx_market_snapshots_dedup_key
+          ON market_snapshots(dedup_key) WHERE dedup_key IS NOT NULL;
+        CREATE INDEX idx_market_snapshots_observation
+          ON market_snapshots(market_node_id, observation_date DESC);
+
+        UPDATE product_snapshots
+        SET observation_date = date,
+            dedup_key = 'product|'
+              || COALESCE((SELECT marketplace FROM products WHERE products.id = product_snapshots.product_id), '')
+              || '|' || product_id || '|' || date || '|' || lower(trim(source_type))
+              || '|' || lower(trim(source)) || '|' || period || '|legacy|' || id
+        WHERE observation_date IS NULL OR dedup_key IS NULL;
+        CREATE UNIQUE INDEX idx_product_snapshots_dedup_key
+          ON product_snapshots(dedup_key) WHERE dedup_key IS NOT NULL;
+        CREATE INDEX idx_product_snapshots_observation
+          ON product_snapshots(product_id, observation_date DESC);
+
+        DROP TRIGGER IF EXISTS trg_market_snapshots_immutable;
+        DROP TRIGGER IF EXISTS trg_product_snapshots_immutable;
+        DROP INDEX IF EXISTS idx_market_snapshots_node_date;
+        DROP INDEX IF EXISTS idx_market_snapshots_dedup_key;
+        DROP INDEX IF EXISTS idx_market_snapshots_observation;
+        DROP INDEX IF EXISTS idx_product_snapshots_product_date;
+        DROP INDEX IF EXISTS idx_product_snapshots_dedup_key;
+        DROP INDEX IF EXISTS idx_product_snapshots_observation;
+        ALTER TABLE market_snapshots RENAME TO market_snapshots_v19;
+        ALTER TABLE product_snapshots RENAME TO product_snapshots_v19;
+
+        CREATE TABLE market_snapshots (
+          id TEXT PRIMARY KEY,
+          market_node_id TEXT NOT NULL REFERENCES market_nodes(id) ON DELETE CASCADE,
+          date TEXT NOT NULL,
+          product_count INTEGER,
+          seller_count INTEGER,
+          brand_count INTEGER,
+          monthly_sales REAL,
+          monthly_revenue REAL,
+          avg_price REAL,
+          median_price REAL,
+          avg_rating REAL,
+          median_reviews REAL,
+          top10_share REAL,
+          top20_share REAL,
+          new_product_share REAL,
+          price_bands_json TEXT,
+          concentration_json TEXT,
+          source TEXT NOT NULL,
+          source_type TEXT NOT NULL,
+          collected_at TEXT NOT NULL,
+          period TEXT NOT NULL,
+          is_estimated INTEGER NOT NULL,
+          confidence REAL NOT NULL,
+          observation_date TEXT,
+          dedup_key TEXT
+        );
+        INSERT INTO market_snapshots (
+          id, market_node_id, date, product_count, seller_count, brand_count, monthly_sales,
+          monthly_revenue, avg_price, median_price, avg_rating, median_reviews, top10_share,
+          top20_share, new_product_share, price_bands_json, concentration_json, source,
+          source_type, collected_at, period, is_estimated, confidence, observation_date, dedup_key
+        ) SELECT
+          id, market_node_id, date, product_count, seller_count, brand_count, monthly_sales,
+          monthly_revenue, avg_price, median_price, avg_rating, median_reviews, top10_share,
+          top20_share, new_product_share, price_bands_json, concentration_json, source,
+          source_type, collected_at, period, is_estimated, confidence, observation_date, dedup_key
+        FROM market_snapshots_v19;
+        DROP TABLE market_snapshots_v19;
+        CREATE INDEX idx_market_snapshots_node_date
+          ON market_snapshots(market_node_id, date DESC);
+        CREATE UNIQUE INDEX idx_market_snapshots_dedup_key
+          ON market_snapshots(dedup_key) WHERE dedup_key IS NOT NULL;
+        CREATE INDEX idx_market_snapshots_observation
+          ON market_snapshots(market_node_id, observation_date DESC);
+        CREATE TRIGGER trg_market_snapshots_immutable
+        BEFORE UPDATE ON market_snapshots
+        BEGIN
+          SELECT RAISE(ABORT, 'market_snapshots are immutable; append a new snapshot');
+        END;
+
+        CREATE TABLE product_snapshots (
+          id TEXT PRIMARY KEY,
+          product_id TEXT NOT NULL REFERENCES products(id) ON DELETE CASCADE,
+          date TEXT NOT NULL,
+          price REAL,
+          rating REAL,
+          review_count INTEGER,
+          bsr INTEGER,
+          estimated_sales REAL,
+          estimated_revenue REAL,
+          seller_count INTEGER,
+          growth_7d REAL,
+          growth_30d REAL,
+          growth_90d REAL,
+          source TEXT NOT NULL,
+          source_type TEXT NOT NULL,
+          collected_at TEXT NOT NULL,
+          period TEXT NOT NULL,
+          is_estimated INTEGER NOT NULL,
+          confidence REAL NOT NULL,
+          observation_date TEXT,
+          dedup_key TEXT
+        );
+        INSERT INTO product_snapshots (
+          id, product_id, date, price, rating, review_count, bsr, estimated_sales,
+          estimated_revenue, seller_count, growth_7d, growth_30d, growth_90d, source,
+          source_type, collected_at, period, is_estimated, confidence, observation_date, dedup_key
+        ) SELECT
+          id, product_id, date, price, rating, review_count, bsr, estimated_sales,
+          estimated_revenue, seller_count, growth_7d, growth_30d, growth_90d, source,
+          source_type, collected_at, period, is_estimated, confidence, observation_date, dedup_key
+        FROM product_snapshots_v19;
+        DROP TABLE product_snapshots_v19;
+        CREATE INDEX idx_product_snapshots_product_date
+          ON product_snapshots(product_id, date DESC);
+        CREATE UNIQUE INDEX idx_product_snapshots_dedup_key
+          ON product_snapshots(dedup_key) WHERE dedup_key IS NOT NULL;
+        CREATE INDEX idx_product_snapshots_observation
+          ON product_snapshots(product_id, observation_date DESC);
+        CREATE TRIGGER trg_product_snapshots_immutable
+        BEFORE UPDATE ON product_snapshots
+        BEGIN
+          SELECT RAISE(ABORT, 'product_snapshots are immutable; append a new snapshot');
+        END;
+
+        CREATE TABLE provider_capability_snapshots (
+          id TEXT PRIMARY KEY,
+          provider_id TEXT NOT NULL,
+          capabilities_json TEXT NOT NULL,
+          collected_at TEXT NOT NULL,
+          expires_at TEXT
+        );
+        CREATE INDEX idx_provider_capabilities_provider_collected
+          ON provider_capability_snapshots(provider_id, collected_at DESC);
+
+        CREATE TABLE mcp_call_logs (
+          id TEXT PRIMARY KEY,
+          provider_id TEXT NOT NULL,
+          capability TEXT NOT NULL,
+          actual_tool TEXT,
+          request_hash TEXT NOT NULL,
+          parameter_hash TEXT,
+          research_job_id TEXT,
+          entity_type TEXT,
+          entity_id TEXT,
+          status TEXT NOT NULL,
+          cache_hit INTEGER NOT NULL DEFAULT 0,
+          result_count INTEGER,
+          response_metadata_json TEXT NOT NULL DEFAULT '{}',
+          error_code TEXT,
+          started_at TEXT NOT NULL,
+          completed_at TEXT,
+          duration_ms INTEGER
+        );
+        CREATE INDEX idx_mcp_call_logs_provider_started
+          ON mcp_call_logs(provider_id, started_at DESC);
+
+        CREATE TABLE mcp_response_cache (
+          cache_key TEXT PRIMARY KEY,
+          provider_id TEXT NOT NULL,
+          response_json TEXT NOT NULL,
+          created_at TEXT NOT NULL,
+          expires_at TEXT NOT NULL
+        );
+        CREATE INDEX idx_mcp_response_cache_expiry ON mcp_response_cache(expires_at);
+
+        CREATE TABLE competitor_candidates (
+          id TEXT PRIMARY KEY,
+          marketplace TEXT NOT NULL,
+          asin TEXT NOT NULL,
+          source_product_id TEXT NOT NULL REFERENCES products(id) ON DELETE CASCADE,
+          source TEXT NOT NULL,
+          source_type TEXT NOT NULL,
+          payload_json TEXT NOT NULL DEFAULT '{}',
+          status TEXT NOT NULL CHECK (status IN ('pending_review', 'confirmed', 'rejected')),
+          created_at TEXT NOT NULL,
+          reviewed_at TEXT,
+          UNIQUE(marketplace, source_product_id, asin)
+        );
+        CREATE INDEX idx_competitor_candidates_review
+          ON competitor_candidates(marketplace, status, created_at DESC);
+
+        CREATE TABLE data_coverage_runs (
+          id TEXT PRIMARY KEY,
+          marketplace TEXT NOT NULL,
+          run_type TEXT NOT NULL,
+          coverage_json TEXT NOT NULL,
+          is_complete INTEGER NOT NULL,
+          created_at TEXT NOT NULL
+        );
+        CREATE INDEX idx_data_coverage_runs_market_created
+          ON data_coverage_runs(marketplace, created_at DESC);
+
+        -- Facts are independently persisted so a provider's missing metric is
+        -- represented as NULL rather than inventing a 0 for legacy snapshots.
+        CREATE TABLE metric_facts (
+          id TEXT PRIMARY KEY,
+          entity_type TEXT NOT NULL CHECK (entity_type IN ('product', 'market')),
+          entity_id TEXT NOT NULL,
+          marketplace TEXT NOT NULL,
+          metric_name TEXT NOT NULL,
+          numeric_value REAL,
+          source TEXT NOT NULL,
+          source_id TEXT,
+          source_type TEXT NOT NULL,
+          is_estimated INTEGER NOT NULL,
+          confidence REAL NOT NULL,
+          observation_date TEXT NOT NULL,
+          collected_at TEXT NOT NULL,
+          dedup_key TEXT
+        );
+        CREATE UNIQUE INDEX idx_metric_facts_dedup_key
+          ON metric_facts(dedup_key) WHERE dedup_key IS NOT NULL;
+        CREATE INDEX idx_metric_facts_authority
+          ON metric_facts(entity_type, entity_id, metric_name, observation_date DESC);
+      `);
+    },
+  },
 ];
 
 export function migrate(database: DatabaseSync): void {
@@ -1407,7 +1676,9 @@ export function migrate(database: DatabaseSync): void {
     if (applied.has(migration.version)) continue;
     database.exec('BEGIN IMMEDIATE');
     try {
-      database.exec(migration.sql);
+      if ('apply' in migration && typeof migration.apply === 'function') migration.apply(database);
+      else if (typeof migration.sql === 'string') database.exec(migration.sql);
+      else throw new Error(`Migration ${migration.version} has no apply function or SQL.`);
       database.prepare('INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)')
         .run(migration.version, new Date().toISOString());
       database.exec('COMMIT');

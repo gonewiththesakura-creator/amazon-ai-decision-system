@@ -132,10 +132,123 @@ describe('database migrations', () => {
     `).all() as Array<{ version: number }>;
 
     expect(versions.map((row) => Number(row.version))).toEqual(
-      Array.from({ length: 19 }, (_, index) => index + 1),
+      Array.from({ length: 20 }, (_, index) => index + 1),
     );
     expect(db.prepare('PRAGMA foreign_key_check').all()).toEqual([]);
     expect(db.prepare('PRAGMA quick_check').get()).toMatchObject({ quick_check: 'ok' });
+  });
+
+  it('upgrades V19 observations without losing master or workflow records', () => {
+    const db = new DatabaseSync(':memory:');
+    database = db;
+    db.exec(`
+      PRAGMA foreign_keys = ON;
+      CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL);
+      CREATE TABLE app_settings (id INTEGER PRIMARY KEY, mode TEXT NOT NULL);
+      CREATE TABLE market_nodes (id TEXT PRIMARY KEY, marketplace TEXT NOT NULL);
+      CREATE TABLE products (
+        id TEXT PRIMARY KEY, asin TEXT NOT NULL, sku TEXT, brand TEXT NOT NULL,
+        title TEXT NOT NULL, image_url TEXT NOT NULL, marketplace TEXT NOT NULL,
+        product_type TEXT NOT NULL, is_owned INTEGER NOT NULL, market_node_id TEXT NOT NULL,
+        source_type TEXT NOT NULL, created_at TEXT NOT NULL
+      );
+      CREATE TABLE market_snapshots (
+        id TEXT PRIMARY KEY, market_node_id TEXT NOT NULL, date TEXT NOT NULL,
+        product_count INTEGER NOT NULL, seller_count INTEGER NOT NULL, brand_count INTEGER NOT NULL,
+        monthly_sales REAL NOT NULL, monthly_revenue REAL NOT NULL, avg_price REAL NOT NULL,
+        median_price REAL NOT NULL, avg_rating REAL NOT NULL, median_reviews REAL NOT NULL,
+        top10_share REAL NOT NULL DEFAULT 0, top20_share REAL NOT NULL DEFAULT 0,
+        new_product_share REAL NOT NULL DEFAULT 0, price_bands_json TEXT NOT NULL DEFAULT '[]',
+        concentration_json TEXT NOT NULL DEFAULT '[]',
+        source TEXT NOT NULL, source_type TEXT NOT NULL, collected_at TEXT NOT NULL,
+        period TEXT NOT NULL, is_estimated INTEGER NOT NULL, confidence REAL NOT NULL
+      );
+      CREATE TABLE product_snapshots (
+        id TEXT PRIMARY KEY, product_id TEXT NOT NULL, date TEXT NOT NULL,
+        price REAL NOT NULL, rating REAL NOT NULL, review_count INTEGER NOT NULL,
+        bsr INTEGER NOT NULL, estimated_sales REAL NOT NULL, estimated_revenue REAL NOT NULL,
+        seller_count INTEGER NOT NULL, growth_7d REAL NOT NULL DEFAULT 0,
+        growth_30d REAL NOT NULL DEFAULT 0, growth_90d REAL NOT NULL DEFAULT 0,
+        source TEXT NOT NULL, source_type TEXT NOT NULL,
+        collected_at TEXT NOT NULL, period TEXT NOT NULL, is_estimated INTEGER NOT NULL,
+        confidence REAL NOT NULL
+      );
+      CREATE TABLE rule_profiles (id TEXT PRIMARY KEY, version INTEGER NOT NULL);
+      CREATE TABLE decisions (id TEXT PRIMARY KEY, decision TEXT NOT NULL);
+    `);
+    const appliedAt = '2026-09-19T00:00:00.000Z';
+    const migration = db.prepare('INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)');
+    for (let version = 1; version <= 19; version += 1) migration.run(version, appliedAt);
+    db.prepare("INSERT INTO app_settings (id, mode) VALUES (1, 'demo')").run();
+    db.prepare("INSERT INTO market_nodes (id, marketplace) VALUES ('market-us', 'US')").run();
+    db.prepare(`
+      INSERT INTO products (
+        id, asin, sku, brand, title, image_url, marketplace, product_type,
+        is_owned, market_node_id, source_type, created_at
+      ) VALUES ('legacy-product', 'B0LEGACY01', 'LEGACY-01', 'Legacy', 'Legacy title', '',
+        'US', 'pillow', 1, 'market-us', 'import', ?)
+    `).run(appliedAt);
+    db.prepare(`
+      INSERT INTO product_snapshots (
+        id, product_id, date, price, rating, review_count, bsr, estimated_sales,
+        estimated_revenue, seller_count, source, source_type, collected_at, period,
+        is_estimated, confidence
+      ) VALUES ('legacy-observation', 'legacy-product', '2026-09-01', 30, 4.4, 12, 100,
+        20, 600, 1, 'SellerSprite import', 'import', ?, '30D', 1, 0.8)
+    `).run(appliedAt);
+    db.prepare(`
+      INSERT INTO product_snapshots (
+        id, product_id, date, price, rating, review_count, bsr, estimated_sales,
+        estimated_revenue, seller_count, source, source_type, collected_at, period,
+        is_estimated, confidence
+      ) VALUES ('legacy-observation-duplicate', 'legacy-product', '2026-09-01', 30, 4.4, 12, 100,
+        20, 600, 1, 'SellerSprite import', 'import', ?, '30D', 1, 0.8)
+    `).run(appliedAt);
+    db.prepare("INSERT INTO rule_profiles (id, version) VALUES ('legacy-rule', 1)").run();
+    db.prepare("INSERT INTO decisions (id, decision) VALUES ('legacy-decision', 'watch')").run();
+
+    migrate(db);
+
+    const productColumns = db.prepare('PRAGMA table_info(products)').all()
+      .map((column) => String((column as { name: unknown }).name));
+    const snapshotColumns = db.prepare('PRAGMA table_info(product_snapshots)').all()
+      .map((column) => String((column as { name: unknown }).name));
+    expect(productColumns).toEqual(expect.arrayContaining([
+      'status', 'updated_at', 'variation_family_id', 'parent_asin', 'is_parent', 'variation_attributes_json',
+    ]));
+    expect(snapshotColumns).toEqual(expect.arrayContaining(['observation_date', 'dedup_key']));
+    expect(db.prepare(`
+      SELECT observation_date, dedup_key FROM product_snapshots WHERE id = 'legacy-observation'
+    `).get()).toMatchObject({ observation_date: '2026-09-01' });
+    expect(db.prepare(`
+      SELECT COUNT(*) AS count, COUNT(DISTINCT dedup_key) AS unique_count
+      FROM product_snapshots WHERE product_id = 'legacy-product'
+    `).get()).toEqual({ count: 2, unique_count: 2 });
+    expect(db.prepare("SELECT id FROM products WHERE id = 'legacy-product'").get()).toMatchObject({ id: 'legacy-product' });
+    expect(db.prepare("SELECT id FROM rule_profiles WHERE id = 'legacy-rule'").get()).toMatchObject({ id: 'legacy-rule' });
+    expect(db.prepare("SELECT id FROM decisions WHERE id = 'legacy-decision'").get()).toMatchObject({ id: 'legacy-decision' });
+    for (const table of [
+      'variation_families', 'provider_capability_snapshots', 'mcp_call_logs', 'mcp_response_cache',
+      'competitor_candidates', 'data_coverage_runs', 'metric_facts',
+    ]) {
+      expect(db.prepare(`SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?`).get(table))
+        .toMatchObject({ name: table });
+    }
+    expect(db.prepare('PRAGMA table_info(mcp_call_logs)').all()
+      .map((column) => String((column as { name: unknown }).name)))
+      .toEqual(expect.arrayContaining([
+        'provider_id', 'actual_tool', 'parameter_hash', 'research_job_id', 'entity_type', 'entity_id',
+        'started_at', 'completed_at', 'duration_ms', 'status', 'cache_hit', 'result_count', 'error_code',
+      ]));
+    expect(() => db.prepare(`
+      INSERT INTO product_snapshots (
+        id, product_id, date, price, rating, review_count, bsr, estimated_sales,
+        estimated_revenue, seller_count, source, source_type, collected_at, period,
+        is_estimated, confidence, observation_date, dedup_key
+      ) VALUES ('duplicate-observation', 'legacy-product', '2026-09-01', 30, 4.4, 12, 100,
+        20, 600, 1, 'SellerSprite import', 'import', ?, '30D', 1, 0.8,
+        '2026-09-01', (SELECT dedup_key FROM product_snapshots WHERE id = 'legacy-observation'))
+    `).run(appliedAt)).toThrow(/UNIQUE/);
   });
 
   it('backfills immutable Reverse Review and Approval lineage when upgrading from V13', () => {
@@ -304,6 +417,73 @@ describe('database migrations', () => {
       UPDATE keyword_snapshots SET search_volume = 999
       WHERE id = 'migration-keyword-snapshot'
     `).run()).toThrow(/immutable/);
+  });
+
+  it('stores absent real-provider snapshot metrics as NULL instead of inventing zero', () => {
+    const db = testDatabase();
+    const now = '2026-09-19T00:00:00.000Z';
+    db.prepare(`
+      INSERT INTO market_nodes (id, name, level, marketplace, status, source_type, created_at)
+      VALUES ('nullable-market', 'Nullable Market', 1, 'US', 'active', 'mcp', ?)
+    `).run(now);
+    db.prepare(`
+      INSERT INTO products (
+        id, asin, brand, title, image_url, marketplace, product_type, is_owned,
+        market_node_id, source_type, created_at
+      ) VALUES ('nullable-product', 'B0NULL0001', 'Brand', 'Title', '', 'US', 'pillow', 1,
+        'nullable-market', 'mcp', ?)
+    `).run(now);
+    db.prepare(`
+      INSERT INTO market_snapshots (
+        id, market_node_id, date, source, source_type, collected_at, period,
+        is_estimated, confidence, observation_date, dedup_key
+      ) VALUES ('nullable-market-observation', 'nullable-market', '2026-09-18',
+        'SellerSprite MCP', 'mcp', ?, '30D', 1, 0.8, '2026-09-18', 'nullable-market-key')
+    `).run(now);
+    db.prepare(`
+      INSERT INTO product_snapshots (
+        id, product_id, date, source, source_type, collected_at, period,
+        is_estimated, confidence, observation_date, dedup_key
+      ) VALUES ('nullable-product-observation', 'nullable-product', '2026-09-18',
+        'SellerSprite MCP', 'mcp', ?, '30D', 1, 0.8, '2026-09-18', 'nullable-product-key')
+    `).run(now);
+
+    expect(db.prepare(`
+      SELECT median_price, median_reviews, top20_share FROM market_snapshots
+      WHERE id = 'nullable-market-observation'
+    `).get()).toEqual({ median_price: null, median_reviews: null, top20_share: null });
+    expect(db.prepare(`
+      SELECT bsr, review_count, seller_count, growth_30d FROM product_snapshots
+      WHERE id = 'nullable-product-observation'
+    `).get()).toEqual({ bsr: null, review_count: null, seller_count: null, growth_30d: null });
+  });
+
+  it('keeps discovered competitor candidates separate for each owned product', () => {
+    const db = testDatabase();
+    const now = '2026-09-19T00:00:00.000Z';
+    db.prepare(`
+      INSERT INTO market_nodes (id, name, level, marketplace, status, source_type, created_at)
+      VALUES ('candidate-market', 'Candidate Market', 1, 'US', 'active', 'mcp', ?)
+    `).run(now);
+    const insertProduct = db.prepare(`
+      INSERT INTO products (
+        id, asin, brand, title, image_url, marketplace, product_type, is_owned,
+        market_node_id, source_type, created_at
+      ) VALUES (?, ?, 'Brand', 'Title', '', 'US', 'pillow', 1, 'candidate-market', 'import', ?)
+    `);
+    insertProduct.run('owned-a', 'B0OWNEDA01', now);
+    insertProduct.run('owned-b', 'B0OWNEDB01', now);
+    const insertCandidate = db.prepare(`
+      INSERT INTO competitor_candidates (
+        id, marketplace, asin, source_product_id, source, source_type, status, created_at
+      ) VALUES (?, 'US', 'B0COMP0001', ?, 'SellerSprite MCP', 'mcp', 'pending_review', ?)
+    `);
+    insertCandidate.run('candidate-a', 'owned-a', now);
+    insertCandidate.run('candidate-b', 'owned-b', now);
+
+    expect(db.prepare(`
+      SELECT COUNT(*) AS count FROM competitor_candidates WHERE asin = 'B0COMP0001'
+    `).get()).toEqual({ count: 2 });
   });
 
   it('keeps development project data and V15 lineage guards while making unknown metrics nullable', () => {
