@@ -26,13 +26,13 @@ describe('MetricAuthorityResolver', () => {
     `).run(now);
     const insert = database.prepare(`
       INSERT INTO metric_facts (
-        id, entity_type, entity_id, marketplace, metric_name, numeric_value, source, source_type,
+        id, entity_type, entity_id, marketplace, metric_name, numeric_value, source, source_id, source_type,
         is_estimated, confidence, observation_date, collected_at, dedup_key
-      ) VALUES (?, 'product', 'owned-product', 'US', 'estimated_sales', ?, ?, ?, ?, 0.9,
+      ) VALUES (?, 'product', 'owned-product', 'US', 'estimated_sales', ?, ?, ?, ?, ?, 0.9,
         '2026-09-18', ?, ?)
     `);
-    insert.run('estimated-fact', 100, 'SellerSprite MCP', 'mcp', 1, now, 'estimated-fact-key');
-    insert.run('actual-fact', 120, 'Amazon SP-API', 'amazon', 0, now, 'actual-fact-key');
+    insert.run('estimated-fact', 100, 'SellerSprite MCP', 'sellersprite_mcp', 'mcp', 1, now, 'estimated-fact-key');
+    insert.run('actual-fact', 120, 'Amazon SP-API', 'amazon_api', 'amazon', 0, now, 'actual-fact-key');
 
     const authority = new MetricAuthorityResolver(database).resolveMetric({
       entityId: 'owned-product', metric: 'estimated_sales', observationDate: '2026-09-18',
@@ -50,13 +50,13 @@ describe('MetricAuthorityResolver', () => {
     const now = '2026-09-19T00:00:00.000Z';
     const insert = database.prepare(`
       INSERT INTO metric_facts (
-        id, entity_type, entity_id, marketplace, metric_name, numeric_value, source, source_type,
+        id, entity_type, entity_id, marketplace, metric_name, numeric_value, source, source_id, source_type,
         is_estimated, confidence, observation_date, collected_at, dedup_key
-      ) VALUES (?, 'market', 'market-us', 'US', 'monthly_sales', ?, ?, ?, 1, 0.9,
+      ) VALUES (?, 'market', 'market-us', 'US', 'monthly_sales', ?, ?, ?, ?, 1, 0.9,
         '2026-09-18', ?, ?)
     `);
-    insert.run('import-market-fact', 100, 'SellerSprite CSV', 'import', now, 'import-market-fact-key');
-    insert.run('mcp-market-fact', 120, 'SellerSprite MCP', 'mcp', now, 'mcp-market-fact-key');
+    insert.run('import-market-fact', 100, 'SellerSprite CSV', 'sellersprite_import', 'import', now, 'import-market-fact-key');
+    insert.run('mcp-market-fact', 120, 'SellerSprite MCP', 'sellersprite_mcp', 'mcp', now, 'mcp-market-fact-key');
 
     const authority = new MetricAuthorityResolver(database).resolveMetric({
       entityId: 'market-us', entityType: 'market', metric: 'monthly_sales', observationDate: '2026-09-18',
@@ -66,5 +66,23 @@ describe('MetricAuthorityResolver', () => {
     expect(authority.alternatives).toEqual([
       expect.objectContaining({ id: 'import-market-fact', sourceType: 'import', value: 100 }),
     ]);
+  });
+
+  it('reads provisional camelCase MCP facts without changing their immutable rows', () => {
+    database = openDatabase(':memory:');
+    database.prepare(`INSERT INTO metric_facts (
+      id, entity_type, entity_id, marketplace, metric_name, numeric_value, source,
+      source_id, source_type, is_estimated, confidence, observation_date,
+      collected_at, dedup_key
+    ) VALUES ('legacy-fact', 'product', 'owned-1', 'US', 'estimatedSales', 145,
+      'SellerSprite MCP', 'source-sellersprite-mcp', 'mcp', 1, 0.9,
+      '2026-08-31', '2026-09-01', 'legacy-key')`).run();
+    const result = new MetricAuthorityResolver(database).resolveMetric({
+      entityType: 'product', entityId: 'owned-1', metric: 'estimated_sales',
+      observationDate: '2026-08-31',
+    });
+    expect(result.selected).toMatchObject({ id: 'legacy-fact', value: 145 });
+    expect(database.prepare(`SELECT metric_name FROM metric_facts WHERE id = 'legacy-fact'`).get())
+      .toEqual({ metric_name: 'estimatedSales' });
   });
 });

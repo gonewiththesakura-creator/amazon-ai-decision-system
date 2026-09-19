@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { DatabaseSync } from 'node:sqlite';
 import { afterEach, describe, expect, it } from 'vitest';
 import { openDatabase, type AppDatabase } from './database.js';
+import { seedDemoData } from './demo-seed.js';
 import { migrate } from './migrations.js';
 
 let database: AppDatabase | undefined;
@@ -59,7 +60,7 @@ function v13Database(): AppDatabase {
   for (let version = 1; version <= 13; version += 1) insertMigration.run(version, appliedAt);
   // This deliberately minimal fixture isolates the V14 backfill and does not
   // reproduce the application tables needed by later migrations.
-  for (let version = 15; version <= 19; version += 1) insertMigration.run(version, appliedAt);
+  for (let version = 15; version <= 21; version += 1) insertMigration.run(version, appliedAt);
   return database;
 }
 
@@ -132,10 +133,52 @@ describe('database migrations', () => {
     `).all() as Array<{ version: number }>;
 
     expect(versions.map((row) => Number(row.version))).toEqual(
-      Array.from({ length: 20 }, (_, index) => index + 1),
+      Array.from({ length: 21 }, (_, index) => index + 1),
     );
     expect(db.prepare('PRAGMA foreign_key_check').all()).toEqual([]);
     expect(db.prepare('PRAGMA quick_check').get()).toMatchObject({ quick_check: 'ok' });
+  });
+
+  it('backfills only recognized V20 Demo rows when the registry is missing', () => {
+    const db = testDatabase();
+    seedDemoData(db);
+    db.prepare(`
+      INSERT INTO market_nodes (id, name, level, marketplace, status, source_type, created_at)
+      VALUES ('unrecognized-mock', 'Unrecognized mock', 1, 'US', 'active', 'mock', ?)
+    `).run('2026-09-09T10:20:00+08:00');
+    db.prepare(`
+      INSERT INTO ai_insights (
+        id, entity_type, entity_id, insight_type, status, title, summary,
+        facts_json, opportunities_json, risks_json, recommendations_json,
+        evidence_json, confidence, model, data_version, input_hash, generated_at
+      ) VALUES ('unrecognized-insight', 'market', 'unrecognized-mock', 'market_analysis',
+        'watch', 'Unrecognized', 'Not a seeded insight', '[]', '[]', '[]', '[]', '[]',
+        0.5, 'rule-engine-v1', 'demo-2026-09-09', 'not-a-seed', ?)
+    `).run('2026-09-09T10:20:00+08:00');
+    db.exec('DROP TABLE demo_seed_records');
+    db.prepare('DELETE FROM schema_migrations WHERE version = 21').run();
+
+    migrate(db);
+
+    const registered = db.prepare(`
+      SELECT table_name, record_id FROM demo_seed_records WHERE seed_id = 'v2-demo-seed'
+    `).all() as Array<{ table_name: string; record_id: string }>;
+    expect(registered).toEqual(expect.arrayContaining([
+      { table_name: 'market_nodes', record_id: 'mkt-memory-foam' },
+      { table_name: 'products', record_id: 'owned-sku-01' },
+      { table_name: 'market_snapshots', record_id: 'ms-mfm-2026-09-09' },
+      { table_name: 'product_snapshots', record_id: 'ps-owned-sku-01-4' },
+      { table_name: 'ai_insights', record_id: 'insight-market-memory' },
+    ]));
+    expect(registered).not.toContainEqual({ table_name: 'market_nodes', record_id: 'unrecognized-mock' });
+    expect(registered).not.toContainEqual({ table_name: 'ai_insights', record_id: 'unrecognized-insight' });
+    const count = registered.length;
+    db.prepare('DELETE FROM schema_migrations WHERE version = 21').run();
+    migrate(db);
+    expect(db.prepare(`
+      SELECT COUNT(*) AS count FROM demo_seed_records WHERE seed_id = 'v2-demo-seed'
+    `).get()).toEqual({ count });
+    expect(db.prepare('PRAGMA foreign_key_check').all()).toEqual([]);
   });
 
   it('upgrades V19 observations without losing master or workflow records', () => {
@@ -179,6 +222,8 @@ describe('database migrations', () => {
     const appliedAt = '2026-09-19T00:00:00.000Z';
     const migration = db.prepare('INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)');
     for (let version = 1; version <= 19; version += 1) migration.run(version, appliedAt);
+    // This minimal V19 fixture isolates V20 and omits the full tables V21 backfills.
+    migration.run(21, appliedAt);
     db.prepare("INSERT INTO app_settings (id, mode) VALUES (1, 'demo')").run();
     db.prepare("INSERT INTO market_nodes (id, marketplace) VALUES ('market-us', 'US')").run();
     db.prepare(`
@@ -206,6 +251,12 @@ describe('database migrations', () => {
     `).run(appliedAt);
     db.prepare("INSERT INTO rule_profiles (id, version) VALUES ('legacy-rule', 1)").run();
     db.prepare("INSERT INTO decisions (id, decision) VALUES ('legacy-decision', 'watch')").run();
+    db.exec(`
+      CREATE TRIGGER trg_market_snapshots_immutable BEFORE UPDATE ON market_snapshots
+      BEGIN SELECT RAISE(ABORT, 'market_snapshots are immutable; append a new snapshot'); END;
+      CREATE TRIGGER trg_product_snapshots_immutable BEFORE UPDATE ON product_snapshots
+      BEGIN SELECT RAISE(ABORT, 'product_snapshots are immutable; append a new snapshot'); END;
+    `);
 
     migrate(db);
 
@@ -219,7 +270,12 @@ describe('database migrations', () => {
     expect(snapshotColumns).toEqual(expect.arrayContaining(['observation_date', 'dedup_key']));
     expect(db.prepare(`
       SELECT observation_date, dedup_key FROM product_snapshots WHERE id = 'legacy-observation'
-    `).get()).toMatchObject({ observation_date: '2026-09-01' });
+    `).get()).toMatchObject({
+      observation_date: '2026-09-01',
+      dedup_key: 'product|US|legacy-product|2026-09-01|import|sellersprite import|30D',
+    });
+    expect(db.prepare(`SELECT dedup_key FROM product_snapshots WHERE id = 'legacy-observation-duplicate'`).get())
+      .toMatchObject({ dedup_key: expect.stringContaining('|archival|legacy-observation-duplicate') });
     expect(db.prepare(`
       SELECT COUNT(*) AS count, COUNT(DISTINCT dedup_key) AS unique_count
       FROM product_snapshots WHERE product_id = 'legacy-product'
@@ -366,12 +422,12 @@ describe('database migrations', () => {
         id, market_node_id, date, product_count, seller_count, brand_count,
         monthly_sales, monthly_revenue, avg_price, median_price, avg_rating,
         median_reviews, source, source_type, collected_at, period,
-        is_estimated, confidence
+        is_estimated, confidence, observation_date, dedup_key
       ) VALUES (?, 'migration-market', ?, 10, 8, 6, 100, 3000, 30, 29,
-        4.3, 50, 'migration test', 'import', ?, 'daily', 0, 0.9)
+        4.3, 50, 'migration test', 'import', ?, 'daily', 0, 0.9, ?, ?)
     `);
-    insert.run('migration-snapshot-1', '2026-08-01', now);
-    insert.run('migration-snapshot-2', '2026-09-01', now);
+    insert.run('migration-snapshot-1', '2026-08-01', now, '2026-08-01', 'migration-market-1');
+    insert.run('migration-snapshot-2', '2026-09-01', now, '2026-09-01', 'migration-market-2');
     db.prepare(`
       INSERT INTO products (
         id, asin, sku, brand, title, image_url, marketplace, product_type,
@@ -383,10 +439,10 @@ describe('database migrations', () => {
       INSERT INTO product_snapshots (
         id, product_id, date, price, rating, review_count, bsr,
         estimated_sales, estimated_revenue, seller_count, source, source_type,
-        collected_at, period, is_estimated, confidence
+        collected_at, period, is_estimated, confidence, observation_date, dedup_key
       ) VALUES ('migration-product-snapshot', 'migration-product', '2026-09-01',
         30, 4.3, 50, 1000, 100, 3000, 1, 'migration test', 'import', ?,
-        'daily', 0, 0.9)
+        'daily', 0, 0.9, '2026-09-01', 'migration-product-1')
     `).run(now);
     db.prepare(`
       INSERT INTO keywords (id, marketplace, market_node_id, keyword, source, created_at)
@@ -734,13 +790,13 @@ describe('database migrations', () => {
         id, market_node_id, date, product_count, seller_count, brand_count,
         monthly_sales, monthly_revenue, avg_price, median_price, avg_rating,
         median_reviews, source, source_type, collected_at, period,
-        is_estimated, confidence
+        is_estimated, confidence, observation_date, dedup_key
       ) VALUES (?, ?, ?, 10, 8, 6, 100, 3000, 30, 29, 4.3,
-        50, 'migration test', 'import', ?, '30D', 0, 0.9)
+        50, 'migration test', 'import', ?, '30D', 0, 0.9, ?, ?)
     `);
-    insertSnapshot.run('calculated-baseline', 'calculated-market', '2026-08-02', now);
-    insertSnapshot.run('calculated-current', 'calculated-market', '2026-09-01', now);
-    insertSnapshot.run('waiting-snapshot', 'waiting-market', '2026-09-01', now);
+    insertSnapshot.run('calculated-baseline', 'calculated-market', '2026-08-02', now, '2026-08-02', 'calculated-baseline');
+    insertSnapshot.run('calculated-current', 'calculated-market', '2026-09-01', now, '2026-09-01', 'calculated-current');
+    insertSnapshot.run('waiting-snapshot', 'waiting-market', '2026-09-01', now, '2026-09-01', 'waiting-snapshot');
 
     migrate(db);
     db.prepare(`

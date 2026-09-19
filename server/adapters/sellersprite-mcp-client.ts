@@ -35,7 +35,9 @@ export interface SellerSpriteMcpTransport {
 export interface SellerSpriteToolCall {
   tool: string;
   arguments: Record<string, unknown>;
-  context: { capability?: string; operation?: string };
+  context: { capability?: string; operation?: string;
+    entityType?: 'market' | 'product' | 'competitor'; entityId?: string;
+    researchJobId?: string };
 }
 
 interface SellerSpriteMcpClientOptions {
@@ -55,8 +57,21 @@ export function sanitizeMcpError(error: unknown): string {
   return message
     .replace(/https?:\/\/[^\s'"<>]+/gi, '[REDACTED]')
     .replace(/Authorization\s*[:=]\s*(?:Bearer\s+)?[^\s;,}]+/gi, '[REDACTED]')
-    .replace(/(?:secretKey|secret_key|api[_-]?key|access[_-]?token|token|password|secret)\s*[=:]\s*["']?[^\s&,;}"']+["']?/gi, '[REDACTED]')
-    .replace(/(["'])(?:secretKey|secret_key|api[_-]?key|access[_-]?token|token|password|secret)\1\s*:\s*["'][^"']+["']/gi, '[REDACTED]');
+    .replace(/(?:secret[-_]?key|api[_-]?key|access[_-]?token|token|password|secret)\s*[=:]\s*["']?[^\s&,;}"']+["']?/gi, '[REDACTED]')
+    .replace(/(["'])(?:secret[-_]?key|api[_-]?key|access[_-]?token|token|password|secret)\1\s*:\s*["'][^"']+["']/gi, '[REDACTED]');
+}
+
+export function sellerSpriteEndpoint(configured: string, secret?: string): URL {
+  let endpoint: URL;
+  try { endpoint = new URL(configured); }
+  catch { throw new SellerSpriteMcpError('AUTH_ERROR', 'SellerSprite MCP endpoint is invalid'); }
+  if (!['https:', 'http:'].includes(endpoint.protocol)) {
+    throw new SellerSpriteMcpError('AUTH_ERROR', 'SellerSprite MCP endpoint protocol is invalid');
+  }
+  const legacySecret = endpoint.searchParams.get('secretKey');
+  endpoint.searchParams.delete('secretKey');
+  if (secret || legacySecret) endpoint.searchParams.set('secret-key', secret || legacySecret!);
+  return endpoint;
 }
 
 export class SellerSpriteMcpClient {
@@ -83,14 +98,7 @@ export class SellerSpriteMcpClient {
     if (!this.transport) {
       const configured = process.env.SELLERSPRITE_MCP_URL;
       if (!configured) throw new SellerSpriteMcpError('AUTH_ERROR', 'SellerSprite MCP is not configured');
-      let endpoint: URL;
-      try { endpoint = new URL(configured); }
-      catch { throw new SellerSpriteMcpError('AUTH_ERROR', 'SellerSprite MCP endpoint is invalid'); }
-      if (!['https:', 'http:'].includes(endpoint.protocol)) {
-        throw new SellerSpriteMcpError('AUTH_ERROR', 'SellerSprite MCP endpoint protocol is invalid');
-      }
-      const secret = process.env.SELLERSPRITE_MCP_SECRET;
-      if (secret) endpoint.searchParams.set('secretKey', secret);
+      const endpoint = sellerSpriteEndpoint(configured, process.env.SELLERSPRITE_MCP_SECRET);
       const sdkClient = new Client({ name: 'amazon-ai-decision-system', version: '2.2.0' });
       const sdkTransport = new StreamableHTTPClientTransport(endpoint);
       this.transport = {
@@ -142,17 +150,30 @@ export class SellerSpriteMcpClient {
     return tools;
   }
 
-  async callTool(request: SellerSpriteToolCall): Promise<McpCallToolResult> {
+  async callTool(request: SellerSpriteToolCall): Promise<McpCallToolResult>;
+  async callTool<T>(request: SellerSpriteToolCall, validate: (result: McpCallToolResult) => T): Promise<T>;
+  async callTool<T>(
+    request: SellerSpriteToolCall, validate?: (result: McpCallToolResult) => T,
+  ): Promise<T | McpCallToolResult> {
     const key = createHash('sha256').update(JSON.stringify([
       request.tool, ordered(request.arguments), request.context.capability ?? '',
     ])).digest('hex');
     const now = new Date(this.now()).toISOString();
     const cached = this.options.cacheStore?.get(key, now);
     if (cached) {
-      const result = mcpCallToolResultSchema.safeParse(JSON.parse(cached.responseJson) as unknown);
-      if (result.success) {
-        this.record(request, key, 'success', null, true, 0, now);
-        return result.data;
+      let accepted: { raw: McpCallToolResult; value: T | McpCallToolResult } | null = null;
+      try {
+        const result = mcpCallToolResultSchema.safeParse(JSON.parse(cached.responseJson) as unknown);
+        if (result.success) {
+          assertToolSuccess(result.data);
+          accepted = { raw: result.data, value: validate ? validate(result.data) : result.data };
+        }
+      } catch {
+        // A stale or malformed cache entry cannot certify a capability call.
+      }
+      if (accepted) {
+        this.record(request, key, 'success', null, true, 0, now, countResult(accepted.raw));
+        return accepted.value;
       }
     }
 
@@ -167,13 +188,9 @@ export class SellerSpriteMcpClient {
         ));
         const parsed = mcpCallToolResultSchema.safeParse(raw);
         if (!parsed.success) throw new SellerSpriteMcpError('INVALID_SCHEMA', 'Invalid SellerSprite MCP tool response');
-        if (parsed.data.isError) throw new SellerSpriteMcpError('REMOTE_ERROR', 'SellerSprite MCP tool returned an error');
-        const payload = mcpJsonPayload(parsed.data);
-        if (payload && typeof payload === 'object' && 'code' in payload
-          && typeof payload.code === 'string' && payload.code !== 'OK') {
-          throw new SellerSpriteMcpError('REMOTE_ERROR', 'SellerSprite rejected the tool request');
-        }
-        this.record(request, key, 'success', null, false, attempt, startedAt);
+        assertToolSuccess(parsed.data);
+        const accepted = validate ? validate(parsed.data) : parsed.data;
+        this.record(request, key, 'success', null, false, attempt, startedAt, countResult(parsed.data));
         if (this.options.cacheStore && (this.options.cacheTtlMs ?? 300_000) > 0) {
           const createdAt = new Date(this.now()).toISOString();
           this.options.cacheStore.set({
@@ -185,7 +202,7 @@ export class SellerSpriteMcpClient {
             expiresAt: new Date(this.now() + (this.options.cacheTtlMs ?? 300_000)).toISOString(),
           });
         }
-        return parsed.data;
+        return accepted;
       } catch (error) {
         const mapped = mapMcpError(error);
         this.record(request, key, 'failed', mapped.code, false, attempt, startedAt);
@@ -206,7 +223,7 @@ export class SellerSpriteMcpClient {
   private record(
     request: SellerSpriteToolCall, requestHash: string,
     status: 'success' | 'failed', errorCode: SellerSpriteMcpErrorCode | null,
-    cacheHit: boolean, attempt: number, startedAt: string,
+    cacheHit: boolean, attempt: number, startedAt: string, resultCount: number | null = null,
   ): void {
     this.options.ledgerStore?.record(newLedgerEntry({
       provider: 'sellersprite',
@@ -214,6 +231,13 @@ export class SellerSpriteMcpClient {
       capability: request.context.capability ? safeLabel(request.context.capability) : null,
       operation: request.context.operation ? safeLabel(request.context.operation) : null,
       status, errorCode, requestHash, cacheHit, attempt, startedAt,
+      entityType: request.context.entityType,
+      entityId: request.context.entityId
+        ? safeEntityId(request.context.entityId, request.context.entityType) : undefined,
+      researchJobId: request.context.researchJobId
+        && /^[0-9a-f]{8}-[0-9a-f-]{27,36}$/i.test(request.context.researchJobId)
+        ? request.context.researchJobId : undefined,
+      resultCount,
       completedAt: new Date(this.now()).toISOString(),
     }));
   }
@@ -265,6 +289,15 @@ export class SellerSpriteMcpClient {
   }
 }
 
+function assertToolSuccess(result: McpCallToolResult): void {
+  if (result.isError) throw new SellerSpriteMcpError('REMOTE_ERROR', 'SellerSprite MCP tool returned an error');
+  const payload = mcpJsonPayload(result);
+  if (payload && typeof payload === 'object' && 'code' in payload
+    && typeof payload.code === 'string' && payload.code !== 'OK') {
+    throw new SellerSpriteMcpError('REMOTE_ERROR', 'SellerSprite rejected the tool request');
+  }
+}
+
 function ordered(value: unknown): unknown {
   if (Array.isArray(value)) return value.map(ordered);
   if (value && typeof value === 'object') {
@@ -287,6 +320,25 @@ function scrubSecrets(value: unknown): unknown {
 
 function safeLabel(value: string): string {
   return /^[A-Za-z][A-Za-z0-9_-]{0,100}$/.test(value) ? value : '[REDACTED]';
+}
+
+function safeEntityId(value: string, type?: SellerSpriteToolCall['context']['entityType']): string | undefined {
+  if (type === 'market' && /^\d+(?::\d+)*$/.test(value)) return value;
+  if ((type === 'product' || type === 'competitor') && /^[A-Z0-9]{10}$/.test(value)) return value;
+  return undefined;
+}
+
+function countResult(result: McpCallToolResult): number | null {
+  const envelope = mcpJsonPayload(result);
+  const payload = envelope && typeof envelope === 'object' && 'data' in envelope
+    ? envelope.data : envelope;
+  if (Array.isArray(payload)) return payload.length;
+  if (!payload || typeof payload !== 'object') return null;
+  const object = payload as Record<string, unknown>;
+  for (const key of ['salesTrendPoints', 'items']) {
+    if (Array.isArray(object[key])) return object[key].length;
+  }
+  return 1;
 }
 
 function mapMcpError(error: unknown): SellerSpriteMcpError {

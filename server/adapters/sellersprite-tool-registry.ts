@@ -59,7 +59,7 @@ export class SellerSpriteToolRegistry {
         inputSchema: safeInputSchema(tool.inputSchema),
       })),
       capabilities: Object.fromEntries(
-        [...this.mapping].map(([capability, tool]) => [capability, tool.name]),
+        [...this.mapping].map(([capability, tool]) => [capability, safeMetadataText(tool.name)]),
       ) as Partial<Record<SellerSpriteCapability, string>>,
       missingCapabilities: this.missing(),
     };
@@ -79,6 +79,18 @@ export class SellerSpriteToolRegistry {
     const tool = this.mapping.get(capability);
     if (!tool) throw new Error(`SellerSprite capability unavailable: ${capability}`);
     validateRequired(tool.inputSchema, args, tool.name);
+  }
+
+  argumentsFor(capability: SellerSpriteCapability, args: Record<string, unknown>): Record<string, unknown> {
+    const tool = this.mapping.get(capability);
+    if (!tool) throw new Error(`SellerSprite capability unavailable: ${capability}`);
+    const request = args.request;
+    const flattened = !Object.hasOwn(tool.inputSchema.properties ?? {}, 'request')
+      && request && typeof request === 'object' && !Array.isArray(request)
+      ? request as Record<string, unknown>
+      : args;
+    validateRequired(tool.inputSchema, flattened, tool.name);
+    return flattened;
   }
 }
 
@@ -116,32 +128,49 @@ function safeInputSchema(schema: McpToolDefinition['inputSchema']): McpToolDefin
 function safeSchemaProperty(value: unknown): Record<string, unknown> {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return {};
   return Object.fromEntries(Object.entries(value as Record<string, unknown>).map(([key, item]) => {
-    if (Array.isArray(item)) return [key, item.map((entry) => typeof entry === 'string' ? safeSchemaText(key, entry) : entry)];
-    if (item && typeof item === 'object') return [key, safeSchemaProperty(item)];
-    if (typeof item === 'string') return [key, safeSchemaText(key, item)];
-    return [key, item];
+    const safeKey = safeMetadataText(key);
+    if (/^(?:enum|const|default|examples?)$/i.test(key)) {
+      return [safeKey, Array.isArray(item) ? item.map(() => '[REDACTED]') : '[REDACTED]'];
+    }
+    if (Array.isArray(item)) return [safeKey, item.map((entry) => {
+      if (typeof entry === 'string') return safeMetadataText(entry);
+      if (entry && typeof entry === 'object') return safeSchemaProperty(entry);
+      return entry;
+    })];
+    if (item && typeof item === 'object') return [safeKey, safeSchemaProperty(item)];
+    if (typeof item === 'string') return [safeKey, safeMetadataText(item)];
+    return [safeKey, item];
   }));
 }
 
-function safeSchemaText(key: string, value: string): string {
-  if (/default|example|description|title/i.test(key)
-    && /https?:\/\/|authorization|bearer|secret|token|api[_-]?key|password/i.test(value)) return '[REDACTED]';
-  return value;
-}
-
 function validateRequired(schema: McpToolDefinition['inputSchema'], args: Record<string, unknown>, path: string): void {
+  if (schema.additionalProperties === false) {
+    for (const key of Object.keys(args)) {
+      if (!Object.hasOwn(schema.properties ?? {}, key)) {
+        throw new Error(`Unsupported SellerSprite tool argument: ${path}.${key}`);
+      }
+    }
+  }
   for (const key of schema.required ?? []) {
     if (args[key] === undefined || args[key] === null || args[key] === '') {
       throw new Error(`Missing required SellerSprite tool argument: ${path}.${key}`);
     }
     const property = schema.properties?.[key];
     if (property && typeof property === 'object' && !Array.isArray(property)) {
-      const nested = property as { type?: string; required?: string[]; properties?: Record<string, unknown> };
+      const nested = property as {
+        type?: string;
+        required?: string[];
+        properties?: Record<string, unknown>;
+        additionalProperties?: boolean;
+      };
       if (nested.type === 'object') {
         if (typeof args[key] !== 'object' || Array.isArray(args[key])) {
           throw new Error(`Invalid SellerSprite tool argument: ${path}.${key}`);
         }
-        validateRequired({ type: 'object', properties: nested.properties, required: nested.required },
+        validateRequired({
+          type: 'object', properties: nested.properties, required: nested.required,
+          additionalProperties: nested.additionalProperties,
+        },
           args[key] as Record<string, unknown>, `${path}.${key}`);
       }
     }

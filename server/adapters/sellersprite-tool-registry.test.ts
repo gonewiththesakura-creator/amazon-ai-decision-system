@@ -105,6 +105,74 @@ describe('SellerSpriteToolRegistry', () => {
     expect(JSON.stringify(store.snapshots)).not.toMatch(/secret-value|Authorization/i);
     expect(store.snapshots[0].tools[0].inputSchema.required).toContain('request');
   });
+
+  it('does not persist a credential-bearing mapped tool name while retaining the callable name', async () => {
+    const store = new MemoryCapabilityStore();
+    const registry = new SellerSpriteToolRegistry({ store });
+    const callableName = 'asin_sales_trend?api_key=opaque-fixture-value';
+
+    const snapshot = await registry.refresh(async () => [mcpTool(
+      callableName, 'Historical sales trend for an ASIN', ['marketplace', 'asin'],
+    )]);
+
+    expect(snapshot.capabilities.ASIN_SALES_TREND).toBe('[REDACTED]');
+    expect(JSON.stringify(store.snapshots)).not.toContain('opaque-fixture-value');
+    expect(registry.resolve('ASIN_SALES_TREND')?.name).toBe(callableName);
+  });
+
+  it('does not persist opaque enum values from discovered tool schemas', async () => {
+    const store = new MemoryCapabilityStore();
+    const registry = new SellerSpriteToolRegistry({ store });
+
+    await registry.refresh(async () => [{
+      name: 'asin_sales_trend',
+      inputSchema: {
+        type: 'object', required: ['asin'],
+        properties: {
+          asin: { type: 'string', enum: ['B000000001', 'opaque-credential-fixture'] },
+          filter: { type: 'object', enum: [{ value: 'opaque-nested-fixture' }] },
+        },
+      },
+    }]);
+
+    expect(JSON.stringify(store.snapshots)).not.toMatch(/B000000001|opaque-credential-fixture|opaque-nested-fixture/);
+    expect(registry.resolve('ASIN_SALES_TREND')?.inputSchema.properties?.asin).toEqual({
+      type: 'string', enum: ['B000000001', 'opaque-credential-fixture'],
+    });
+  });
+
+  it('rejects a requested month that a strict flat tool schema cannot receive', async () => {
+    const registry = new SellerSpriteToolRegistry();
+    await registry.refresh(async () => [{
+      name: 'market_research_statistics',
+      inputSchema: {
+        type: 'object', required: ['marketplace', 'nodeIdPath'], additionalProperties: false,
+        properties: { marketplace: { type: 'string' }, nodeIdPath: { type: 'string' } },
+      },
+    }]);
+
+    expect(() => registry.argumentsFor('MARKET_STATISTICS', {
+      request: { marketplace: 'US', nodeIdPath: 'bed-pillows', month: '202608' },
+    })).toThrow(/month/);
+  });
+
+  it('rejects a requested month that a strict nested request schema cannot receive', async () => {
+    const registry = new SellerSpriteToolRegistry();
+    await registry.refresh(async () => [{
+      name: 'market_research_statistics',
+      inputSchema: {
+        type: 'object', required: ['request'], additionalProperties: false,
+        properties: { request: {
+          type: 'object', required: ['marketplace', 'nodeIdPath'], additionalProperties: false,
+          properties: { marketplace: { type: 'string' }, nodeIdPath: { type: 'string' } },
+        } },
+      },
+    }]);
+
+    expect(() => registry.argumentsFor('MARKET_STATISTICS', {
+      request: { marketplace: 'US', nodeIdPath: 'bed-pillows', month: '202608' },
+    })).toThrow(/month/);
+  });
 });
 
 const discoveredTools: McpToolDefinition[] = [

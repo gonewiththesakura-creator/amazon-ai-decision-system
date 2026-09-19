@@ -1399,7 +1399,9 @@ const migrations = [
       const hasProductSnapshots = database.prepare(`
         SELECT 1 AS present FROM sqlite_master WHERE type = 'table' AND name = 'product_snapshots'
       `).get();
-      if (!hasProductSnapshots) return;
+      if (!hasProductSnapshots) {
+        throw new Error('V20 requires the V19 product_snapshots table. Refusing to mark a partial schema migrated.');
+      }
 
       database.exec(`
         ALTER TABLE products ADD COLUMN status TEXT NOT NULL DEFAULT 'active'
@@ -1427,6 +1429,18 @@ const migrations = [
           ON products(marketplace, asin);
         CREATE INDEX idx_products_identity_sku
           ON products(marketplace, sku);
+        -- Preserve every legacy product row. The deterministic oldest row keeps
+        -- its canonical SKU; later case-insensitive collisions become archival.
+        UPDATE products
+        SET sku = sku || '#legacy-' || id
+        WHERE sku IS NOT NULL AND rowid NOT IN (
+          SELECT MIN(rowid) FROM products
+          WHERE sku IS NOT NULL AND TRIM(sku) <> ''
+          GROUP BY marketplace, UPPER(TRIM(sku))
+        );
+        CREATE UNIQUE INDEX idx_products_marketplace_normalized_sku
+          ON products(marketplace, UPPER(TRIM(sku)))
+          WHERE sku IS NOT NULL AND TRIM(sku) <> '';
         CREATE INDEX idx_products_variation_family
           ON products(variation_family_id);
 
@@ -1435,12 +1449,25 @@ const migrations = [
         ALTER TABLE product_snapshots ADD COLUMN observation_date TEXT;
         ALTER TABLE product_snapshots ADD COLUMN dedup_key TEXT;
 
+        -- V7's immutable triggers protect business observations. This migration
+        -- only fills new identity columns before rebuilding the same rows below.
+        DROP TRIGGER IF EXISTS trg_market_snapshots_immutable;
+        DROP TRIGGER IF EXISTS trg_product_snapshots_immutable;
+
         UPDATE market_snapshots
         SET observation_date = date,
             dedup_key = 'market|'
               || COALESCE((SELECT marketplace FROM market_nodes WHERE market_nodes.id = market_snapshots.market_node_id), '')
               || '|' || market_node_id || '|' || date || '|' || lower(trim(source_type))
-              || '|' || lower(trim(source)) || '|' || period || '|legacy|' || id
+              || '|' || lower(trim(source)) || '|' || period
+              || CASE WHEN rowid = (
+                SELECT MIN(candidate.rowid) FROM market_snapshots candidate
+                WHERE candidate.market_node_id = market_snapshots.market_node_id
+                  AND candidate.date = market_snapshots.date
+                  AND lower(trim(candidate.source_type)) = lower(trim(market_snapshots.source_type))
+                  AND lower(trim(candidate.source)) = lower(trim(market_snapshots.source))
+                  AND candidate.period = market_snapshots.period
+              ) THEN '' ELSE '|archival|' || id END
         WHERE observation_date IS NULL OR dedup_key IS NULL;
         CREATE UNIQUE INDEX idx_market_snapshots_dedup_key
           ON market_snapshots(dedup_key) WHERE dedup_key IS NOT NULL;
@@ -1452,15 +1479,21 @@ const migrations = [
             dedup_key = 'product|'
               || COALESCE((SELECT marketplace FROM products WHERE products.id = product_snapshots.product_id), '')
               || '|' || product_id || '|' || date || '|' || lower(trim(source_type))
-              || '|' || lower(trim(source)) || '|' || period || '|legacy|' || id
+              || '|' || lower(trim(source)) || '|' || period
+              || CASE WHEN rowid = (
+                SELECT MIN(candidate.rowid) FROM product_snapshots candidate
+                WHERE candidate.product_id = product_snapshots.product_id
+                  AND candidate.date = product_snapshots.date
+                  AND lower(trim(candidate.source_type)) = lower(trim(product_snapshots.source_type))
+                  AND lower(trim(candidate.source)) = lower(trim(product_snapshots.source))
+                  AND candidate.period = product_snapshots.period
+              ) THEN '' ELSE '|archival|' || id END
         WHERE observation_date IS NULL OR dedup_key IS NULL;
         CREATE UNIQUE INDEX idx_product_snapshots_dedup_key
           ON product_snapshots(dedup_key) WHERE dedup_key IS NOT NULL;
         CREATE INDEX idx_product_snapshots_observation
           ON product_snapshots(product_id, observation_date DESC);
 
-        DROP TRIGGER IF EXISTS trg_market_snapshots_immutable;
-        DROP TRIGGER IF EXISTS trg_product_snapshots_immutable;
         DROP INDEX IF EXISTS idx_market_snapshots_node_date;
         DROP INDEX IF EXISTS idx_market_snapshots_dedup_key;
         DROP INDEX IF EXISTS idx_market_snapshots_observation;
@@ -1494,8 +1527,8 @@ const migrations = [
           period TEXT NOT NULL,
           is_estimated INTEGER NOT NULL,
           confidence REAL NOT NULL,
-          observation_date TEXT,
-          dedup_key TEXT
+          observation_date TEXT NOT NULL,
+          dedup_key TEXT NOT NULL
         );
         INSERT INTO market_snapshots (
           id, market_node_id, date, product_count, seller_count, brand_count, monthly_sales,
@@ -1512,7 +1545,7 @@ const migrations = [
         CREATE INDEX idx_market_snapshots_node_date
           ON market_snapshots(market_node_id, date DESC);
         CREATE UNIQUE INDEX idx_market_snapshots_dedup_key
-          ON market_snapshots(dedup_key) WHERE dedup_key IS NOT NULL;
+          ON market_snapshots(dedup_key);
         CREATE INDEX idx_market_snapshots_observation
           ON market_snapshots(market_node_id, observation_date DESC);
         CREATE TRIGGER trg_market_snapshots_immutable
@@ -1541,8 +1574,8 @@ const migrations = [
           period TEXT NOT NULL,
           is_estimated INTEGER NOT NULL,
           confidence REAL NOT NULL,
-          observation_date TEXT,
-          dedup_key TEXT
+          observation_date TEXT NOT NULL,
+          dedup_key TEXT NOT NULL
         );
         INSERT INTO product_snapshots (
           id, product_id, date, price, rating, review_count, bsr, estimated_sales,
@@ -1557,7 +1590,7 @@ const migrations = [
         CREATE INDEX idx_product_snapshots_product_date
           ON product_snapshots(product_id, date DESC);
         CREATE UNIQUE INDEX idx_product_snapshots_dedup_key
-          ON product_snapshots(dedup_key) WHERE dedup_key IS NOT NULL;
+          ON product_snapshots(dedup_key);
         CREATE INDEX idx_product_snapshots_observation
           ON product_snapshots(product_id, observation_date DESC);
         CREATE TRIGGER trg_product_snapshots_immutable
@@ -1638,7 +1671,7 @@ const migrations = [
         -- represented as NULL rather than inventing a 0 for legacy snapshots.
         CREATE TABLE metric_facts (
           id TEXT PRIMARY KEY,
-          entity_type TEXT NOT NULL CHECK (entity_type IN ('product', 'market')),
+          entity_type TEXT NOT NULL CHECK (entity_type IN ('product', 'market', 'competitor')),
           entity_id TEXT NOT NULL,
           marketplace TEXT NOT NULL,
           metric_name TEXT NOT NULL,
@@ -1656,7 +1689,125 @@ const migrations = [
           ON metric_facts(dedup_key) WHERE dedup_key IS NOT NULL;
         CREATE INDEX idx_metric_facts_authority
           ON metric_facts(entity_type, entity_id, metric_name, observation_date DESC);
+
+        CREATE TABLE demo_seed_records (
+          seed_id TEXT NOT NULL,
+          table_name TEXT NOT NULL,
+          record_id TEXT NOT NULL,
+          created_at TEXT NOT NULL,
+          PRIMARY KEY (seed_id, table_name, record_id)
+        );
+        CREATE INDEX idx_demo_seed_records_table ON demo_seed_records(table_name, record_id);
       `);
+    },
+  },
+  {
+    version: 21,
+    apply(database: DatabaseSync): void {
+      // V20 may already have been applied before the Demo registry existed.
+      database.exec(`
+        CREATE TABLE IF NOT EXISTS demo_seed_records (
+          seed_id TEXT NOT NULL,
+          table_name TEXT NOT NULL,
+          record_id TEXT NOT NULL,
+          created_at TEXT NOT NULL,
+          PRIMARY KEY (seed_id, table_name, record_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_demo_seed_records_table
+          ON demo_seed_records(table_name, record_id);
+      `);
+
+      const seedTime = '2026-09-09T10:20:00+08:00';
+      const source = '演示数据 / Mock Adapter';
+      const register = (
+        table: string, id: string, predicate: string, ...parameters: Array<string | number>
+      ): void => {
+        database.prepare(`
+          INSERT OR IGNORE INTO demo_seed_records (seed_id, table_name, record_id, created_at)
+          SELECT 'v2-demo-seed', ?, id, ? FROM ${table}
+          WHERE id = ? AND ${predicate}
+        `).run(table, seedTime, id, ...parameters);
+      };
+      const marketIds = [
+        'mkt-pillow', 'mkt-memory-foam', 'mkt-cervical', 'mkt-contour',
+        'mkt-ergonomic', 'mkt-neck-support', 'mkt-side-sleeper', 'mkt-back-sleeper',
+        'mkt-other-memory', 'mkt-lumbar', 'mkt-travel', 'mkt-seat-cushion',
+      ];
+      for (const id of marketIds) {
+        register('market_nodes', id, 'source_type = ? AND created_at = ?', 'mock', seedTime);
+      }
+      const products = [
+        ['owned-sku-01', 'B0DEMO0001'], ['owned-sku-02', 'B0DEMO0002'],
+        ['owned-sku-03', 'B0DEMO0003'], ['owned-sku-04', 'B0DEMO0004'],
+        ['competitor-01', 'B0DEMO1001'], ['competitor-02', 'B0DEMO1002'],
+        ['competitor-03', 'B0DEMO1003'], ['competitor-04', 'B0DEMO1004'],
+        ['competitor-05', 'B0DEMO1005'], ['competitor-06', 'B0DEMO1006'],
+        ['competitor-07', 'B0DEMO1007'], ['competitor-08', 'B0DEMO1008'],
+      ] as const;
+      for (const [id, asin] of products) {
+        register('products', id, 'asin = ? AND source_type = ? AND created_at = ?', asin, 'mock', seedTime);
+      }
+      const registerMarketSnapshot = (id: string, marketId: string, date: string): void => {
+        register(
+          'market_snapshots', id,
+          'market_node_id = ? AND date = ? AND source = ? AND source_type = ? AND collected_at = ?',
+          marketId, date, source, 'mock', `${date}T10:20:00+08:00`,
+        );
+      };
+      for (const date of [
+        '2026-04-12', '2026-05-12', '2026-06-11',
+        '2026-07-11', '2026-08-10', '2026-09-09',
+      ]) registerMarketSnapshot(`ms-mfm-${date}`, 'mkt-memory-foam', date);
+      for (const marketId of marketIds.filter((id) => id !== 'mkt-memory-foam')) {
+        registerMarketSnapshot(`ms-${marketId}-prev`, marketId, '2026-08-10');
+        registerMarketSnapshot(`ms-${marketId}-current`, marketId, '2026-09-09');
+      }
+      for (const [id] of products) {
+        const dates = id.startsWith('owned-sku-')
+          ? ['2026-06-11', '2026-07-11', '2026-08-10', '2026-09-09']
+          : ['2026-08-10', '2026-09-09'];
+        dates.forEach((date, index) => register(
+          'product_snapshots', `ps-${id}-${index + 1}`,
+          'product_id = ? AND date = ? AND source = ? AND source_type = ? AND collected_at = ?',
+          id, date, source, 'mock', `${date}T10:20:00+08:00`,
+        ));
+      }
+      const relations = [
+        ['owned-sku-01', 'competitor-03'], ['owned-sku-01', 'competitor-08'],
+        ['owned-sku-01', 'competitor-01'], ['owned-sku-02', 'competitor-07'],
+        ['owned-sku-02', 'competitor-01'], ['owned-sku-02', 'competitor-04'],
+        ['owned-sku-03', 'competitor-02'], ['owned-sku-03', 'competitor-06'],
+        ['owned-sku-03', 'competitor-05'], ['owned-sku-04', 'competitor-05'],
+        ['owned-sku-04', 'competitor-03'], ['owned-sku-04', 'competitor-08'],
+      ] as const;
+      relations.forEach(([owned, competitor], index) => register(
+        'competitor_relations', `relation-${index + 1}`,
+        'owned_product_id = ? AND competitor_product_id = ? AND created_at = ?',
+        owned, competitor, seedTime,
+      ));
+      for (const id of [
+        'insight-market-memory', 'insight-owned-sku-01', 'insight-owned-sku-02',
+        'insight-owned-sku-03', 'insight-owned-sku-04', 'insight-dev-lumbar',
+        'insight-dev-travel', 'insight-dev-seat',
+      ]) register(
+        'ai_insights', id, 'input_hash = ? AND data_version = ? AND generated_at = ?',
+        `seed-${id}`, 'demo-2026-09-09', seedTime,
+      );
+      for (const [id, insightId] of [
+        ['dev-lumbar', 'insight-dev-lumbar'],
+        ['dev-travel', 'insight-dev-travel'],
+        ['dev-seat', 'insight-dev-seat'],
+      ]) register('development_projects', id, 'insight_id = ? AND updated_at = ?', insightId, seedTime);
+      for (const id of ['opp-school-kit', 'opp-travel-desk', 'opp-cooling-lumbar']) {
+        register('opportunities', id, 'updated_at = ?', seedTime);
+      }
+      register('research_results', 'research-demo-school', 'generated_at = ?', seedTime);
+      for (const id of ['watch-market', 'watch-sku03', 'watch-comp04', 'watch-lumbar']) {
+        register('watchlist_items', id, 'created_at = ?', '2026-08-30T10:00:00+08:00');
+      }
+      for (const id of ['task-demo-1', 'task-demo-2', 'task-demo-3']) {
+        register('data_tasks', id, 'source_id = ? AND source = ?', 'source-mock', source);
+      }
     },
   },
 ];

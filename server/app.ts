@@ -1,5 +1,5 @@
-import { existsSync } from 'node:fs';
-import { join, resolve } from 'node:path';
+import { existsSync, mkdirSync } from 'node:fs';
+import { basename, join, resolve } from 'node:path';
 import express, { type NextFunction, type Request, type Response } from 'express';
 import multer from 'multer';
 import { z } from 'zod';
@@ -11,19 +11,32 @@ import type {
   TimeRange,
   TrendPoint,
 } from '../shared/types.js';
-import { AdapterRegistry } from './adapters/index.js';
+import {
+  AdapterRegistry,
+  DataSourceRouter,
+  SELLERSPRITE_CAPABILITIES,
+  SellerSpriteMCPAdapter,
+  type SellerSpriteConnectionDiagnostics,
+} from './adapters/index.js';
+import type { SellerSpriteSyncPort } from './services/sellersprite-sync-service.js';
 import { openDatabase, type AppDatabase } from './database/database.js';
 import { IntelligenceRepository } from './repository/intelligence-repository.js';
 import { WorkflowRepository } from './repository/workflow-repository.js';
 import { ImportService } from './services/import-service.js';
 import { ExecutiveDashboardService } from './services/executive-dashboard-service.js';
+import { DataCoverageService } from './services/data-coverage-service.js';
 import { IntelligenceService } from './services/intelligence-service.js';
+import { GoLiveMigrationService } from './services/go-live-migration-service.js';
+import { SellerSpriteSyncService } from './services/sellersprite-sync-service.js';
 import { WorkflowOrchestrator } from './services/workflow-orchestrator.js';
 
 export interface CreateAppOptions {
   database?: AppDatabase;
   databasePath?: string;
   serveStatic?: boolean;
+  sellerSpritePort?: SellerSpriteSyncPort;
+  sellerSpriteDiagnostics?: Pick<SellerSpriteMCPAdapter, 'testConnection'>;
+  backupDirectory?: string;
 }
 
 const settingsSchema = z.object({
@@ -114,18 +127,28 @@ const asyncHandler = (
 
 export function createApp(options: CreateAppOptions = {}): express.Express {
   const database = options.database ?? openDatabase(options.databasePath);
-  const service = new IntelligenceService(database);
+  const adapters = new AdapterRegistry(undefined, { database });
+  const sellerSpriteAdapter = adapters.get('source-sellersprite-mcp') as SellerSpriteMCPAdapter;
+  const service = new IntelligenceService(database, new DataSourceRouter(adapters));
   const repository = service.repository;
   const workflowRepository = new WorkflowRepository(database, repository);
   const executiveDashboard = new ExecutiveDashboardService(database, repository, workflowRepository);
+  const dataCoverage = new DataCoverageService(database);
+  const goLive = new GoLiveMigrationService(database);
   const workflow = new WorkflowOrchestrator(database);
-  const importer = new ImportService(database, new AdapterRegistry());
+  const importer = new ImportService(database, adapters);
+  const sellerSprite = new SellerSpriteSyncService(
+    database,
+    options.sellerSpritePort ?? sellerSpriteAdapter,
+  );
+  const sellerSpriteDiagnostics = options.sellerSpriteDiagnostics ?? sellerSpriteAdapter;
   const adminOnly = requireAdmin(repository);
   const upload = multer({
     storage: multer.memoryStorage(),
     limits: { fileSize: 15 * 1024 * 1024, files: 1 },
   });
   const app = express();
+  let latestGoLiveBackup: { filename: string; createdAt: string } | null = null;
   app.locals.database = database;
 
   app.disable('x-powered-by');
@@ -164,6 +187,40 @@ export function createApp(options: CreateAppOptions = {}): express.Express {
   });
   app.get('/api/data-sources', (_request, response) => sendData(response, repository.getDataSources(), repository));
 
+  app.get('/api/go-live/preview', (_request, response) => {
+    sendData(response, goLive.preview(), repository);
+  });
+  app.post('/api/go-live/backup', adminOnly, asyncHandler(async (_request, response) => {
+    const backupDirectory = resolve(options.backupDirectory ?? join('data', 'backups'));
+    mkdirSync(backupDirectory, { recursive: true });
+    const filename = `opportunity-intelligence-${Date.now()}.db`;
+    await goLive.backup(join(backupDirectory, filename));
+    latestGoLiveBackup = { filename, createdAt: new Date().toISOString() };
+    sendData(response, { created: true, ...latestGoLiveBackup }, repository, 201);
+  }));
+  app.post('/api/go-live/cleanup', adminOnly, (request, response) => {
+    const input = z.object({ confirmation: z.string() }).parse(request.body ?? {});
+    if (input.confirmation !== 'CLEAR DEMO DATA') {
+      throw httpError(409, '确认文本不匹配，未清除任何数据。');
+    }
+    if (!latestGoLiveBackup) throw httpError(409, '清除 Demo 前必须先创建数据库备份。');
+    sendData(response, {
+      cleanup: goLive.clearDemoObservations(),
+      backup: { filename: basename(latestGoLiveBackup.filename), createdAt: latestGoLiveBackup.createdAt },
+    }, repository);
+  });
+  app.get('/api/go-live/verify', (_request, response) => {
+    sendData(response, goLive.verify(), repository);
+  });
+  app.post('/api/go-live/activate', adminOnly, (request, response) => {
+    const input = z.object({ confirmation: z.string() }).parse(request.body ?? {});
+    if (input.confirmation !== 'ACTIVATE LIVE') {
+      throw httpError(409, '确认文本不匹配，未切换 Live 模式。');
+    }
+    goLive.activateLiveMode();
+    sendData(response, { activated: true, verification: goLive.verify() }, repository);
+  });
+
   app.get('/api/dashboard/briefing', (_request, response) => sendData(response, service.getDashboard(), repository));
   app.get('/api/dashboard/executive', (request, response) => {
     const query = z.object({
@@ -175,8 +232,31 @@ export function createApp(options: CreateAppOptions = {}): express.Express {
     if (query.skuId) requireOwnedProduct(repository, query.skuId);
     sendData(response, executiveDashboard.getDashboard(query.range, query.skuId), repository);
   });
+  app.get('/api/data-coverage', (request, response) => {
+    const query = z.object({ marketplace: z.string().trim().min(1).optional() }).parse(request.query);
+    assertRequestedMarketplace(repository, query.marketplace);
+    sendData(response, dataCoverage.getCoverage(repository.getSettings().marketplace), repository);
+  });
 
   app.get('/api/markets', (_request, response) => sendData(response, repository.getMarkets(), repository));
+  app.patch('/api/markets/:id/sellersprite-node', adminOnly, (request, response) => {
+    const id = routeParam(request, 'id');
+    const market = requireMarket(repository, id);
+    const input = z.object({ nodeIdPath: z.string().trim().regex(/^\d+(?::\d+)*$/), confirmed: z.literal(true) })
+      .parse(request.body ?? {});
+    const current = database.prepare(`SELECT category_id AS categoryId FROM market_nodes WHERE id = ?`)
+      .get(id) as { categoryId: string | null };
+    if (current.categoryId !== input.nodeIdPath) {
+      const existing = database.prepare(`
+        SELECT EXISTS(SELECT 1 FROM market_snapshots
+          WHERE market_node_id = ? AND source_type = 'mcp') AS found
+      `).get(id) as { found: number };
+      if (existing.found) throw httpError(409, '该市场已有 SellerSprite 历史观察；变更节点路径需要新建市场。');
+      database.prepare(`UPDATE market_nodes SET category_id = ? WHERE id = ? AND marketplace = ?`)
+        .run(input.nodeIdPath, id, market.node.marketplace);
+    }
+    sendData(response, { marketId: id, nodeIdPath: input.nodeIdPath }, repository);
+  });
   app.get('/api/markets/:id/snapshots', (request, response) => {
     requireMarket(repository, request.params.id);
     const range = parseTimeRange(request.query.range);
@@ -377,6 +457,114 @@ export function createApp(options: CreateAppOptions = {}): express.Express {
     sendData(response, await service.runDataTask({ retryTaskId: routeParam(request, 'id') }), repository, 201);
   }));
 
+  app.post('/api/integrations/sellersprite/test', adminOnly, asyncHandler(async (_request, response) => {
+    const result: SellerSpriteConnectionDiagnostics = await sellerSpriteDiagnostics.testConnection();
+    database.prepare(`
+      UPDATE data_sources
+      SET status = ?, last_sync_at = CASE WHEN ? = 1 THEN ? ELSE last_sync_at END
+      WHERE id = 'source-sellersprite-mcp'
+    `).run(
+      result.connected ? 'connected' : result.authenticated ? 'disconnected' : 'needs_configuration',
+      result.connected ? 1 : 0,
+      new Date().toISOString(),
+    );
+    sendData(response, result, repository);
+  }));
+  app.get('/api/integrations/sellersprite/capabilities', (_request, response) => {
+    const row = database.prepare(`
+      SELECT capabilities_json AS capabilitiesJson, collected_at AS collectedAt
+      FROM provider_capability_snapshots
+      WHERE provider_id = 'sellersprite'
+      ORDER BY collected_at DESC, rowid DESC LIMIT 1
+    `).get() as { capabilitiesJson: string; collectedAt: string } | undefined;
+    const payload = row ? safeJsonObject(row.capabilitiesJson) : {};
+    const mappings = safeJsonObject(payload.capabilities);
+    const missing = Array.isArray(payload.missingCapabilities)
+      ? new Set(payload.missingCapabilities.filter((value): value is string => typeof value === 'string'))
+      : new Set<string>(SELLERSPRITE_CAPABILITIES);
+    sendData(response, {
+      collectedAt: row?.collectedAt ?? null,
+      toolCount: Array.isArray(payload.tools) ? payload.tools.length : 0,
+      required: SELLERSPRITE_CAPABILITIES.map((capability) => ({
+        capability,
+        available: !missing.has(capability) && typeof mappings[capability] === 'string',
+      })),
+    }, repository);
+  });
+
+  app.post('/api/integrations/sellersprite/sync/market', adminOnly, asyncHandler(async (request, response) => {
+    const input = z.object({
+      marketId: z.string().trim().min(1),
+      month: z.string().regex(/^\d{4}-?\d{2}(?:-\d{2})?$/),
+    }).parse(request.body);
+    requireMarket(repository, input.marketId);
+    sendData(response, await sellerSprite.syncMarket(input), repository, 201);
+  }));
+  app.post('/api/integrations/sellersprite/sync/products', adminOnly, asyncHandler(async (request, response) => {
+    const input = z.object({ productIds: z.array(z.string().trim().min(1)).max(100).optional() })
+      .parse(request.body ?? {});
+    const productIds = input.productIds ?? database.prepare(`
+      SELECT id FROM products
+      WHERE marketplace = ? AND is_owned = 1 AND status = 'active'
+      ORDER BY id
+    `).all(repository.getSettings().marketplace).map((row) => String((row as { id: string }).id));
+    const results = [];
+    for (const productId of productIds) {
+      requireOwnedProduct(repository, productId);
+      results.push({ productId, ...await sellerSprite.syncOwnedProduct({ productId }) });
+    }
+    sendData(response, { results }, repository, 201);
+  }));
+  app.post('/api/integrations/sellersprite/sync/competitor', adminOnly, asyncHandler(async (request, response) => {
+    const input = z.object({
+      ownedProductId: z.string().trim().min(1),
+      competitorProductId: z.string().trim().min(1),
+    }).parse(request.body);
+    requireOwnedProduct(repository, input.ownedProductId);
+    sendData(response, await sellerSprite.syncConfirmedCompetitor(input), repository, 201);
+  }));
+  app.post('/api/integrations/sellersprite/sync/critical', adminOnly, asyncHandler(async (request, response) => {
+    const input = z.object({
+      marketId: z.string().trim().min(1),
+      month: z.string().regex(/^\d{4}-?\d{2}(?:-\d{2})?$/),
+    }).parse(request.body);
+    requireMarket(repository, input.marketId);
+    sendData(response, await sellerSprite.syncCriticalBatch(input), repository, 201);
+  }));
+  app.post('/api/owned-products/:id/competitor-candidates', adminOnly, asyncHandler(async (request, response) => {
+    const ownedProductId = routeParam(request, 'id');
+    requireOwnedProduct(repository, ownedProductId);
+    const input = z.object({ size: z.number().int().min(1).max(100).optional() }).parse(request.body ?? {});
+    sendData(response, await sellerSprite.discoverCompetitors({ ownedProductId, ...input }), repository, 201);
+  }));
+  app.get('/api/owned-products/:id/competitor-candidates', (request, response) => {
+    const ownedProductId = routeParam(request, 'id');
+    requireOwnedProduct(repository, ownedProductId);
+    sendData(response, sellerSprite.listCompetitorCandidates(ownedProductId), repository);
+  });
+  app.post('/api/owned-products/:id/competitor-candidates/:candidateId/confirm', adminOnly, (request, response) => {
+    const ownedProductId = routeParam(request, 'id');
+    requireOwnedProduct(repository, ownedProductId);
+    const input = z.object({
+      relationType: relationTypeSchema.default('direct'),
+      reason: z.string().trim().min(1),
+      similarityScore: z.number().min(0).max(100).optional(),
+    }).parse(request.body ?? {});
+    sendData(response, sellerSprite.confirmCompetitorCandidate({
+      ownedProductId,
+      candidateId: routeParam(request, 'candidateId'),
+      ...input,
+    }), repository, 201);
+  });
+  app.post('/api/owned-products/:id/competitor-candidates/:candidateId/reject', adminOnly, (request, response) => {
+    const ownedProductId = routeParam(request, 'id');
+    requireOwnedProduct(repository, ownedProductId);
+    sendData(response, sellerSprite.rejectCompetitorCandidate({
+      ownedProductId,
+      candidateId: routeParam(request, 'candidateId'),
+    }), repository);
+  });
+
   app.get('/api/rules/profiles', (_request, response) => {
     sendData(response, workflowRepository.getRuleProfiles(), repository);
   });
@@ -439,21 +627,39 @@ export function createApp(options: CreateAppOptions = {}): express.Express {
     sendData(response, requireResearchJob(workflowRepository, routeParam(request, 'id')), repository);
   });
 
-  const importHandler = (format: 'csv' | 'xlsx') => (request: Request, response: Response): void => {
+  app.post(['/api/import/csv', '/api/import/xlsx'], adminOnly, () => {
+    throw httpError(410, '直接导入已停用；请先通过 /api/import/preview/csv 或 /api/import/preview/xlsx 审核文件，再使用确认令牌导入。');
+  });
+  const previewImportHandler = (format: 'csv' | 'xlsx') => (request: Request, response: Response): void => {
     if (!request.file) throw httpError(400, '请使用 multipart/form-data 的 file 字段上传文件。');
-    const result = importer.import(request.file.buffer, {
+    sendData(response, importer.preview(request.file.buffer, {
       format,
       filename: request.file.originalname,
       entityType: stringBodyValue(request.body.entityType),
       marketplace: stringBodyValue(request.body.marketplace),
       marketNodeId: stringBodyValue(request.body.marketNodeId),
+      reportStartDate: stringBodyValue(request.body.reportStartDate),
+      reportEndDate: stringBodyValue(request.body.reportEndDate),
       researchJobId: stringBodyValue(request.body.researchJobId),
       sourceType: stringBodyValue(request.body.sourceType) === 'amazon' ? 'amazon' : 'import',
-    });
-    sendData(response, result, repository, 201);
+    }), repository);
   };
-  app.post('/api/import/csv', adminOnly, upload.single('file'), importHandler('csv'));
-  app.post('/api/import/xlsx', adminOnly, upload.single('file'), importHandler('xlsx'));
+  app.post('/api/import/preview/csv', adminOnly, upload.single('file'), previewImportHandler('csv'));
+  app.post('/api/import/preview/xlsx', adminOnly, upload.single('file'), previewImportHandler('xlsx'));
+  app.post('/api/import/preview/type', adminOnly, (request, response) => {
+    const input = z.object({
+      token: z.string().uuid(),
+      entityType: z.string().trim().min(1),
+    }).parse(request.body);
+    sendData(response, importer.selectType(input.token, input.entityType), repository);
+  });
+  app.post('/api/import/confirm', adminOnly, (request, response) => {
+    const input = z.object({
+      token: z.string().uuid(),
+      entityType: z.string().trim().min(1).optional(),
+    }).parse(request.body);
+    sendData(response, importer.confirm(input.token, input.entityType), repository, 201);
+  });
 
   app.post('/api/ai/analyze', adminOnly, (request, response) => {
     const body = z.object({
@@ -525,6 +731,21 @@ function sendData<T>(
   const mode: DataMode = repository.getSettings().mode;
   const payload: ApiResponse<T> = { data, meta: { mode, generatedAt: new Date().toISOString() } };
   response.status(status).json(payload);
+}
+
+function safeJsonObject(value: unknown): Record<string, unknown> {
+  if (value && typeof value === 'object' && !Array.isArray(value)) {
+    return value as Record<string, unknown>;
+  }
+  if (typeof value !== 'string') return {};
+  try {
+    const parsed: unknown = JSON.parse(value);
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed)
+      ? parsed as Record<string, unknown>
+      : {};
+  } catch {
+    return {};
+  }
 }
 
 function requireMarket(repository: IntelligenceRepository, id: string) {
@@ -640,7 +861,8 @@ function isHttpError(error: unknown): error is HttpError {
 function inferErrorStatus(error: unknown): number {
   if (!(error instanceof Error)) return 500;
   if (/UNIQUE constraint failed/.test(error.message)) return 409;
-  if (/已有真实或导入数据/.test(error.message)) return 409;
+  if (/无法切换 Live 模式/.test(error.message)) return 409;
+  if (/已有真实或导入数据|真实工作流仍引用 Demo|Demo 不能覆盖|Go Live 迁移/.test(error.message)) return 409;
   if (/机会数据不足/.test(error.message)) return 409;
   if (/存在历史 Snapshot/.test(error.message)) return 409;
   if (/当前状态|没有待处理的.*Approval|阻断决策|不能批准|Reverse Review/.test(error.message)) return 409;

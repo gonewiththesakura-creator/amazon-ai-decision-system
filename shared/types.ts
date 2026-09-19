@@ -68,6 +68,11 @@ export interface Provenance {
   confidence: number;
 }
 
+export interface MetricProvenance extends Provenance {
+  sourceRecordId: string;
+  sourceRecordType: 'metric_fact' | 'snapshot';
+}
+
 export interface EvidenceMetric {
   name: string;
   label: string;
@@ -171,6 +176,7 @@ export interface MarketDetail {
   concentration: Array<{ tier: string; share: number; avgPrice: number; avgSales: number }>;
   insight: Insight;
   provenance: Provenance;
+  metricProvenance?: Record<string, MetricProvenance>;
 }
 
 export interface ProductSnapshot {
@@ -190,6 +196,7 @@ export interface ProductSnapshot {
   growth30dAvailable: boolean;
   growth90d: number | null;
   provenance: Provenance;
+  metricProvenance?: Record<string, MetricProvenance>;
 }
 
 export interface Product {
@@ -800,6 +807,25 @@ export interface ExecutiveDashboardViewModel {
   coreBusinessFreshness: CoreBusinessFreshness;
   systemSyncStatus: SystemSyncStatus;
   skuFocus: ExecutiveSkuFocus | null;
+}
+
+export type DataCoverageStatus = 'complete' | 'partial' | 'missing' | 'not_applicable';
+
+export interface DataCoverageCounter {
+  covered: number;
+  total: number;
+  status: DataCoverageStatus;
+  label: '完整' | '部分覆盖' | '缺失' | '不适用';
+}
+
+export interface DataCoverageReport {
+  generatedAt: string;
+  marketplace: string;
+  primaryMarket: DataCoverageCounter;
+  activeOwnedProducts: DataCoverageCounter;
+  coreCompetitors: DataCoverageCounter;
+  history90d: DataCoverageCounter;
+  amazonActual: DataCoverageCounter;
 }
 
 export interface AppSettings {

@@ -84,6 +84,9 @@
 .executive-system-sync--failed { color: var(--red); }
 .executive-system-sync--partial,
 .executive-system-sync--running { color: var(--amber); }
+.executive-coverage--complete { color: var(--teal); }
+.executive-coverage--partial { color: var(--amber); }
+.executive-coverage--missing { color: var(--red); }
 
 .executive-dashboard-grid {
   display: grid;

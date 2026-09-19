@@ -7,7 +7,11 @@ import { sellerSpriteEnvelope } from './sellersprite-mcp-schemas.js';
 import {
   SqliteMcpCallLedgerStore, SqliteMcpCapabilityStore, SqliteMcpResponseCacheStore,
 } from './sellersprite-mcp-store.js';
-import { SellerSpriteToolRegistry, type SellerSpriteCapability } from './sellersprite-tool-registry.js';
+import {
+  SELLERSPRITE_CAPABILITIES,
+  SellerSpriteToolRegistry,
+  type SellerSpriteCapability,
+} from './sellersprite-tool-registry.js';
 import type {
   KeywordDataRecord, KeywordInput, MarketDataAdapter, MarketInput,
   MarketOverviewRecord, ProductDetailRecord, ProductInput,
@@ -34,6 +38,17 @@ export type SellerSpriteAsinTrend = {
 };
 export type SellerSpriteCompetitorCandidates = Array<Record<string, unknown>>;
 
+export interface SellerSpriteConnectionDiagnostics {
+  connected: boolean;
+  authenticated: boolean;
+  toolCount: number;
+  requiredCapabilityCount: number;
+  availableRequiredCapabilityCount: number;
+  missingCapabilities: SellerSpriteCapability[];
+  latencyMs: number;
+  errorCode?: string;
+}
+
 export class SellerSpriteMCPAdapter implements MarketDataAdapter {
   readonly id = 'source-sellersprite-mcp';
   readonly name = 'SellerSprite MCP';
@@ -56,6 +71,24 @@ export class SellerSpriteMCPAdapter implements MarketDataAdapter {
     this.registry = options.registry ?? new SellerSpriteToolRegistry(options.database
       ? { store: new SqliteMcpCapabilityStore(options.database) } : {});
     this.injectedClient = Boolean(options.client);
+  }
+
+  async testConnection(): Promise<SellerSpriteConnectionDiagnostics> {
+    const startedAt = Date.now();
+    const status = await this.client.connectionTest();
+    let missingCapabilities = [...SELLERSPRITE_CAPABILITIES] as SellerSpriteCapability[];
+    if (status.connected) {
+      await this.registry.refresh(() => this.client.listTools());
+      missingCapabilities = this.registry.missing();
+      this.discovered = true;
+    }
+    return {
+      ...status,
+      requiredCapabilityCount: SELLERSPRITE_CAPABILITIES.length,
+      availableRequiredCapabilityCount: SELLERSPRITE_CAPABILITIES.length - missingCapabilities.length,
+      missingCapabilities,
+      latencyMs: Math.max(0, Date.now() - startedAt),
+    };
   }
 
   async fetchMarketStatistics(input: SellerSpriteMarketRequest): Promise<SellerSpriteData<SellerSpriteStatistics>> {
@@ -128,13 +161,17 @@ export class SellerSpriteMCPAdapter implements MarketDataAdapter {
       throw new SellerSpriteMcpError('INVALID_SCHEMA', 'SellerSprite product detail missing identity or observation period');
     }
     const id = `${input.marketplace}:${info.asin}`;
+    const isParentAsin = typeof info.parent === 'string'
+      && info.parent.toUpperCase() === info.asin.toUpperCase();
     const snapshot: ProductSnapshot = {
       id: randomUUID(), snapshotAvailable: true, productId: id, date: observationDate(latest.month),
-      price: numberOrNull(latest.price ?? info.price), rating: numberOrNull(info.rating),
-      reviewCount: numberOrNull(info.ratings), bsr: numberOrNull(info.bsr),
-      estimatedSales: numberOrNull(latest.childUnitSales),
-      estimatedRevenue: numberOrNull(latest.childSalesRevenue),
-      sellerCount: numberOrNull(info.sellers),
+      price: numberOrNull(latest.price), rating: numberOrNull(latest.rating),
+      reviewCount: numberOrNull(latest.ratings), bsr: numberOrNull(latest.bsr ?? latest.bsrRank),
+      estimatedSales: numberOrNull(latest.childUnitSales
+        ?? (isParentAsin ? latest.parentUnitSales : null)),
+      estimatedRevenue: numberOrNull(latest.childSalesRevenue
+        ?? (isParentAsin ? latest.parentSalesRevenue : null)),
+      sellerCount: numberOrNull(latest.sellers),
       growth7d: null, growth30d: null, growth30dAvailable: false, growth90d: null,
       provenance,
     };
@@ -166,16 +203,27 @@ export class SellerSpriteMCPAdapter implements MarketDataAdapter {
     }
     const tool = this.registry.resolve(capability);
     if (!tool) throw new SellerSpriteMcpError('TOOL_NOT_FOUND', `SellerSprite capability unavailable: ${capability}`);
-    try { this.registry.validateArguments(capability, args); }
+    let toolArgs: Record<string, unknown>;
+    try { toolArgs = this.registry.argumentsFor(capability, args); }
     catch { throw new SellerSpriteMcpError('INVALID_SCHEMA', 'SellerSprite tool arguments do not match discovered schema'); }
-    const result = await this.client.callTool({ tool: tool.name, arguments: args, context: { capability, operation } });
-    let payload: unknown;
-    try { payload = sellerSpriteEnvelope(result); }
-    catch { throw new SellerSpriteMcpError('REMOTE_ERROR', 'SellerSprite rejected the tool request'); }
-    const parsed = schema.safeParse(payload);
-    if (!parsed.success) throw new SellerSpriteMcpError('INVALID_SCHEMA', 'SellerSprite response does not match discovered capability');
+    const request = args.request && typeof args.request === 'object'
+      ? args.request as Record<string, unknown> : args;
+    const entityType = capability === 'ASIN_SALES_TREND' || capability === 'ASIN_COMPETITOR_DISCOVERY'
+      ? 'product' as const : 'market' as const;
+    const entityId = entityType === 'product' ? request.asin : request.nodeIdPath;
+    const data = await this.client.callTool({ tool: tool.name, arguments: toolArgs, context: {
+      capability, operation, entityType,
+      ...(typeof entityId === 'string' ? { entityId: entityId.toUpperCase() } : {}),
+    } }, (result) => {
+      let payload: unknown;
+      try { payload = sellerSpriteEnvelope(result); }
+      catch { throw new SellerSpriteMcpError('INVALID_SCHEMA', 'Invalid SellerSprite response envelope'); }
+      const parsed = schema.safeParse(payload);
+      if (!parsed.success) throw new SellerSpriteMcpError('INVALID_SCHEMA', 'SellerSprite response does not match discovered capability');
+      return parsed.data;
+    });
     return {
-      data: parsed.data,
+      data,
       provenance: {
         source: 'SellerSprite MCP', sourceType: 'mcp', collectedAt: new Date().toISOString(),
         period: 'monthly', isEstimated: true, confidence: 0.75,
@@ -213,7 +261,10 @@ function observationDate(value: unknown): string {
   if (typeof value !== 'string') {
     throw new SellerSpriteMcpError('INVALID_SCHEMA', 'SellerSprite product missing observation date');
   }
-  if (/^\d{4}-\d{2}-\d{2}$/.test(value) && !Number.isNaN(Date.parse(`${value}T00:00:00Z`))) return value;
+  if (/^\d{4}-\d{2}-\d{2}$/.test(value)) {
+    const date = new Date(`${value}T00:00:00Z`);
+    if (Number.isFinite(date.getTime()) && date.toISOString().slice(0, 10) === value) return value;
+  }
   if (/^\d{4}-\d{2}$/.test(value)) {
     const [year, month] = value.split('-').map(Number);
     if (month >= 1 && month <= 12) return new Date(Date.UTC(year, month, 0)).toISOString().slice(0, 10);

@@ -36,9 +36,18 @@ describe('ProductIdentityResolver', () => {
     insertProduct(db, 'sku-product', 'US', 'B0OTHER001', 'SHARED-SKU');
     const resolver = new ProductIdentityResolver(db);
 
-    const resolved = resolver.resolve({ marketplace: 'us', asin: 'b0asin0001', sku: 'shared-sku' });
+    const resolved = resolver.resolve({ marketplace: 'us', asin: 'b0asin0001', sku: 'sku-asin' });
 
     expect(resolved).toMatchObject({ productId: 'asin-product', disposition: 'existing' });
+  });
+
+  it('rejects conflicting ASIN and SKU matches instead of merging products', () => {
+    const db = createDatabase();
+    insertProduct(db, 'asin-product', 'US', 'B0ASIN0001', 'SKU-ASIN');
+    insertProduct(db, 'sku-product', 'US', 'B0OTHER001', 'SHARED-SKU');
+    expect(() => new ProductIdentityResolver(db).resolve({
+      marketplace: 'US', asin: 'B0ASIN0001', sku: 'shared-sku',
+    })).toThrow(/拒绝合并/);
   });
 
   it('does not merge a matching ASIN across marketplaces and associates a parent family', () => {

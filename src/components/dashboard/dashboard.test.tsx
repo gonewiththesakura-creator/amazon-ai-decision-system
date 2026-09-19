@@ -57,6 +57,20 @@ describe('executive dashboard presentation invariants', () => {
     expect(container.textContent).not.toContain('0%');
   });
 
+  it('uses the dynamic portfolio total in KPI copy', () => {
+    render(<ExecutiveKpis kpis={{
+      marketGrowth: 8,
+      marketGrowthLabel: '稳定增长',
+      outperformingSkus: 17,
+      totalSkus: 50,
+      attentionSkus: 9,
+      fastGrowthCompetitors: 4,
+    }} />);
+
+    expect(screen.getByText('17 / 50')).toBeInTheDocument();
+    expect(screen.queryByText(/4\s*SKU/)).not.toBeInTheDocument();
+  });
+
   it('shows the trend empty state when no series has two valid points', () => {
     render(<MarketSkuTrendChart
       commonBaselineDate={null}

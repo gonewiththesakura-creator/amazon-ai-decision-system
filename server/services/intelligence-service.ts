@@ -20,7 +20,7 @@ import type {
   ScoreBreakdown,
   WatchlistItem,
 } from '../../shared/types.js';
-import { AdapterRegistry, DataSourceRouter } from '../adapters/index.js';
+import { AdapterRegistry, DataSourceRouter, SellerSpriteMCPAdapter } from '../adapters/index.js';
 import type {
   MarketDataAdapter,
   MarketOverviewRecord,
@@ -159,9 +159,6 @@ export class IntelligenceService {
         JSON.stringify(input.keywords ?? []), input.monitoringEnabled ? 1 : 0,
         settings.mode === 'demo' ? 'mock' : 'import', now,
       );
-      if (settings.mode === 'empty') {
-        this.database.prepare(`UPDATE app_settings SET mode = 'live' WHERE id = 1`).run();
-      }
       if (input.monitoringEnabled) {
         this.addWatchlist({
           itemType: 'owned_product', itemId: id,
@@ -621,9 +618,6 @@ export class IntelligenceService {
         id, query, summary, JSON.stringify(nodes), JSON.stringify(combinations),
         JSON.stringify(opportunityIds), nodes.length, now,
       );
-      if (settings.mode === 'empty') {
-        this.database.prepare(`UPDATE app_settings SET mode = 'live' WHERE id = 1`).run();
-      }
     });
     for (const opportunityId of opportunityIds) {
       const created = this.repository.getOpportunity(opportunityId);
@@ -910,7 +904,19 @@ export class IntelligenceService {
       },
       suggestedQuestions: ['今天有什么值得关注？', '哪个 SKU 最近最差？', '腰靠值得开发吗？'],
     };
-    if (settings.mode === 'empty') return empty;
+    if (settings.mode === 'empty') {
+      const staged = this.database.prepare(`
+        SELECT EXISTS(
+          SELECT 1 FROM products
+          WHERE marketplace = ? AND is_owned = 1 AND source_type <> 'mock'
+          UNION ALL
+          SELECT 1 FROM market_snapshots snapshot
+          JOIN market_nodes market ON market.id = snapshot.market_node_id
+          WHERE market.marketplace = ? AND snapshot.source_type <> 'mock'
+        ) AS available
+      `).get(settings.marketplace, settings.marketplace) as { available: number };
+      if (!staged.available) return empty;
+    }
     const market = settings.defaultMarketId ? this.repository.getMarket(settings.defaultMarketId) : null;
     const owned = this.repository.getOwnedProducts();
     const comparableOwned = owned.filter((item) => item.relativePerformanceAvailable);
@@ -1216,6 +1222,9 @@ export class IntelligenceService {
       throw new Error('评论刷新持久化尚未实现，任务已安全终止且未写入任何数据。');
     }
     if (normalizedTaskType === 'dashboard_core_refresh') {
+      if (adapter instanceof SellerSpriteMCPAdapter) {
+        throw new Error('V2.2 SellerSprite MCP 不支持旧版刷新任务；请使用真实数据工作台的关键数据同步。');
+      }
       refreshed = await this.refreshDashboardCore(adapter);
     } else if (watchItem) {
       if (watchItem.itemType === 'market') {
@@ -1432,8 +1441,8 @@ export class IntelligenceService {
         id, market_node_id, date, product_count, seller_count, brand_count, monthly_sales,
         monthly_revenue, avg_price, median_price, avg_rating, median_reviews, top10_share,
         top20_share, new_product_share, price_bands_json, concentration_json, source,
-        source_type, collected_at, period, is_estimated, confidence
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        source_type, collected_at, period, is_estimated, confidence, observation_date, dedup_key
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).run(
       randomUUID(), marketId, collectedAt.slice(0, 10), overview.productCount, overview.sellerCount,
       overview.brandCount, overview.monthlySales, overview.monthlyRevenue, overview.avgPrice,
@@ -1443,6 +1452,7 @@ export class IntelligenceService {
       overview.provenance.source, overview.provenance.sourceType, collectedAt,
       overview.provenance.period, overview.provenance.isEstimated ? 1 : 0,
       overview.provenance.confidence,
+      collectedAt.slice(0, 10), `market|${this.repository.getSettings().marketplace}|${marketId}|${collectedAt.slice(0, 10)}|${overview.provenance.sourceType.trim().toLowerCase()}|${overview.provenance.source.trim().toLowerCase()}|${overview.provenance.period}`,
     );
   }
 
@@ -1467,8 +1477,8 @@ export class IntelligenceService {
       INSERT INTO product_snapshots (
         id, product_id, date, price, rating, review_count, bsr, estimated_sales,
         estimated_revenue, seller_count, growth_7d, growth_30d, growth_90d,
-        source, source_type, collected_at, period, is_estimated, confidence
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        source, source_type, collected_at, period, is_estimated, confidence, observation_date, dedup_key
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).run(
       randomUUID(), productId, snapshot.date, snapshot.price, snapshot.rating,
       snapshot.reviewCount, snapshot.bsr, snapshot.estimatedSales,
@@ -1476,6 +1486,7 @@ export class IntelligenceService {
       snapshot.growth30d, snapshot.growth90d, provenance.source, provenance.sourceType,
       provenance.collectedAt, provenance.period, provenance.isEstimated ? 1 : 0,
       provenance.confidence,
+      snapshot.date, `product|${this.repository.getSettings().marketplace}|${productId}|${snapshot.date}|${provenance.sourceType.trim().toLowerCase()}|${provenance.source.trim().toLowerCase()}|${provenance.period}`,
     );
   }
 

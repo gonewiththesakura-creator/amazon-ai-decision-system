@@ -1,4 +1,5 @@
 import request from 'supertest';
+import { previewAndConfirmCsv } from './test-utils/import-api.js';
 import { afterEach, describe, expect, it } from 'vitest';
 import { createApp } from './app.js';
 import { AdapterRegistry } from './adapters/adapter-registry.js';
@@ -110,8 +111,7 @@ describe('data refresh routing', () => {
       'ASIN,SKU,Brand,Title,MarketName,Price,Rating,Reviews,BSR,MonthlySales,SellerCount,Growth7D,Growth30D,Growth90D,Confidence,IsEstimated,Date',
       'B0ROUTE001,ROUTE-01,Route Brand,Route Product,Route Market,39.99,4.4,120,8000,700,1,1.2,4.2,9.4,0.8,true,2026-09-09',
     ].join('\n');
-    await request(app).post('/api/import/csv').field('entityType', 'product')
-      .attach('file', Buffer.from(csv), 'route-live.csv').expect(201);
+    await previewAndConfirmCsv(app, csv, 'route-live.csv', { entityType: 'product' });
     const products = await request(app).get('/api/owned-products').expect(200);
     const productId = products.body.data[0].id as string;
     const before = database.prepare(`

@@ -2,18 +2,23 @@ import type { AppDatabase } from '../database/database.js';
 
 export interface ResolveMetricInput {
   entityId: string;
-  entityType?: 'product' | 'market';
+  entityType?: 'product' | 'market' | 'competitor';
   metric: string;
   observationDate: string;
+  sourceId?: string;
 }
 
 export interface MetricFact {
   id: string;
+  sourceRecordType: 'metric_fact' | 'snapshot';
   sourceType: string;
   source: string;
   value: number | null;
   isEstimated: boolean;
   confidence: number;
+  sourceId: string | null;
+  collectedAt: string;
+  period: string | null;
 }
 
 export interface MetricAuthorityResolution {
@@ -29,6 +34,14 @@ interface SnapshotRow {
   metric_value: number | null;
   is_estimated: number;
   confidence: number;
+  source_id?: string | null;
+  collected_at: string;
+  period?: string | null;
+}
+
+interface Candidate {
+  fact: MetricFact;
+  store: 'fact' | 'snapshot';
 }
 
 export class MetricAuthorityResolver {
@@ -36,16 +49,29 @@ export class MetricAuthorityResolver {
 
   resolveMetric(input: ResolveMetricInput): MetricAuthorityResolution {
     const entityType = input.entityType ?? 'product';
+    const legacyMetric = input.metric.replace(/_([a-z])/g, (_match, letter: string) => letter.toUpperCase());
     const factRows = this.database.prepare(`
-      SELECT id, source_type, source, numeric_value AS metric_value, is_estimated, confidence
+      SELECT id, source_type, source, source_id, numeric_value AS metric_value,
+        is_estimated, confidence, collected_at, NULL AS period
       FROM metric_facts
-      WHERE entity_type = ? AND entity_id = ? AND metric_name = ?
+      WHERE entity_type = ? AND entity_id = ? AND metric_name IN (?, ?)
         AND observation_date = ? AND numeric_value IS NOT NULL
-    `).all(entityType, input.entityId, input.metric, input.observationDate) as unknown as SnapshotRow[];
-    const rows = factRows.length > 0
-      ? factRows
-      : this.legacyProductSnapshotFacts(input, entityType);
-    const facts = rows.map(toFact).sort(compareAuthority);
+        AND (? IS NULL OR source_id = ?)
+    `).all(entityType, input.entityId, input.metric, legacyMetric, input.observationDate, input.sourceId ?? null, input.sourceId ?? null) as unknown as SnapshotRow[];
+    const candidates: Candidate[] = [
+      ...factRows.map((row) => ({ fact: toFact(row, 'metric_fact'), store: 'fact' as const })),
+      ...this.legacySnapshotFacts(input, entityType)
+        .map((row) => ({ fact: toFact(row), store: 'snapshot' as const })),
+    ];
+    const byProvider = new Map<string, Candidate>();
+    for (const candidate of candidates) {
+      const key = providerKey(candidate.fact);
+      const previous = byProvider.get(key);
+      if (!previous || compareWithinProvider(candidate, previous) < 0) byProvider.set(key, candidate);
+    }
+    const facts = [...byProvider.values()]
+      .map((candidate) => candidate.fact)
+      .sort((left, right) => compareAuthority(entityType, input.metric, left, right));
     const [selected, ...alternatives] = facts;
     return {
       selected: selected ?? null,
@@ -54,36 +80,97 @@ export class MetricAuthorityResolver {
     };
   }
 
-  private legacyProductSnapshotFacts(input: ResolveMetricInput, entityType: 'product' | 'market'): SnapshotRow[] {
-    if (entityType !== 'product' || !PRODUCT_SNAPSHOT_METRICS.has(input.metric)) return [];
-    return this.database.prepare(`
-      SELECT id, source_type, source, ${input.metric} AS metric_value, is_estimated, confidence
-      FROM product_snapshots
-      WHERE product_id = ? AND observation_date = ?
+  private legacySnapshotFacts(input: ResolveMetricInput, entityType: 'product' | 'market' | 'competitor'): SnapshotRow[] {
+    const market = entityType === 'market';
+    const metrics = market ? MARKET_SNAPSHOT_METRICS : PRODUCT_SNAPSHOT_METRICS;
+    if (!metrics.has(input.metric)) return [];
+    const table = market ? 'market_snapshots' : 'product_snapshots';
+    const entityColumn = market ? 'market_node_id' : 'product_id';
+    const rows = this.database.prepare(`
+      SELECT id, source_type, source, NULL AS source_id, ${input.metric} AS metric_value,
+        is_estimated, confidence, collected_at, period
+      FROM ${table}
+      WHERE ${entityColumn} = ? AND observation_date = ? AND ${input.metric} IS NOT NULL
     `).all(input.entityId, input.observationDate) as unknown as SnapshotRow[];
+    return rows.filter((row) => (
+      input.sourceId === undefined
+      || providerId(toFact(row)) === normalizeProviderId(input.sourceId)
+    ));
   }
 }
 
-const PRODUCT_SNAPSHOT_METRICS = new Set(['estimated_sales', 'estimated_revenue']);
+const MARKET_SNAPSHOT_METRICS = new Set([
+  'monthly_sales', 'monthly_revenue', 'product_count', 'seller_count', 'brand_count',
+  'avg_price', 'median_price', 'avg_rating', 'median_reviews', 'top10_share',
+  'top20_share', 'new_product_share',
+]);
+const PRODUCT_SNAPSHOT_METRICS = new Set([
+  'price', 'rating', 'review_count', 'bsr', 'estimated_sales', 'estimated_revenue',
+  'seller_count', 'growth_7d', 'growth_30d', 'growth_90d',
+]);
 
-function toFact(row: SnapshotRow): MetricFact {
+function toFact(row: SnapshotRow, sourceRecordType: MetricFact['sourceRecordType'] = 'snapshot'): MetricFact {
   return {
     id: row.id,
+    sourceRecordType,
     sourceType: row.source_type,
     source: row.source,
     value: row.metric_value,
     isEstimated: row.is_estimated === 1,
     confidence: row.confidence,
+    sourceId: row.source_id ?? null,
+    collectedAt: row.collected_at,
+    period: row.period ?? null,
   };
 }
 
-function compareAuthority(left: MetricFact, right: MetricFact): number {
+function normalizeProviderId(sourceId: string): string {
+  const value = sourceId.toLowerCase();
+  return value.startsWith('source-') ? value.slice('source-'.length).replaceAll('-', '_') : value;
+}
+
+function providerId(fact: MetricFact): string {
+  if (fact.sourceId) return normalizeProviderId(fact.sourceId);
+  if (fact.sourceType === 'amazon') {
+    return /\b(?:sp[ -]?)?api\b/i.test(fact.source) ? 'amazon_api' : 'amazon_import';
+  }
+  if (fact.sourceType === 'mcp' && /sellersprite|卖家精灵/i.test(fact.source)) return 'sellersprite_mcp';
+  if (fact.sourceType === 'import' && /sellersprite|卖家精灵/i.test(fact.source)) return 'sellersprite_import';
+  return '';
+}
+
+function providerKey(fact: MetricFact): string {
+  return `${fact.sourceType}|${providerId(fact) || fact.source.toLowerCase()}`;
+}
+
+function compareWithinProvider(left: Candidate, right: Candidate): number {
+  return (left.store === 'fact' ? 0 : 1) - (right.store === 'fact' ? 0 : 1)
+    || right.fact.confidence - left.fact.confidence
+    || right.fact.collectedAt.localeCompare(left.fact.collectedAt)
+    || left.fact.id.localeCompare(right.fact.id);
+}
+
+function compareAuthority(entityType: string, metric: string, left: MetricFact, right: MetricFact): number {
   const priority = (fact: MetricFact): number => {
-    if (fact.sourceType === 'amazon' && !fact.isEstimated) return 0;
-    if (fact.sourceType === 'amazon') return 1;
-    if (fact.sourceType === 'mcp') return 2;
-    if (fact.sourceType === 'import') return 3;
-    return 4;
+    const sourceId = providerId(fact);
+    const amazonApi = fact.sourceType === 'amazon'
+      && sourceId === 'amazon_api' && !fact.isEstimated;
+    const amazonReport = fact.sourceType === 'amazon'
+      && ['amazon_report', 'amazon_import'].includes(sourceId) && !fact.isEstimated;
+    if (entityType === 'product' && ['estimated_sales', 'estimated_revenue'].includes(metric)) {
+      if (amazonApi) return 0;
+      if (amazonReport) return 1;
+      if (fact.isEstimated) return 2;
+      return 3;
+    }
+    if (entityType === 'market' || entityType === 'competitor') {
+      if (fact.sourceType === 'mcp'
+        && sourceId === 'sellersprite_mcp') return 0;
+      if (fact.sourceType === 'import'
+        && sourceId === 'sellersprite_import') return 1;
+      return 2;
+    }
+    return 0;
   };
   return priority(left) - priority(right) || Number(right.confidence) - Number(left.confidence) || left.id.localeCompare(right.id);
 }

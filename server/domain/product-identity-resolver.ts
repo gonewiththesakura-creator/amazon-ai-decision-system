@@ -34,11 +34,17 @@ export class ProductIdentityResolver {
     if (!asin && !sku) throw new Error('ASIN 或 SKU 至少需要一个。');
 
     const product = asin
-      ? this.database.prepare(`SELECT id FROM products WHERE marketplace = ? AND asin = ?`).get(marketplace, asin) as ProductRow | undefined
+      ? this.database.prepare(`SELECT id FROM products WHERE marketplace = ? AND UPPER(TRIM(asin)) = ?`).get(marketplace, asin) as ProductRow | undefined
       : undefined;
-    const skuProduct = !product && sku
+    const skuProduct = sku
       ? this.database.prepare(`SELECT id FROM products WHERE marketplace = ? AND UPPER(sku) = ?`).get(marketplace, sku) as ProductRow | undefined
       : undefined;
+    if (product && skuProduct && product.id !== skuProduct.id) {
+      throw new Error('ASIN 与 SKU 分别匹配不同产品，拒绝合并身份。');
+    }
+    if (asin && !product && skuProduct) {
+      throw new Error('新 ASIN 不能覆盖已存在 SKU 的产品身份。');
+    }
     const matched = product ?? skuProduct;
     const variationFamilyId = parentAsin
       ? this.findOrCreateFamily(marketplace, parentAsin, input.variationTheme)

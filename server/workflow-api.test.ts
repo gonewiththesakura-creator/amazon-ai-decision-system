@@ -16,6 +16,7 @@ import { createApp } from './app.js';
 import { openDatabase, type AppDatabase } from './database/database.js';
 import { IntelligenceRepository } from './repository/intelligence-repository.js';
 import { WorkflowRepository } from './repository/workflow-repository.js';
+import { previewAndConfirmCsv } from './test-utils/import-api.js';
 
 let database: AppDatabase | undefined;
 
@@ -55,13 +56,9 @@ async function importCsv(
   filename: string,
   csv: string,
 ): Promise<void> {
-  await request(app)
-    .post('/api/import/csv')
-    .field('entityType', entityType)
-    .field('sourceType', 'amazon')
-    .field('marketplace', 'US')
-    .attach('file', Buffer.from(csv), filename)
-    .expect(201);
+  await previewAndConfirmCsv(app, csv, filename, {
+    entityType, sourceType: 'import', marketplace: 'US',
+  });
 }
 
 const PRODUCT_HEADER = [
@@ -454,15 +451,9 @@ describe('V2 workflow API', () => {
       'mkt-bad-json', 'Bad JSON Market', 'US', '2026-08-10', 10, 8, 4, 1_000,
       25, 24, 4.1, 90, 25, 40, 12, 0.8, false, 'not-json', '',
     ].join(',');
-    const response = await request(app)
-      .post('/api/import/csv')
-      .field('entityType', 'market')
-      .field('sourceType', 'amazon')
-      .field('marketplace', 'US')
-      .attach('file', Buffer.from([
-        MARKET_HEADER, valid, withoutOptionalStructures, invalid,
-      ].join('\n')), 'market-json.csv')
-      .expect(201);
+    const response = await previewAndConfirmCsv(app, [
+      MARKET_HEADER, valid, withoutOptionalStructures, invalid,
+    ].join('\n'), 'market-json.csv', { entityType: 'market', sourceType: 'import', marketplace: 'US' });
 
     expect(response.body.data).toMatchObject({ rowCount: 3, successCount: 2, failureCount: 1 });
     expect(response.body.data.errors[0]).toContain('PriceBands 不是有效 JSON');

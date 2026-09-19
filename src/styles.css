@@ -2284,6 +2284,9 @@ button.metric {
 
 /* SKU war room */
 .sku-selector-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 9px; }
+.portfolio-toolbar { padding: 10px 12px; background: #fafcfa; border: 1px solid var(--line); border-radius: 6px; }
+.portfolio-toolbar .result-count { margin-left: auto; }
+.portfolio-pagination { display: inline-flex; align-items: center; gap: 8px; color: var(--muted); font-size: 10px; font-weight: 700; }
 .sku-selector { position: relative; min-width: 0; padding: 13px; background: #fff; border: 1px solid var(--line); border-radius: 6px; box-shadow: var(--shadow-sm); }
 .sku-selector:hover { border-color: #b7c5c1; }
 .sku-selector.is-active { border-color: #64a494; box-shadow: inset 0 0 0 1px #64a494; }
@@ -2380,6 +2383,12 @@ button.metric {
 .status-badge.warning { color: #865017; background: var(--amber-soft); border-color: #edd7bb; }
 .status-badge.danger { color: #963b37; background: var(--red-soft); border-color: #efcecc; }
 .status-badge.info { color: #285d8a; background: var(--blue-soft); border-color: #d3e1ef; }
+.data-coverage__list { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); margin: 0; padding: 0; list-style: none; }
+.data-coverage__list li { display: grid; gap: 7px; min-width: 0; padding: 12px; border-right: 1px solid var(--line); }
+.data-coverage__list li:last-child { border-right: 0; }
+.data-coverage__list strong { font-size: 18px; font-variant-numeric: tabular-nums; }
+@media (max-width: 900px) { .data-coverage__list { grid-template-columns: repeat(2, minmax(0, 1fr)); } .data-coverage__list li { border-bottom: 1px solid var(--line); } }
+@media (max-width: 520px) { .data-coverage__list { grid-template-columns: 1fr; } .data-coverage__list li { grid-template-columns: 1fr auto auto; align-items: center; border-right: 0; gap: 12px; } .data-coverage__list strong { font-size: 14px; } }
 .detail-header { align-items: flex-end; }
 .detail-header .button-ghost { margin-bottom: 7px; }
 .score-panel { align-self: stretch; }
@@ -2973,3 +2982,72 @@ button.metric {
 .decision-option strong, .decision-option small { display: block; }
 .decision-option strong { font-size: 11px; }
 .decision-option small { margin-top: 3px; color: var(--muted); font-size: 9px; }
+.real-data-controls {
+  margin-top: 24px;
+  border-top: 1px solid var(--border, #dce2e6);
+}
+
+.real-data-band {
+  padding: 20px 0;
+  border-bottom: 1px solid var(--border, #dce2e6);
+}
+
+.real-data-band h3 { margin: 0; font-size: 16px; }
+
+.real-data-actions {
+  display: flex;
+  align-items: end;
+  flex-wrap: wrap;
+  gap: 12px;
+  margin-top: 16px;
+}
+
+.real-data-actions .field { min-width: min(100%, 220px); margin: 0; }
+.real-data-confirmation { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; }
+.real-data-confirmation input { accent-color: var(--teal); }
+
+.real-data-preview {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 24px;
+  margin-top: 16px;
+}
+
+.real-data-preview ul,
+.real-data-capabilities {
+  margin: 8px 0 0;
+  padding-left: 18px;
+  line-height: 1.8;
+}
+
+.real-data-capabilities {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  gap: 4px 16px;
+  list-style: none;
+  padding-left: 0;
+}
+
+.real-data-capabilities li { display: flex; align-items: center; gap: 8px; }
+.real-data-verification { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+
+@media (max-width: 620px) {
+  .real-data-preview { grid-template-columns: 1fr; gap: 8px; }
+  .real-data-actions .field,
+  .real-data-actions .button { width: 100%; }
+}
+
+.candidate-review {
+  border-block: 1px solid var(--line);
+  padding: 16px 0;
+  margin-bottom: 20px;
+}
+.candidate-review .section-header { margin-bottom: 12px; }
+.candidate-review h3 { margin: 3px 0 0; font-size: 16px; }
+.candidate-review .table-scroll { overflow-x: auto; }
+.candidate-table { min-width: 650px; }
+.candidate-table td { vertical-align: middle; }
+.candidate-table td:first-child { min-width: 180px; max-width: 260px; overflow-wrap: anywhere; }
+.candidate-table .input { width: 100%; min-width: 140px; }
+.candidate-actions { display: flex; gap: 4px; white-space: nowrap; }
+.candidate-review .section-header__note { display: inline-flex; align-items: center; gap: 5px; }

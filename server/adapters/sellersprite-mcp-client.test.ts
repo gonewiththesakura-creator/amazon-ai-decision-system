@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import {
   SellerSpriteMcpClient,
   SellerSpriteMcpError,
+  sellerSpriteEndpoint,
   sanitizeMcpError,
   type SellerSpriteMcpTransport,
 } from './sellersprite-mcp-client.js';
@@ -47,7 +48,8 @@ describe('SellerSpriteMcpClient', () => {
       const request = {
         tool: 'market_research_statistics',
         arguments: { request: { marketplace: 'US', nodeIdPath: 'Home/Bed' } },
-        context: { capability: 'MARKET_STATISTICS', operation: 'market_refresh' },
+        context: { capability: 'MARKET_STATISTICS', operation: 'market_refresh',
+          entityType: 'market' as const, entityId: '1055398:1063252' },
       };
       await client.callTool(request);
       await client.callTool(request);
@@ -55,10 +57,14 @@ describe('SellerSpriteMcpClient', () => {
       expect(capabilityStore.latest()).toMatchObject({
         capabilities: { MARKET_STATISTICS: 'market_research_statistics' },
       });
-      const rows = database.prepare('SELECT status, cache_hit, actual_tool, request_hash, response_metadata_json FROM mcp_call_logs ORDER BY rowid').all();
+      const rows = database.prepare(`SELECT status, cache_hit, actual_tool, request_hash,
+        response_metadata_json, entity_type, entity_id, result_count
+        FROM mcp_call_logs ORDER BY rowid`).all();
       expect(rows).toMatchObject([
-        { status: 'success', cache_hit: 0, actual_tool: 'market_research_statistics' },
-        { status: 'success', cache_hit: 1, actual_tool: 'market_research_statistics' },
+        { status: 'success', cache_hit: 0, actual_tool: 'market_research_statistics',
+          entity_type: 'market', entity_id: '1055398:1063252', result_count: 1 },
+        { status: 'success', cache_hit: 1, actual_tool: 'market_research_statistics',
+          entity_type: 'market', entity_id: '1055398:1063252', result_count: 1 },
       ]);
       expect(JSON.stringify(rows)).not.toMatch(/Home\/Bed|Authorization|secret-value/i);
       const cached = database.prepare('SELECT cache_key, response_json FROM mcp_response_cache').get();
@@ -265,13 +271,19 @@ describe('SellerSpriteMcpClient', () => {
   it('redacts query credentials, authorization, tokens, and secret-key values', () => {
     const secretBearingError = new Error(
       'Authorization: Bearer secret-value; https://example.test/mcp?token=secret-value&x=1 '
-      + '{"secretKey":"secret-value","api_key":"secret-value"}',
+      + '{"secretKey":"secret-value","api_key":"secret-value"} secret-key=secret-value',
     );
 
     const diagnostic = sanitizeMcpError(secretBearingError);
 
     expect(diagnostic).not.toMatch(/secret-value|Authorization/i);
     expect(diagnostic).toContain('[REDACTED]');
+  });
+
+  it('uses the SellerSprite secret-key query parameter without duplicating credentials', () => {
+    const endpoint = sellerSpriteEndpoint('https://mcp.sellersprite.com/mcp?secretKey=old', 'test-secret');
+    expect(endpoint.searchParams.get('secret-key')).toBe('test-secret');
+    expect(endpoint.searchParams.has('secretKey')).toBe(false);
   });
 });
 

@@ -28,6 +28,10 @@ export interface McpCallLedgerEntry {
   requestHash: string;
   cacheHit: boolean;
   attempt: number;
+  entityType?: 'market' | 'product' | 'competitor';
+  entityId?: string;
+  researchJobId?: string;
+  resultCount?: number | null;
   startedAt: string;
   completedAt: string;
 }
@@ -86,12 +90,14 @@ export class SqliteMcpCallLedgerStore implements McpCallLedgerStore {
       INSERT INTO mcp_call_logs
         (id, provider_id, capability, request_hash, status, response_metadata_json,
          error_code, started_at, completed_at, actual_tool, parameter_hash,
-         duration_ms, cache_hit)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         duration_ms, cache_hit, entity_type, entity_id, research_job_id, result_count)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).run(entry.id, entry.provider, entry.capability ?? 'unspecified', entry.requestHash,
       entry.status, JSON.stringify({ operation: entry.operation, attempt: entry.attempt }),
       entry.errorCode, entry.startedAt, entry.completedAt, entry.toolName, entry.requestHash,
-      Math.max(0, Date.parse(entry.completedAt) - Date.parse(entry.startedAt)), entry.cacheHit ? 1 : 0);
+      Math.max(0, Date.parse(entry.completedAt) - Date.parse(entry.startedAt)), entry.cacheHit ? 1 : 0,
+      entry.entityType ?? null, entry.entityId ?? null, entry.researchJobId ?? null,
+      entry.resultCount ?? null);
   }
 }
 

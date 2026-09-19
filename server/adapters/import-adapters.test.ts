@@ -36,6 +36,28 @@ describe('file import adapters', () => {
     expect(batch.rows[0]?.values).toMatchObject({ marketname: 'Travel Pillow', monthlysales: '1200' });
   });
 
+  it('recognizes only a child-ASIN Amazon Sales and Traffic report signature', () => {
+    const adapter = new AmazonImportAdapter();
+    const report = adapter.ingest({
+      buffer: Buffer.from([
+        '(Parent) ASIN,(Child) ASIN,Title,SKU,Units Ordered,Ordered Product Sales,Sessions - Total',
+        'B0PARENT01,B0ACTUAL01,Contour Pillow,PILLOW-01,132,"$1,299.50",803',
+      ].join('\n')),
+      format: 'csv', filename: 'sales-and-traffic-by-child-item.csv',
+    });
+    expect(report).toMatchObject({ entityType: 'product', detectedType: 'amazon_business_report', rowCount: 1 });
+    expect(report.rows[0]?.values).toMatchObject({
+      parentasin: 'B0PARENT01', childasin: 'B0ACTUAL01', sku: 'PILLOW-01',
+      unitsordered: '132', orderedproductsales: '$1,299.50',
+    });
+
+    const generic = adapter.ingest({
+      buffer: Buffer.from('ASIN,Order Date\nB0ACTUAL01,2026-06-30'),
+      format: 'csv', filename: 'generic-orders.csv',
+    });
+    expect(generic.detectedType).toBe('unknown');
+  });
+
   it('detects the reviewed owned product master header independently of data rows', () => {
     const adapter = new SellerSpriteImportAdapter();
     const batch = adapter.ingest({

@@ -63,10 +63,9 @@ abstract class FileImportAdapter implements FileDataAdapter {
 
 function detectHeaderType(row: ImportRow, sourceType: 'import' | 'amazon'): FileImportDetectedType {
   if (isOwnedProductMaster(row)) return 'owned_product_master';
-  if (row.reviewtext !== undefined || row.reviewbody !== undefined || row.reviewid !== undefined) {
-    return 'amazon_business_report';
-  }
-  if (sourceType === 'amazon' && (row.asin !== undefined || row.sku !== undefined || row.orderdate !== undefined)) {
+  if (sourceType === 'amazon' && row.childasin !== undefined
+    && (row.unitsordered !== undefined || row.unitsorderedtotal !== undefined)
+    && (row.orderedproductsales !== undefined || row.orderedproductsalestotal !== undefined)) {
     return 'amazon_business_report';
   }
   if (row.asin !== undefined && (row.price !== undefined || row.estimatedsales !== undefined || row.monthlysales !== undefined)) {
@@ -106,13 +105,14 @@ function normalizeRow(row: ImportRow): ImportRow {
 }
 
 function normalizeKey(value: string): string {
-  return value.trim().toLowerCase().replace(/[\s_-]+/g, '');
+  return value.trim().toLowerCase().replace(/[\s_()-]+/g, '');
 }
 
 function normalizeEntityType(value: string | undefined, firstRow: ImportRow): FileImportEntityType {
   if (value) {
     const normalized = value.trim().toLowerCase();
     if (normalized === 'owned_product_master' || normalized === 'ownedproductmaster') return 'owned_product_master';
+    if (normalized === 'amazon_business_report') return 'product';
     if (normalized === 'market' || normalized.includes('market')) return 'market';
     if (normalized === 'product' || normalized.includes('sku') || normalized.includes('asin')) return 'product';
     if (normalized === 'review' || normalized.includes('comment') || normalized.includes('评论')) return 'review';
@@ -125,7 +125,8 @@ function normalizeEntityType(value: string | undefined, firstRow: ImportRow): Fi
     || firstRow.评论正文 !== undefined
   ) return 'review';
   if (isOwnedProductMaster(firstRow)) return 'owned_product_master';
-  return firstRow.asin !== undefined || firstRow.sku !== undefined ? 'product' : 'market';
+  return firstRow.asin !== undefined || firstRow.childasin !== undefined || firstRow.sku !== undefined
+    ? 'product' : 'market';
 }
 
 function isOwnedProductMaster(row: ImportRow): boolean {

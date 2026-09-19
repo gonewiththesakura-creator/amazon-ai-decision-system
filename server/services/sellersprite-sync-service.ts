@@ -20,6 +20,11 @@ export interface SellerSpriteOwnedProductSyncInput {
   productId: string;
 }
 
+export interface SellerSpriteConfirmedCompetitorSyncInput {
+  ownedProductId: string;
+  competitorProductId: string;
+}
+
 export interface SellerSpriteCompetitorDiscoveryInput {
   ownedProductId: string;
   size?: number;
@@ -31,6 +36,22 @@ export interface SellerSpriteCandidateConfirmationInput {
   relationType: 'direct' | 'top100' | 'benchmark' | 'fast_growth' | 'price_peer';
   reason: string;
   similarityScore?: number;
+}
+
+export interface SellerSpriteCandidateReviewInput {
+  ownedProductId: string;
+  candidateId: string;
+}
+
+export interface SellerSpriteCandidateSummary {
+  id: string;
+  asin: string;
+  status: 'pending_review' | 'confirmed' | 'rejected';
+  title: string | null;
+  brand: string | null;
+  price: number | null;
+  createdAt: string;
+  reviewedAt: string | null;
 }
 
 export interface SellerSpriteSyncPort {
@@ -124,6 +145,11 @@ const MARKET_METRIC_COLUMNS: Record<MarketMetric, string> = {
 const PRODUCT_METRICS = [
   'price', 'rating', 'reviewCount', 'bsr', 'estimatedSales', 'estimatedRevenue', 'sellerCount',
 ] as const;
+const PRODUCT_METRIC_COLUMNS: Record<typeof PRODUCT_METRICS[number], string> = {
+  price: 'price', rating: 'rating', reviewCount: 'review_count', bsr: 'bsr',
+  estimatedSales: 'estimated_sales', estimatedRevenue: 'estimated_revenue',
+  sellerCount: 'seller_count',
+};
 
 const SOURCE_ID = 'source-sellersprite-mcp';
 
@@ -147,6 +173,19 @@ export class SellerSpriteSyncService {
     return transaction(this.database, () => ({ inserted: this.persistProduct(prepared) }));
   }
 
+  async syncConfirmedCompetitor(input: SellerSpriteConfirmedCompetitorSyncInput): Promise<{ inserted: number }> {
+    const product = this.requireConfirmedCompetitor(input);
+    const prepared = await this.prepareProduct(product);
+    return transaction(this.database, () => {
+      const current = this.requireConfirmedCompetitor(input);
+      if (current.asin !== product.asin || current.marketplace !== product.marketplace
+        || current.marketNodeId !== product.marketNodeId) {
+        throw new Error('竞品身份或市场节点在同步期间发生变化，请重新请求。');
+      }
+      return { inserted: this.persistProduct(prepared) };
+    });
+  }
+
   async discoverCompetitors(
     input: SellerSpriteCompetitorDiscoveryInput,
   ): Promise<{ candidates: number }> {
@@ -156,8 +195,12 @@ export class SellerSpriteSyncService {
       asin: product.asin,
       ...(input.size === undefined ? {} : { size: input.size }),
     });
+    ensureMcpProvenance(response.provenance);
     const candidates = response.data
-      .map((candidate) => normalizeCandidate(candidate))
+      .map((candidate) => {
+        ensureResponseScope(candidate, product.marketplace);
+        return normalizeCandidate(candidate);
+      })
       .filter((candidate): candidate is NonNullable<typeof candidate> => (
         candidate !== null && candidate.asin !== product.asin.toUpperCase()
       ));
@@ -179,6 +222,49 @@ export class SellerSpriteSyncService {
         inserted += Number(result.changes);
       }
       return { candidates: inserted };
+    });
+  }
+
+  listCompetitorCandidates(ownedProductId: string): SellerSpriteCandidateSummary[] {
+    const owned = this.requireOwnedProduct(ownedProductId);
+    const rows = this.database.prepare(`
+      SELECT id, asin, status, payload_json AS payloadJson,
+        created_at AS createdAt, reviewed_at AS reviewedAt
+      FROM competitor_candidates
+      WHERE source_product_id = ? AND marketplace = ?
+      ORDER BY created_at DESC, id
+    `).all(owned.id, owned.marketplace) as Array<{
+      id: string;
+      asin: string;
+      status: SellerSpriteCandidateSummary['status'];
+      payloadJson: string;
+      createdAt: string;
+      reviewedAt: string | null;
+    }>;
+    return rows.map((row) => {
+      const payload = safeJsonObject(row.payloadJson);
+      return {
+        id: row.id,
+        asin: row.asin,
+        status: row.status,
+        title: stringOrNull(payload.title),
+        brand: stringOrNull(payload.brand),
+        price: finiteNumber(payload.price),
+        createdAt: row.createdAt,
+        reviewedAt: row.reviewedAt,
+      };
+    });
+  }
+
+  rejectCompetitorCandidate(input: SellerSpriteCandidateReviewInput): { status: 'rejected' } {
+    const owned = this.requireOwnedProduct(input.ownedProductId);
+    return transaction(this.database, () => {
+      const result = this.database.prepare(`
+        UPDATE competitor_candidates SET status = 'rejected', reviewed_at = ?
+        WHERE id = ? AND source_product_id = ? AND marketplace = ? AND status = 'pending_review'
+      `).run(new Date().toISOString(), input.candidateId, owned.id, owned.marketplace);
+      if (result.changes !== 1) throw new Error('竞争候选不存在或已经处理。');
+      return { status: 'rejected' as const };
     });
   }
 
@@ -205,25 +291,31 @@ export class SellerSpriteSyncService {
     const payload = safeJsonObject(candidate.payloadJson);
 
     return transaction(this.database, () => {
+      const existing = this.database.prepare(`
+        SELECT is_owned AS isOwned FROM products
+        WHERE marketplace = ? AND UPPER(TRIM(asin)) = ?
+      `).get(owned.marketplace, candidate.asin.toUpperCase()) as { isOwned: number } | undefined;
+      if (existing?.isOwned === 1) throw new Error('自有产品不能确认成竞品。');
       const resolution = this.identityResolver.resolve({
         marketplace: owned.marketplace,
         asin: candidate.asin,
-        parentAsin: stringOrNull(payload.parentAsin) ?? undefined,
+        parentAsin: existing ? undefined : stringOrNull(payload.parentAsin) ?? undefined,
       });
       if (!resolution.productId) throw new Error('竞争候选产品身份创建失败。');
-      if (resolution.productId === owned.id) throw new Error('自有产品不能确认成自身竞品。');
-      this.database.prepare(`
-        UPDATE products
-        SET brand = ?, title = ?, product_type = 'competitor', market_node_id = ?,
-          source_type = 'mcp', updated_at = ?
-        WHERE id = ? AND is_owned = 0
-      `).run(
-        stringOrNull(payload.brand) ?? '未知品牌',
-        stringOrNull(payload.title) ?? candidate.asin,
-        owned.marketNodeId,
-        new Date().toISOString(),
-        resolution.productId,
-      );
+      if (resolution.disposition === 'created') {
+        this.database.prepare(`
+          UPDATE products
+          SET brand = ?, title = ?, product_type = 'competitor', market_node_id = ?,
+            source_type = 'mcp', updated_at = ?
+          WHERE id = ? AND is_owned = 0
+        `).run(
+          stringOrNull(payload.brand) ?? '未知品牌',
+          stringOrNull(payload.title) ?? candidate.asin,
+          owned.marketNodeId,
+          new Date().toISOString(),
+          resolution.productId,
+        );
+      }
       this.database.prepare(`
         INSERT INTO competitor_relations (
           id, owned_product_id, competitor_product_id, relation_type,
@@ -285,10 +377,13 @@ export class SellerSpriteSyncService {
 
   private async prepareMarket(input: SellerSpriteMarketSyncInput): Promise<PreparedMarketObservation> {
     const market = this.requireMarket(input.marketId);
+    if (!market.categoryId || !/^\d+(?::\d+)*$/.test(market.categoryId)) {
+      throw new Error('请先确认并映射 SellerSprite 市场节点路径 category_id。');
+    }
     const observationDate = monthEnd(input.month);
     const request = {
       marketplace: market.marketplace,
-      nodeIdPath: market.categoryId ?? market.id,
+      nodeIdPath: market.categoryId,
       month: compactMonth(input.month),
     };
     const [statistics, concentration] = await Promise.all([
@@ -296,6 +391,10 @@ export class SellerSpriteSyncService {
       this.port.fetchMarketConcentration(request),
     ]);
     ensureCompatibleProvenance(statistics.provenance, concentration.provenance);
+    ensureResponseScope(statistics.data, market.marketplace, request.nodeIdPath, request.month);
+    for (const item of concentration.data) {
+      ensureResponseScope(item, market.marketplace, request.nodeIdPath, request.month);
+    }
 
     const normalizedConcentration = concentration.data.map((item) => ({
       asin: stringOrNull(item.asin),
@@ -309,26 +408,24 @@ export class SellerSpriteSyncService {
       totalUnitsRatio: finiteNumber(item.totalUnitsRatio),
       totalRevenueRatio: finiteNumber(item.totalRevenueRatio),
     }));
-    const prices = compactNumbers(normalizedConcentration.map((item) => item.price));
-    const reviews = compactNumbers(normalizedConcentration.map((item) => item.ratings));
-    const units = compactNumbers(normalizedConcentration.map((item) => item.totalUnits));
-    const revenues = compactNumbers(normalizedConcentration.map((item) => item.totalRevenue));
-    const ratios = compactNumbers(normalizedConcentration.map((item) => item.totalUnitsRatio));
     const data = statistics.data;
     const metrics: Record<MarketMetric, number | null> = {
       productCount: finiteNumber(data.products),
       sellerCount: finiteNumber(data.sellers),
       brandCount: finiteNumber(data.brands),
-      monthlySales: units.length > 0 ? sum(units) : finiteNumber(data.totalUnits),
-      monthlyRevenue: revenues.length > 0 ? sum(revenues) : finiteNumber(data.totalRevenue),
-      avgPrice: finiteNumber(data.avgPrice) ?? average(prices),
-      medianPrice: finiteNumber(data.medianPrice) ?? median(prices),
+      monthlySales: finiteNumber(data.totalUnits),
+      monthlyRevenue: finiteNumber(data.totalRevenue),
+      avgPrice: finiteNumber(data.avgPrice),
+      medianPrice: finiteNumber(data.medianPrice),
       avgRating: finiteNumber(data.avgRating),
-      medianReviews: finiteNumber(data.medianReviews) ?? median(reviews),
-      top10Share: sharePercent(ratios.slice(0, 10)),
-      top20Share: sharePercent(ratios.slice(0, 20)),
+      medianReviews: finiteNumber(data.medianReviews),
+      top10Share: percentOrNull(data.top10Share),
+      top20Share: percentOrNull(data.top20Share),
       newProductShare: finiteNumber(data.newProductShare ?? data.newProductProportion),
     };
+    if (Object.values(metrics).every((value) => value === null)) {
+      throw new Error('SellerSprite 市场响应没有有效指标。');
+    }
     return {
       market,
       observationDate,
@@ -340,25 +437,45 @@ export class SellerSpriteSyncService {
 
   private async prepareOwnedProduct(productId: string): Promise<PreparedProductObservation> {
     const product = this.requireOwnedProduct(productId);
+    return this.prepareProduct(product);
+  }
+
+  private async prepareProduct(product: ProductRow): Promise<PreparedProductObservation> {
     const response = await this.port.fetchAsinSalesTrend({
       marketplace: product.marketplace,
       asin: product.asin,
     });
+    ensureMcpProvenance(response.provenance);
     const info = response.data.asin;
+    ensureResponseScope(info, product.marketplace);
     const remoteAsin = stringOrNull(info.asin)?.toUpperCase();
     if (remoteAsin && remoteAsin !== product.asin.toUpperCase()) {
       throw new Error('SellerSprite 返回的 ASIN 与请求产品不一致。');
     }
-    const points = response.data.salesTrendPoints.map((point) => ({
-      observationDate: monthEnd(requiredString(point.month, '销售趋势月份')),
-      price: finiteNumber(point.price) ?? finiteNumber(info.price),
-      rating: finiteNumber(point.rating) ?? finiteNumber(info.rating),
-      reviewCount: finiteNumber(point.ratings) ?? finiteNumber(info.ratings),
-      bsr: finiteNumber(point.bsr ?? point.bsrRank ?? info.bsr ?? info.bsrRank),
-      estimatedSales: finiteNumber(point.childUnitSales) ?? finiteNumber(point.parentUnitSales),
-      estimatedRevenue: finiteNumber(point.childSalesRevenue) ?? finiteNumber(point.parentSalesRevenue),
-      sellerCount: finiteNumber(point.sellers) ?? finiteNumber(info.sellers),
-    }));
+    const isParentAsin = stringOrNull(info.parent)?.toUpperCase() === product.asin.toUpperCase();
+    const points = response.data.salesTrendPoints.map((point) => {
+      ensureResponseScope(point, product.marketplace);
+      const pointAsin = stringOrNull(point.asin)?.toUpperCase();
+      if (pointAsin && pointAsin !== product.asin.toUpperCase()) {
+        throw new Error('SellerSprite 历史观察 ASIN 与请求产品不一致。');
+      }
+      const entry = {
+        observationDate: historicalDate(requiredString(point.month, '销售趋势月份')),
+        price: finiteNumber(point.price),
+        rating: finiteNumber(point.rating),
+        reviewCount: finiteNumber(point.ratings),
+        bsr: finiteNumber(point.bsr ?? point.bsrRank),
+        estimatedSales: finiteNumber(point.childUnitSales)
+          ?? (isParentAsin ? finiteNumber(point.parentUnitSales) : null),
+        estimatedRevenue: finiteNumber(point.childSalesRevenue)
+          ?? (isParentAsin ? finiteNumber(point.parentSalesRevenue) : null),
+        sellerCount: finiteNumber(point.sellers),
+      };
+      if (PRODUCT_METRICS.every((metric) => entry[metric] === null)) {
+        throw new Error('SellerSprite 产品历史观察没有有效指标。');
+      }
+      return entry;
+    });
     if (points.length === 0) throw new Error('SellerSprite 未返回产品历史观察。');
     return {
       product,
@@ -370,6 +487,17 @@ export class SellerSpriteSyncService {
 
   private persistMarket(prepared: PreparedMarketObservation): number {
     const { market, metrics, observationDate, provenance } = prepared;
+    const existing = this.database.prepare(`
+      SELECT id FROM market_snapshots
+      WHERE market_node_id = ? AND COALESCE(observation_date, date) = ?
+        AND source_type = 'mcp' AND LOWER(TRIM(period)) = LOWER(TRIM(?))
+        AND (product_count IS NOT NULL OR seller_count IS NOT NULL OR brand_count IS NOT NULL
+          OR monthly_sales IS NOT NULL OR monthly_revenue IS NOT NULL OR avg_price IS NOT NULL
+          OR median_price IS NOT NULL OR avg_rating IS NOT NULL OR median_reviews IS NOT NULL
+          OR top10_share IS NOT NULL OR top20_share IS NOT NULL OR new_product_share IS NOT NULL)
+      LIMIT 1
+    `).get(market.id, observationDate, provenance.period);
+    if (existing) return 0;
     const dedupKey = snapshotDedupKey('market', market.marketplace, market.id, observationDate, provenance);
     const result = this.database.prepare(`
       INSERT OR IGNORE INTO market_snapshots (
@@ -390,7 +518,8 @@ export class SellerSpriteSyncService {
       provenance.isEstimated ? 1 : 0, provenance.confidence, observationDate, dedupKey,
     );
     for (const metric of Object.keys(MARKET_METRIC_COLUMNS) as MarketMetric[]) {
-      this.persistFact('market', market.id, market.marketplace, metric, metrics[metric], observationDate, provenance);
+      this.persistFact('market', market.id, market.marketplace,
+        MARKET_METRIC_COLUMNS[metric], metrics[metric], observationDate, provenance);
     }
     return Number(result.changes);
   }
@@ -413,6 +542,17 @@ export class SellerSpriteSyncService {
       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, ?, 'mcp', ?, ?, ?, ?, ?, ?)
     `);
     for (const point of prepared.points) {
+      const existing = this.database.prepare(`
+        SELECT id FROM product_snapshots
+        WHERE product_id = ? AND COALESCE(observation_date, date) = ?
+          AND source_type = 'mcp' AND LOWER(TRIM(period)) = LOWER(TRIM(?))
+          AND (price IS NOT NULL OR rating IS NOT NULL OR review_count IS NOT NULL
+            OR bsr IS NOT NULL OR estimated_sales IS NOT NULL OR estimated_revenue IS NOT NULL
+            OR seller_count IS NOT NULL OR growth_7d IS NOT NULL OR growth_30d IS NOT NULL
+            OR growth_90d IS NOT NULL)
+        LIMIT 1
+      `).get(prepared.product.id, point.observationDate, prepared.provenance.period);
+      if (existing) continue;
       const dedupKey = snapshotDedupKey(
         'product', prepared.product.marketplace, prepared.product.id,
         point.observationDate, prepared.provenance,
@@ -427,7 +567,7 @@ export class SellerSpriteSyncService {
       inserted += Number(result.changes);
       for (const metric of PRODUCT_METRICS) {
         this.persistFact(
-          'product', prepared.product.id, prepared.product.marketplace, metric,
+          'product', prepared.product.id, prepared.product.marketplace, PRODUCT_METRIC_COLUMNS[metric],
           point[metric], point.observationDate, prepared.provenance,
         );
       }
@@ -473,6 +613,23 @@ export class SellerSpriteSyncService {
       WHERE id = ? AND is_owned = 1 AND status = 'active'
     `).get(productId) as ProductRow | undefined;
     if (!row) throw new Error(`启用中的自有产品不存在：${productId}`);
+    return row;
+  }
+
+  private requireConfirmedCompetitor(input: SellerSpriteConfirmedCompetitorSyncInput): ProductRow {
+    const row = this.database.prepare(`
+      SELECT competitor.id, competitor.asin, competitor.marketplace,
+        competitor.market_node_id AS marketNodeId
+      FROM competitor_relations relation
+      JOIN products owned ON owned.id = relation.owned_product_id
+      JOIN products competitor ON competitor.id = relation.competitor_product_id
+      WHERE relation.owned_product_id = ? AND relation.competitor_product_id = ?
+        AND owned.is_owned = 1 AND owned.status = 'active'
+        AND competitor.is_owned = 0 AND competitor.status = 'active'
+        AND competitor.marketplace = owned.marketplace
+      LIMIT 1
+    `).get(input.ownedProductId, input.competitorProductId) as ProductRow | undefined;
+    if (!row) throw new Error('启用中的自有产品与竞品之间不存在已确认的同站点关联。');
     return row;
   }
 }
@@ -521,10 +678,33 @@ function snapshotDedupKey(
 }
 
 function ensureCompatibleProvenance(left: Provenance, right: Provenance): void {
-  if (left.sourceType !== 'mcp' || right.sourceType !== 'mcp') {
-    throw new Error('SellerSprite 同步只能持久化 MCP 来源数据。');
-  }
+  ensureMcpProvenance(left);
+  ensureMcpProvenance(right);
   if (left.source !== right.source) throw new Error('SellerSprite 市场响应来源不一致。');
+}
+
+function ensureMcpProvenance(value: Provenance): void {
+  if (value.sourceType !== 'mcp') throw new Error('SellerSprite 同步只能持久化 MCP 来源数据。');
+}
+
+function ensureResponseScope(
+  data: Record<string, unknown>, marketplace: string, nodeIdPath?: string, month?: string,
+): void {
+  const remoteMarketplace = stringOrNull(data.marketplace);
+  if (remoteMarketplace && remoteMarketplace.toUpperCase() !== marketplace.toUpperCase()) {
+    throw new Error('SellerSprite 响应站点与请求 marketplace 不一致。');
+  }
+  const remoteNode = stringOrNull(data.nodeIdPath);
+  if (nodeIdPath && remoteNode && remoteNode !== nodeIdPath) {
+    throw new Error('SellerSprite 响应市场节点 nodeIdPath 与请求不一致。');
+  }
+  if (month && data.month !== undefined && data.month !== null) {
+    const remoteMonth = typeof data.month === 'number' && Number.isInteger(data.month)
+      ? String(data.month) : stringOrNull(data.month);
+    if (!remoteMonth || compactObservationMonth(remoteMonth) !== month) {
+      throw new Error('SellerSprite 响应月份与请求 month 不一致。');
+    }
+  }
 }
 
 function requiredString(value: unknown, label: string): string {
@@ -538,20 +718,39 @@ function compactMonth(value: string): string {
     monthEnd(normalized);
     return normalized;
   }
-  const match = /^(\d{4})-(\d{2})(?:-\d{2})?$/.exec(normalized);
-  if (!match) throw new Error('月份必须使用 YYYYMM、YYYY-MM 或 YYYY-MM-DD。');
+  const match = /^(\d{4})-(\d{2})$/.exec(normalized);
+  if (!match) throw new Error('月份必须使用 YYYYMM 或 YYYY-MM。');
   monthEnd(normalized);
   return `${match[1]}${match[2]}`;
 }
 
 function monthEnd(value: string): string {
   const normalized = value.trim();
-  const match = /^(\d{4})(?:-)?(\d{2})(?:-\d{2})?$/.exec(normalized);
-  if (!match) throw new Error('月份必须使用 YYYYMM、YYYY-MM 或 YYYY-MM-DD。');
+  const match = /^(\d{4})(?:-)?(\d{2})$/.exec(normalized);
+  if (!match) throw new Error('月份必须使用 YYYYMM 或 YYYY-MM。');
   const year = Number(match[1]);
   const month = Number(match[2]);
   if (month < 1 || month > 12) throw new Error('月份超出有效范围。');
   return new Date(Date.UTC(year, month, 0)).toISOString().slice(0, 10);
+}
+
+function historicalDate(value: string): string {
+  if (/^\d{4}-\d{2}-\d{2}$/.test(value)) {
+    const parsed = new Date(`${value}T00:00:00.000Z`);
+    if (!Number.isFinite(parsed.getTime()) || parsed.toISOString().slice(0, 10) !== value) {
+      throw new Error('销售趋势日期不在有效日历范围内。');
+    }
+    return value;
+  }
+  return monthEnd(value);
+}
+
+function compactObservationMonth(value: string): string {
+  if (/^\d{4}-\d{2}-\d{2}$/.test(value)) {
+    historicalDate(value);
+    return value.slice(0, 4) + value.slice(5, 7);
+  }
+  return compactMonth(value);
 }
 
 function finiteNumber(value: unknown): number | null {
@@ -562,31 +761,9 @@ function stringOrNull(value: unknown): string | null {
   return typeof value === 'string' && value.trim() !== '' ? value.trim() : null;
 }
 
-function compactNumbers(values: Array<number | null>): number[] {
-  return values.filter((value): value is number => value !== null);
-}
-
-function sum(values: number[]): number {
-  return values.reduce((total, value) => total + value, 0);
-}
-
-function average(values: number[]): number | null {
-  return values.length > 0 ? sum(values) / values.length : null;
-}
-
-function median(values: number[]): number | null {
-  if (values.length === 0) return null;
-  const ordered = [...values].sort((left, right) => left - right);
-  const middle = Math.floor(ordered.length / 2);
-  return ordered.length % 2 === 1
-    ? ordered[middle]!
-    : (ordered[middle - 1]! + ordered[middle]!) / 2;
-}
-
-function sharePercent(values: number[]): number | null {
-  if (values.length === 0) return null;
-  const total = sum(values);
-  return values.every((value) => Math.abs(value) <= 1) ? total * 100 : total;
+function percentOrNull(value: unknown): number | null {
+  const number = finiteNumber(value);
+  return number !== null && number >= 0 && number <= 100 ? number : null;
 }
 
 function normalizeKeyPart(value: string): string {
