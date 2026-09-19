@@ -6,15 +6,18 @@ import {
   ChevronRight,
   Clock3,
   DatabaseZap,
+  FileSpreadsheet,
   Loader2,
   RefreshCw,
   RotateCcw,
   Search,
+  Upload,
   X,
   XCircle,
 } from 'lucide-react';
 import type { ApiResponse, DataTask, TaskStatus } from '../../shared/types';
 import { useApp } from '../lib/AppContext';
+import { confirmImport, previewImport, type ImportPreviewResult } from '../lib/api';
 
 const statusLabels: Record<TaskStatus, string> = {
   pending: '等待中',
@@ -84,6 +87,9 @@ export default function DataTasksPage() {
   const [marketplaceFilter, setMarketplaceFilter] = useState('all');
   const [detailTask, setDetailTask] = useState<DataTask | null>(null);
   const [retryingId, setRetryingId] = useState<string | null>(null);
+  const [importFile, setImportFile] = useState<File | null>(null);
+  const [importPreview, setImportPreview] = useState<ImportPreviewResult | null>(null);
+  const [importing, setImporting] = useState(false);
 
   const loadTasks = useCallback(async (showLoading = true) => {
     if (showLoading) setLoading(true);
@@ -148,6 +154,38 @@ export default function DataTasksPage() {
     }
   }
 
+  async function inspectImport(file: File | null) {
+    setImportFile(file);
+    setImportPreview(null);
+    if (!file) return;
+    setImporting(true);
+    setError(null);
+    try {
+      setImportPreview(await previewImport(file));
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : '文件预览失败');
+    } finally {
+      setImporting(false);
+    }
+  }
+
+  async function confirmPreview() {
+    if (!importPreview || importPreview.detectedType === 'unknown' || importPreview.newCount === 0) return;
+    setImporting(true);
+    setError(null);
+    try {
+      const result = await confirmImport(importPreview.token);
+      setNotice(`已确认导入 ${result.successCount} 行，${result.failureCount} 行未写入。`);
+      setImportPreview(null);
+      setImportFile(null);
+      await loadTasks(false);
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : '确认导入失败');
+    } finally {
+      setImporting(false);
+    }
+  }
+
   return (
     <main className="page data-tasks-page">
       <header className="page-header">
@@ -166,6 +204,17 @@ export default function DataTasksPage() {
         <button className={`metric ${statusFilter === 'partial' ? 'selected' : ''}`} type="button" onClick={() => setStatusFilter(statusFilter === 'partial' ? 'all' : 'partial')}><span>部分成功</span><strong>{counts.partial}</strong><small>存在失败记录</small></button>
         <button className={`metric ${statusFilter === 'failed' ? 'selected' : ''}`} type="button" onClick={() => setStatusFilter(statusFilter === 'failed' ? 'all' : 'failed')}><span>失败</span><strong>{counts.failed}</strong><small>可查看日志并重试</small></button>
       </section>
+
+      {canEdit && (
+        <section className="panel" aria-labelledby="import-center-title">
+          <div className="panel-header"><div><span className="eyebrow">IMPORT CENTER V2</span><h2 id="import-center-title">审核文件导入</h2></div><FileSpreadsheet size={22} /></div>
+          <div className="toolbar">
+            <label className="button button-secondary" htmlFor="import-center-file"><Upload size={16} />{importFile?.name ?? '选择 CSV / XLSX'}</label>
+            <input id="import-center-file" className="sr-only" type="file" accept=".csv,.xlsx,.xls" onChange={(event) => void inspectImport(event.target.files?.[0] ?? null)} />
+            {importPreview && <><span className="status-badge neutral">{importPreview.detectedType}</span><span className="result-count">{importPreview.totalCount} 行 · {importPreview.newCount} 新增 · {importPreview.duplicateCount} 重复 · {importPreview.errorCount} 错误</span><button className="button button-primary" type="button" disabled={importing || importPreview.detectedType === 'unknown' || importPreview.newCount === 0} onClick={() => void confirmPreview()}>{importing ? <Loader2 className="spin" size={16} /> : <CheckCircle2 size={16} />}确认导入</button></>}
+          </div>
+        </section>
+      )}
 
       <div className="toolbar filter-toolbar">
         <label className="search-field"><Search size={16} /><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="搜索任务、目标或数据源" /></label>

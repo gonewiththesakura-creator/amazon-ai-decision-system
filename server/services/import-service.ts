@@ -1,9 +1,10 @@
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import type { DataTask, MarketDetail } from '../../shared/types.js';
 import { AdapterRegistry } from '../adapters/index.js';
 import type {
   FileImportEntityType as ImportEntityType,
   FileImportBatch,
+  FileImportDetectedType,
   FileImportFormat as ImportFormat,
   NormalizedFileImportRow,
 } from '../adapters/types.js';
@@ -16,6 +17,7 @@ import {
 } from '../domain/calculations.js';
 import { IntelligenceRepository } from '../repository/intelligence-repository.js';
 import { DeterministicAIService } from './ai-service.js';
+import { ProductIdentityResolver, type ProductIdentityResolution } from '../domain/product-identity-resolver.js';
 
 type ImportRow = Record<string, unknown>;
 
@@ -105,16 +107,118 @@ export interface ImportResult {
   task: DataTask;
 }
 
+export interface ImportPreview {
+  token: string;
+  detectedType: FileImportDetectedType;
+  entityType: ImportEntityType | null;
+  totalCount: number;
+  newCount: number;
+  duplicateCount: number;
+  errorCount: number;
+  errors: string[];
+  expiresAt: string;
+}
+
+interface StagedImportPreview {
+  hash: string;
+  buffer: Buffer;
+  batch: FileImportBatch;
+  options: ImportOptions;
+  preview: ImportPreview;
+  confirmed?: ImportResult;
+}
+
+interface ProductIdentityPort {
+  resolve(input: {
+    marketplace: string;
+    asin?: string;
+    sku?: string;
+    parentAsin?: string;
+    variationTheme?: string;
+  }): ProductIdentityResolution;
+}
+
 export class ImportService {
   private readonly repository: IntelligenceRepository;
   private readonly ai: DeterministicAIService;
+  private readonly stagedPreviews = new Map<string, StagedImportPreview>();
+  private readonly identity: ProductIdentityPort;
 
   constructor(
     private readonly database: AppDatabase,
     private readonly adapters: Pick<AdapterRegistry, 'getFile'> = new AdapterRegistry(),
+    identity?: ProductIdentityPort,
   ) {
     this.repository = new IntelligenceRepository(database);
     this.ai = new DeterministicAIService(this.repository);
+    this.identity = identity ?? new ProductIdentityResolver(database);
+  }
+
+  /** Parses and validates a file through its adapter without writing business records. */
+  preview(buffer: Buffer, options: ImportOptions): ImportPreview {
+    this.deleteExpiredPreviews();
+    const sourceId = options.sourceType === 'amazon' ? 'source-amazon-import' : 'source-sellersprite-import';
+    const adapter = this.adapters.getFile(sourceId);
+    const batch = adapter.ingest({
+      buffer,
+      format: options.format,
+      filename: options.filename,
+      entityType: options.entityType,
+    });
+    const detectedType = batch.detectedType;
+    const errors: string[] = [];
+    let validCount = 0;
+    let duplicateCount = 0;
+    for (const row of batch.rows) {
+      try {
+        validateImportRow(row.values, batch.entityType, { ...options, sourceType: adapter.sourceType });
+        if (this.isDuplicatePreviewRow(row.values, batch.entityType, options)) duplicateCount += 1;
+        else validCount += 1;
+      } catch (error) {
+        errors.push(`第 ${row.rowNumber} 行：${error instanceof Error ? error.message : '未知错误'}`);
+      }
+    }
+    const token = randomUUID();
+    const expiresAt = new Date(Date.now() + 10 * 60 * 1_000).toISOString();
+    const preview: ImportPreview = {
+      token,
+      detectedType,
+      entityType: detectedType === 'unknown' ? null : batch.entityType,
+      totalCount: batch.rowCount,
+      newCount: validCount,
+      duplicateCount,
+      errorCount: errors.length,
+      errors,
+      expiresAt,
+    };
+    this.stagedPreviews.set(token, {
+      hash: createHash('sha256').update(buffer).digest('hex'),
+      buffer: Buffer.from(buffer),
+      batch,
+      options: { ...options, sourceType: adapter.sourceType },
+      preview,
+    });
+    return preview;
+  }
+
+  /** Writes only the normalized rows captured by preview. Confirmation is idempotent per token. */
+  confirm(token: string, explicitEntityType?: string): ImportResult {
+    this.deleteExpiredPreviews();
+    const staged = this.stagedPreviews.get(token);
+    if (!staged) throw new Error('确认令牌无效或已过期，请重新预览文件。');
+    if (staged.confirmed) return staged.confirmed;
+    const entityType = staged.preview.entityType ?? normalizeExplicitEntityType(explicitEntityType);
+    if (!entityType) throw new Error('未知文件类型必须先明确选择导入类型。');
+    if (entityType !== staged.batch.entityType) {
+      throw new Error('确认类型与预览文件不一致；请使用所选类型重新预览。');
+    }
+    // The token owns a hash of the original buffer. Only this parsed batch can reach persistence.
+    if (!staged.hash) throw new Error('导入预览校验失败。');
+    const result = entityType === 'owned_product_master'
+      ? this.importOwnedProductMaster(staged.batch, staged.options)
+      : this.importFromBatch(staged.buffer, staged.batch, staged.options);
+    staged.confirmed = result;
+    return result;
   }
 
   import(buffer: Buffer, options: ImportOptions): ImportResult {
@@ -146,6 +250,7 @@ export class ImportService {
     }
 
     const { entityType, rowCount } = batch;
+    if (entityType === 'owned_product_master') return this.importOwnedProductMaster(batch, normalizedOptions);
     const errors: string[] = [];
     const stagedRows: StagedImportRow[] = [];
     batch.rows.forEach(({ values, rowNumber }) => {
@@ -294,6 +399,146 @@ export class ImportService {
       errors,
       task,
     };
+  }
+
+  private importFromBatch(buffer: Buffer, batch: FileImportBatch, options: ImportOptions): ImportResult {
+    const sourceId = options.sourceType === 'amazon' ? 'source-amazon-import' : 'source-sellersprite-import';
+    const adapter = this.adapters.getFile(sourceId);
+    return this.import(buffer, { ...options, entityType: batch.entityType, sourceType: adapter.sourceType });
+  }
+
+  private importOwnedProductMaster(batch: FileImportBatch, options: ImportOptions): ImportResult {
+    const taskId = randomUUID();
+    const batchId = randomUUID();
+    const now = new Date().toISOString();
+    const sourceId = options.sourceType === 'amazon' ? 'source-amazon-import' : 'source-sellersprite-import';
+    const adapter = this.adapters.getFile(sourceId);
+    const sourceLabel = `${adapter.name}: ${options.filename} @ ${now}`;
+    const errors: string[] = [];
+    let successCount = 0;
+
+    transaction(this.database, () => {
+      this.database.prepare(`
+        INSERT INTO data_tasks (
+          id, name, source_id, task_type, target, source, marketplace, status, started_at,
+          total, success, failed, created_at
+        ) VALUES (?, ?, ?, 'file_import', ?, ?, ?, 'running', ?, 0, 0, 0, ?)
+      `).run(
+        taskId, `导入 ${options.filename}`, sourceId, options.filename, sourceLabel,
+        this.repository.getSettings().marketplace, now, now,
+      );
+      for (const row of batch.rows) {
+        this.database.exec('SAVEPOINT import_owned_master_row');
+        try {
+          validateImportRow(row.values, 'owned_product_master', options);
+          this.importOwnedProductMasterRow(row.values, options);
+          this.database.exec('RELEASE SAVEPOINT import_owned_master_row');
+          successCount += 1;
+        } catch (error) {
+          this.database.exec('ROLLBACK TO SAVEPOINT import_owned_master_row');
+          this.database.exec('RELEASE SAVEPOINT import_owned_master_row');
+          errors.push(`第 ${row.rowNumber} 行：${error instanceof Error ? error.message : '未知错误'}`);
+        }
+      }
+      const completedAt = new Date().toISOString();
+      const failureCount = batch.rowCount - successCount;
+      const status = successCount === 0 ? 'failed' : failureCount > 0 ? 'partial' : 'success';
+      this.database.prepare(`
+        UPDATE data_tasks SET status = ?, completed_at = ?, total = ?, success = ?, failed = ?, error_log = ?
+        WHERE id = ?
+      `).run(status, completedAt, batch.rowCount, successCount, failureCount, errors.length ? errors.join('\n') : null, taskId);
+      this.database.prepare(`
+        INSERT INTO import_batches (
+          id, filename, format, entity_type, row_count, success_count, failure_count,
+          errors_json, task_id, imported_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `).run(
+        batchId, options.filename, options.format, 'owned_product_master', batch.rowCount,
+        successCount, failureCount, JSON.stringify(errors), taskId, completedAt,
+      );
+      if (successCount > 0) {
+        this.database.prepare(`UPDATE app_settings SET mode = 'live', last_successful_sync = ? WHERE id = 1`)
+          .run(completedAt);
+        this.database.prepare('UPDATE data_sources SET last_sync_at = ? WHERE id = ?').run(completedAt, sourceId);
+      }
+    });
+    const task = this.repository.getDataTask(taskId);
+    if (!task) throw new Error('导入任务记录未创建。');
+    return {
+      batchId,
+      entityType: 'owned_product_master',
+      rowCount: batch.rowCount,
+      successCount,
+      failureCount: batch.rowCount - successCount,
+      errors,
+      task,
+    };
+  }
+
+  private importOwnedProductMasterRow(row: ImportRow, options: ImportOptions): void {
+    const marketplace = requiredString(row, ['marketplace']).toUpperCase();
+    this.assertActiveMarketplace(marketplace);
+    const asin = requiredString(row, ['asin']).toUpperCase();
+    const sku = requiredString(row, ['sku']);
+    const parentAsin = optionalString(row, ['parentasin'])?.toUpperCase() ?? null;
+    const variationTheme = optionalString(row, ['variationtheme']) ?? null;
+    const marketNodeId = this.ensureMarketNode(
+      undefined,
+      requiredString(row, ['marketnode']),
+      marketplace,
+    );
+    const now = new Date().toISOString();
+    const identity = this.identity.resolve({ marketplace, asin, sku, parentAsin: parentAsin ?? undefined, variationTheme: variationTheme ?? undefined });
+    const variationFamilyId = identity.variationFamilyId;
+    const values = [
+      sku,
+      requiredString(row, ['internalname']),
+      requiredString(row, ['brand']),
+      requiredString(row, ['title']),
+      requiredString(row, ['producttype']),
+      marketNodeId,
+      options.sourceType ?? 'import',
+      parentAsin,
+      asin === parentAsin ? 1 : 0,
+      variationFamilyId,
+      requiredBoolean(row, ['monitoringenabled']) ? 1 : 0,
+      requiredProductStatus(row),
+      now,
+    ];
+    if (identity.productId) {
+      this.database.prepare(`
+        UPDATE products SET sku = ?, internal_name = ?, brand = ?, title = ?, product_type = ?, market_node_id = ?,
+          source_type = ?, parent_asin = ?, is_parent = ?, variation_family_id = ?, monitoring_enabled = ?,
+          status = ?, updated_at = ? WHERE id = ?
+      `).run(...values, identity.productId);
+      return;
+    }
+    this.database.prepare(`
+      INSERT INTO products (
+        id, asin, sku, internal_name, brand, title, image_url, marketplace, product_type, is_owned,
+        market_node_id, keywords_json, monitoring_enabled, source_type, created_at, status, updated_at,
+        variation_family_id, parent_asin, is_parent, variation_attributes_json
+      ) VALUES (?, ?, ?, ?, ?, ?, '', ?, ?, 1, ?, '[]', ?, ?, ?, ?, ?, ?, ?, ?, '{}')
+    `).run(randomUUID(), asin, sku, requiredString(row, ['internalname']), requiredString(row, ['brand']),
+      requiredString(row, ['title']), marketplace, requiredString(row, ['producttype']), marketNodeId,
+      requiredBoolean(row, ['monitoringenabled']) ? 1 : 0, options.sourceType ?? 'import', now,
+      requiredProductStatus(row), now, variationFamilyId, parentAsin, asin === parentAsin ? 1 : 0);
+  }
+
+  private isDuplicatePreviewRow(row: ImportRow, entityType: ImportEntityType, options: ImportOptions): boolean {
+    if (entityType !== 'owned_product_master') return false;
+    const asin = optionalString(row, ['asin'])?.toUpperCase();
+    const marketplace = optionalString(row, ['marketplace'])?.toUpperCase() ?? options.marketplace;
+    if (!asin || !marketplace) return false;
+    return Boolean(this.database.prepare(`SELECT 1 FROM products WHERE marketplace = ? AND asin = ?`)
+      .get(marketplace, asin));
+  }
+
+  private deleteExpiredPreviews(): void {
+    const now = Date.now();
+    for (const [token, staged] of this.stagedPreviews) {
+      if (Date.parse(staged.preview.expiresAt) <= now) this.stagedPreviews.delete(token);
+    }
   }
 
   private recordFailedImport(
@@ -490,6 +735,7 @@ export class ImportService {
       ? existing.keywords_json
       : JSON.stringify(optionalList(row, ['keywords', '关键词']));
     const collectedAt = new Date().toISOString();
+    const period = optionalString(row, ['period', '周期']) ?? '30D';
 
     if (existing) {
       this.database.prepare(`
@@ -537,18 +783,19 @@ export class ImportService {
     }
 
     this.database.prepare(`
-      INSERT INTO product_snapshots (
+      INSERT OR IGNORE INTO product_snapshots (
         id, product_id, date, price, rating, review_count, bsr, estimated_sales,
         estimated_revenue, seller_count, growth_7d, growth_30d, growth_90d,
-        source, source_type, collected_at, period, is_estimated, confidence
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        source, source_type, collected_at, period, is_estimated, confidence, observation_date, dedup_key
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).run(
       randomUUID(), productId, snapshot.date, snapshot.price, snapshot.rating,
       snapshot.reviewCount, snapshot.bsr, snapshot.estimatedSales, snapshot.estimatedRevenue,
       snapshot.sellerCount, snapshot.growth7d, snapshot.growth30d, snapshot.growth90d,
       sourceLabel, options.sourceType ?? 'import', collectedAt,
-      optionalString(row, ['period', '周期']) ?? '30D',
+      period,
       snapshot.isEstimated ? 1 : 0, snapshot.confidence,
+      snapshot.date, `product|${productId}|${snapshot.date}|${options.sourceType ?? 'import'}|${period}`,
     );
     return { productId, marketNodeId };
   }
@@ -566,13 +813,14 @@ export class ImportService {
       marketplace,
     );
     const collectedAt = new Date().toISOString();
+    const period = optionalString(row, ['period', '周期']) ?? '30D';
     this.database.prepare(`
-      INSERT INTO market_snapshots (
+      INSERT OR IGNORE INTO market_snapshots (
         id, market_node_id, date, product_count, seller_count, brand_count, monthly_sales,
         monthly_revenue, avg_price, median_price, avg_rating, median_reviews, top10_share,
         top20_share, new_product_share, price_bands_json, concentration_json, source,
-        source_type, collected_at, period, is_estimated, confidence
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        source_type, collected_at, period, is_estimated, confidence, observation_date, dedup_key
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).run(
       randomUUID(), marketNodeId, snapshot.date, snapshot.productCount, snapshot.sellerCount,
       snapshot.brandCount, snapshot.monthlySales, snapshot.monthlyRevenue, snapshot.avgPrice,
@@ -580,8 +828,9 @@ export class ImportService {
       snapshot.top20Share, snapshot.newProductShare,
       JSON.stringify(snapshot.priceBands), JSON.stringify(snapshot.concentration),
       sourceLabel, options.sourceType ?? 'import', collectedAt,
-      optionalString(row, ['period', '周期']) ?? '30D',
+      period,
       snapshot.isEstimated ? 1 : 0, snapshot.confidence,
+      snapshot.date, `market|${marketNodeId}|${snapshot.date}|${options.sourceType ?? 'import'}|${period}`,
     );
     return marketNodeId;
   }
@@ -799,6 +1048,12 @@ function requiredBoolean(row: ImportRow, names: string[]): boolean {
   return value;
 }
 
+function requiredProductStatus(row: ImportRow): 'active' | 'inactive' {
+  const status = requiredString(row, ['status']).toLowerCase();
+  if (status === 'active' || status === 'inactive') return status;
+  throw new Error('字段 status 必须为 active 或 inactive。');
+}
+
 function optionalList(row: ImportRow, names: string[]): string[] {
   const value = valueFrom(row, names);
   if (value === undefined) return [];
@@ -989,6 +1244,19 @@ function validateImportRow(
   entityType: ImportEntityType,
   options: ImportOptions,
 ): void {
+  if (entityType === 'owned_product_master') {
+    requiredString(row, ['marketplace']);
+    requiredString(row, ['asin']);
+    requiredString(row, ['sku']);
+    requiredString(row, ['internalname']);
+    requiredString(row, ['brand']);
+    requiredString(row, ['title']);
+    requiredString(row, ['producttype']);
+    requiredString(row, ['marketnode']);
+    requiredBoolean(row, ['monitoringenabled']);
+    requiredProductStatus(row);
+    return;
+  }
   if (entityType === 'product') {
     requiredString(row, ['asin']);
     productSnapshotInput(row);
@@ -999,4 +1267,14 @@ function validateImportRow(
     return;
   }
   reviewImportInput(row, options);
+}
+
+function normalizeExplicitEntityType(value: string | undefined): ImportEntityType | null {
+  if (!value) return null;
+  const normalized = value.trim().toLowerCase();
+  if (normalized === 'owned_product_master') return 'owned_product_master';
+  if (normalized === 'product' || normalized === 'sellersprite_product') return 'product';
+  if (normalized === 'market' || normalized === 'sellersprite_market') return 'market';
+  if (normalized === 'review' || normalized === 'amazon_business_report') return 'review';
+  throw new Error(`不支持的确认导入类型：${value}。`);
 }

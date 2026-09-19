@@ -3,6 +3,7 @@ import type { Product } from '../../shared/types.js';
 import type {
   FileDataAdapter,
   FileImportBatch,
+  FileImportDetectedType,
   FileImportEntityType,
   FileImportInput,
   KeywordDataRecord,
@@ -29,6 +30,7 @@ abstract class FileImportAdapter implements FileDataAdapter {
     }));
     return {
       entityType: normalizeEntityType(input.entityType, normalizedRows[0]?.values ?? {}),
+      detectedType: detectHeaderType(normalizedRows[0]?.values ?? {}, this.sourceType),
       rowCount: rows.length,
       rows: normalizedRows,
     };
@@ -57,6 +59,23 @@ abstract class FileImportAdapter implements FileDataAdapter {
   private fileOnlyError(): AdapterUnavailableError {
     return new AdapterUnavailableError(`${this.name} 是文件摄取 Adapter，请使用 ingest 提交 CSV/XLSX。`);
   }
+}
+
+function detectHeaderType(row: ImportRow, sourceType: 'import' | 'amazon'): FileImportDetectedType {
+  if (isOwnedProductMaster(row)) return 'owned_product_master';
+  if (row.reviewtext !== undefined || row.reviewbody !== undefined || row.reviewid !== undefined) {
+    return 'amazon_business_report';
+  }
+  if (sourceType === 'amazon' && (row.asin !== undefined || row.sku !== undefined || row.orderdate !== undefined)) {
+    return 'amazon_business_report';
+  }
+  if (row.asin !== undefined && (row.price !== undefined || row.estimatedsales !== undefined || row.monthlysales !== undefined)) {
+    return 'sellersprite_product';
+  }
+  if ((row.marketname !== undefined || row.marketnodeid !== undefined) && row.monthlysales !== undefined) {
+    return 'sellersprite_market';
+  }
+  return 'unknown';
 }
 
 export class SellerSpriteImportAdapter extends FileImportAdapter {
@@ -93,6 +112,7 @@ function normalizeKey(value: string): string {
 function normalizeEntityType(value: string | undefined, firstRow: ImportRow): FileImportEntityType {
   if (value) {
     const normalized = value.trim().toLowerCase();
+    if (normalized === 'owned_product_master' || normalized === 'ownedproductmaster') return 'owned_product_master';
     if (normalized === 'market' || normalized.includes('market')) return 'market';
     if (normalized === 'product' || normalized.includes('sku') || normalized.includes('asin')) return 'product';
     if (normalized === 'review' || normalized.includes('comment') || normalized.includes('评论')) return 'review';
@@ -104,5 +124,14 @@ function normalizeEntityType(value: string | undefined, firstRow: ImportRow): Fi
     || firstRow.comment !== undefined
     || firstRow.评论正文 !== undefined
   ) return 'review';
+  if (isOwnedProductMaster(firstRow)) return 'owned_product_master';
   return firstRow.asin !== undefined || firstRow.sku !== undefined ? 'product' : 'market';
+}
+
+function isOwnedProductMaster(row: ImportRow): boolean {
+  const required = [
+    'marketplace', 'asin', 'sku', 'internalname', 'brand', 'title', 'producttype',
+    'parentasin', 'variationtheme', 'marketnode', 'monitoringenabled', 'status',
+  ];
+  return required.every((key) => Object.hasOwn(row, key));
 }

@@ -36,6 +36,19 @@ describe('file import adapters', () => {
     expect(batch.rows[0]?.values).toMatchObject({ marketname: 'Travel Pillow', monthlysales: '1200' });
   });
 
+  it('detects the reviewed owned product master header independently of data rows', () => {
+    const adapter = new SellerSpriteImportAdapter();
+    const batch = adapter.ingest({
+      buffer: Buffer.from([
+        'marketplace,asin,sku,internalName,brand,title,productType,parentAsin,variationTheme,marketNode,monitoringEnabled,status',
+        'US,B0OWNED001,OWN-001,Contour Pillow,Northstar,Contour Pillow,memory foam,,,Memory Foam,true,active',
+      ].join('\n')),
+      format: 'csv', filename: 'owned-product-master.csv',
+    });
+
+    expect(batch.entityType).toBe('owned_product_master');
+  });
+
   it('does not let ImportService bypass a selected adapter', () => {
     database = openDatabase(':memory:');
     const adapter = new SellerSpriteImportAdapter();

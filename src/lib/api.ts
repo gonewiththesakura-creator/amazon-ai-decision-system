@@ -67,6 +67,45 @@ export const api = {
     apiRequest<T>(path, { method: 'POST', body: formData }),
 };
 
+export type ImportDetectedType =
+  | 'sellersprite_product'
+  | 'sellersprite_market'
+  | 'amazon_business_report'
+  | 'owned_product_master'
+  | 'unknown';
+
+export interface ImportPreviewResult {
+  token: string;
+  detectedType: ImportDetectedType;
+  entityType: string | null;
+  totalCount: number;
+  newCount: number;
+  duplicateCount: number;
+  errorCount: number;
+  errors: string[];
+  expiresAt: string;
+}
+
+export interface ConfirmedImportResult {
+  batchId: string;
+  entityType: string;
+  rowCount: number;
+  successCount: number;
+  failureCount: number;
+  errors: string[];
+}
+
+export function previewImport(file: File): Promise<ImportPreviewResult> {
+  const format = file.name.toLowerCase().endsWith('.csv') ? 'csv' : 'xlsx';
+  const formData = new FormData();
+  formData.append('file', file);
+  return api.upload<ImportPreviewResult>(`/api/import/preview/${format}`, formData);
+}
+
+export function confirmImport(token: string, entityType?: string): Promise<ConfirmedImportResult> {
+  return api.post<ConfirmedImportResult>('/api/import/confirm', { token, entityType });
+}
+
 export interface ApiQuery<T> {
   data: T | null;
   error: Error | null;
