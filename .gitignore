@@ -11,6 +11,8 @@ data/imports/*
 data/reports/*
 !data/reports/.gitkeep
 .env
+.env.*
+!.env.example
 coverage/
 *.log
 .DS_Store
