@@ -241,7 +241,8 @@ export class GoLiveMigrationService {
         AND snapshot.source_type = 'mcp' AND ${MARKET_METRICS}
     `, false, settings.marketplace, settings.default_market_id);
     const activeOwnedProducts = this.count(`
-      SELECT COUNT(*) AS count FROM products WHERE is_owned = 1 AND status = 'active' AND marketplace = ?
+      SELECT COUNT(*) AS count FROM products
+      WHERE is_owned = 1 AND is_parent = 0 AND status = 'active' AND marketplace = ?
     `, false, settings.marketplace);
     const activeMockOwnedProducts = this.count(`
       SELECT COUNT(*) AS count FROM products
@@ -251,7 +252,8 @@ export class GoLiveMigrationService {
       SELECT COUNT(DISTINCT snapshot.product_id) AS count
       FROM product_snapshots snapshot
       JOIN products product ON product.id = snapshot.product_id
-      WHERE product.is_owned = 1 AND product.status = 'active' AND product.marketplace = ?
+      WHERE product.is_owned = 1 AND product.is_parent = 0
+        AND product.status = 'active' AND product.marketplace = ?
         AND snapshot.source_type IN ('mcp', 'amazon', 'import')
         AND ${PRODUCT_METRICS}
     `, false, settings.marketplace);
@@ -259,7 +261,8 @@ export class GoLiveMigrationService {
       SELECT COUNT(DISTINCT snapshot.product_id) AS count
       FROM product_snapshots snapshot
       JOIN products product ON product.id = snapshot.product_id
-      WHERE product.is_owned = 1 AND product.status = 'active' AND product.marketplace = ?
+      WHERE product.is_owned = 1 AND product.is_parent = 0
+        AND product.status = 'active' AND product.marketplace = ?
         AND snapshot.source_type = 'mcp' AND ${PRODUCT_METRICS}
     `, false, settings.marketplace);
     const sellerSpriteConnectionVerified = this.count(`
@@ -308,7 +311,7 @@ export class GoLiveMigrationService {
       )
       SELECT COUNT(*) AS count FROM mcp_call_logs log
       JOIN products product ON product.asin = log.entity_id
-        AND product.is_owned = 1 AND product.status = 'active'
+        AND product.is_owned = 1 AND product.is_parent = 0 AND product.status = 'active'
         AND product.source_type <> 'mock' AND product.marketplace = ?
       JOIN market_scope scope ON scope.id = product.market_node_id
       WHERE log.provider_id = 'sellersprite' AND log.status = 'success'
@@ -370,7 +373,8 @@ export class GoLiveMigrationService {
         CASE WHEN scope.id IS NOT NULL THEN 1 ELSE 0 END AS inScope
       FROM products product
       LEFT JOIN market_scope scope ON scope.id = product.market_node_id
-      WHERE product.marketplace = ? AND product.is_owned = 1 AND product.status = 'active'
+      WHERE product.marketplace = ? AND product.is_owned = 1 AND product.is_parent = 0
+        AND product.status = 'active'
         AND product.source_type <> 'mock' ORDER BY product.id
     `).all(marketId, marketplace, marketplace, marketplace) as Array<{
       id: string; asin: string; marketNodeId: string; inScope: number;
@@ -714,9 +718,10 @@ export class GoLiveMigrationService {
       JOIN products owned ON owned.id = relation.owned_product_id
       JOIN products competitor ON competitor.id = relation.competitor_product_id
       WHERE relation.relation_type = 'direct'
-        AND owned.marketplace = ? AND owned.is_owned = 1 AND owned.status = 'active'
+        AND owned.marketplace = ? AND owned.is_owned = 1 AND owned.is_parent = 0 AND owned.status = 'active'
         AND owned.source_type <> 'mock'
         AND competitor.marketplace = owned.marketplace AND competitor.is_owned = 0
+        AND competitor.is_parent = 0
         AND competitor.status = 'active' AND competitor.source_type <> 'mock'
       ORDER BY competitor.id
     `).all(marketplace) as Array<{ id: string; asin: string }>;

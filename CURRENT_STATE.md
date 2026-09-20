@@ -1,6 +1,6 @@
 # Current State
 
-记录时间：2026-09-11。本文描述 V2.1 完成后的仓库状态。
+记录时间：2026-09-21。本文描述 V2.2 代码交付后的仓库状态，并把模拟契约验证与尚未完成的真实业务验收明确分开。
 
 ## 技术栈
 
@@ -11,8 +11,8 @@
 
 ## 产品能力
 
-- 首页为 AI 经营驾驶舱，按当前 Marketplace 聚合市场、现有 4 SKU、关联竞品、待开发项目、ResearchJob 和 DataTask；支持 `7D`、`30D`、`90D`、`180D`、`1Y` 时间范围。
-- 驾驶舱包括四项经营 KPI、市场与 4 SKU 指数趋势、市场集中度/价格带、SKU 相对表现、竞品增长 TOP10、正式 AI 今日判断、开发机会评分、产品研究状态和数据新鲜度。
+- 首页为 AI 经营驾驶舱，按当前 Marketplace 动态聚合市场、全部 active 自有 SKU、关联竞品、待开发项目、ResearchJob 和 DataTask；支持 `7D`、`30D`、`90D`、`180D`、`1Y` 时间范围。
+- 驾驶舱包括四项经营 KPI、市场与最多 5 个重点 SKU 的指数趋势、市场集中度/价格带、完整 SKU 相对表现、竞品增长 TOP10、正式 AI 今日判断、开发机会评分、产品研究状态和数据新鲜度。
 - 点击 SKU 相对表现进入 SKU Focus；该视图提供 SKU/市场/直接竞品平均趋势、九项当前经营指标、直接竞品 TOP5、正式结论和待补数据提示，并保留时间范围与 URL 状态。
 - MarketPage 使用图表优先的信息层级：趋势和市场结构先于明细表，并提供章节导航、空快照引导、来源/采集时间/可信度、细分机会排名、市场树、TOP100 与事实账本。
 - 顶栏“问 AI”支持建议问题和自由提问，但只把当前正式 ResearchJob 的 Insight/Evidence 作为正式回答；证据不足、问题歧义或竞品个体排名无证据时明确提示，不拿无关旧结论代答。
@@ -37,6 +37,11 @@
 - Reverse Review 固定检查 12 类失败模式；Reverse Review 与 Approval 均绑定不可变版本链，Approval 还绑定具体审查记录。
 - Opportunity Lab 在空/live 模式只保留待采集研究计划和 pending DataTask；无真实数据时不落零值 MarketNode，也不创建 Opportunity。
 - V16-V19 后，空/live 模式的待开发项目将市场规模、30D 增长、竞争分、机会分和评分拆解保存为 `null`；空市场节点的评分同样为 `null`。对应 DataTask 保持 pending，只有存在合法 Snapshot 基线时才重算。
+- V2.2 增加 Product Master 生命周期、Variation Family、Marketplace 级身份解析、`observationDate`/`collectedAt` 分离、稳定去重键和多来源 Metric Authority；相同事实不会因重复导入而翻倍，也不会让 SellerSprite 估算覆盖 Amazon actual。
+- SellerSprite MCP 使用服务端 Streamable HTTP Client；运行时 `listTools` 建立 Capability Registry，远端响应经 schema、Marketplace、节点、ASIN 和月份校验后才能标准化并写 Snapshot。调用账本、缓存、限流、超时、重试和错误脱敏均位于服务端。
+- `critical_sync` 为每次运行创建唯一 `runId`。fresh `listTools`、能力快照、当前月与上月市场数据、全部 active 真实自有 SKU、候选/直接竞品 coverage、Snapshot、Fact 和后续 Evidence 都关联该运行；Go Live 不允许跨运行拼证据。
+- Live 读取拒绝 Mock 及 failed/running MCP 观察；失败批次保留上一份合法真实 Snapshot 并显示“部分未更新”。主市场与全部自有 SKU 是原子批次，直接竞品为可部分失败的 secondary batch。
+- Variation Family 的父体保留在产品主档、单品详情和历史记录中，但不会进入 SKU/市场商品聚合、工作流竞品 cohort、批量刷新、关键同步或 Go Live Evidence 分母；active Mock 父体仍会阻断 Live。
 
 ## 确定性分析
 
@@ -52,8 +57,10 @@
 - `/api/research-jobs` 及 `/:id/run|retry|approve|reject|steps|evidence|missing-data`
 - `/api/rules/profiles`
 - `/api/markets`、`/api/owned-products`、`/api/development-projects`、`/api/opportunities`
-- `/api/data-tasks` 及 `/:id/retry`
-- `/api/import/csv`、`/api/import/xlsx`
+- `/api/data-tasks` 及 `/:id/retry`、`/api/data-coverage`
+- `/api/import/preview`、`/api/import/confirm`；旧 `/api/import/csv|xlsx` 已关闭，不能绕过预览确认
+- `/api/integrations/sellersprite/test|capabilities|sync/*`、竞品候选审核接口
+- `/api/go-live/preview|backup|cleanup|verify|activate`
 - `/api/ai/insights`
 
 所有工作流读取和写入均受当前 Marketplace 约束。已有 V1 API 保留兼容性，但关联 ResearchJob 后不能通过旧开发/机会动作绕过 V2 Gate。
@@ -68,7 +75,8 @@
 ## 当前边界
 
 - TOP100 商品数据尚无可信的上架/首见日期；“新品”排序已禁用，不根据销量、Review 或标签推断新品身份。
-- SellerSprite MCP 没有真实账号/schema，只有显式 unavailable 的 Adapter stub；文件导入可用。
+- SellerSprite MCP 真实 Transport、Capability Registry、同步与 Go Live 证明链已实现，不再是 Stub；但本机尚未配置 `.env`，也没有经核实的真实市场节点和真实自有 ASIN，因此真实 provider schema、Market/Product Snapshot、Dashboard 与 Evidence 链仍未完成现场验收。
+- 当前本地数据库仍为 Demo：真实链成功前不会清除 Mock，不会切换 Live。Dry Run 会单独列出两项需人工确认的 Demo/manual 历史；清理与激活继续受备份、覆盖和明确确认文本保护。
 - 外部 LLM 尚未接入，当前解释完全可重复；确定性指标始终由代码计算。
 - 常驻 scheduler/worker 尚未启用，监控和 DataTask 当前由人工触发。
 - Admin/Viewer 不是身份认证；真实部署前需要账户、授权、审计与密钥管理。
@@ -82,7 +90,9 @@
 - Hard Gate 拒绝、不可降级 safety floor、严格输入域与 Evidence 当前版本引用：已覆盖。
 - Review Gap、Reverse Review、Approval、Decision：已覆盖。
 - 灰色 SKU 与 U 型枕两个 V2 端到端任务：已覆盖。
-- 本轮 lint、typecheck、185 项全量测试和生产 build 已于 2026-09-11 通过；V2 专项验收集的 123 项测试同时通过。
+- 动态 SKU `0/1/4/5/12/50`、父子体、历史导入幂等、MCP 模拟契约、运行级追溯、Live no-Mock 与 Demo 清理门禁：已由自动化测试覆盖。
+- 2026-09-21 的最新交付验证为 lint、typecheck、51 个测试文件共 533 项和 production build 全部通过；额外在 `TZ=America/Los_Angeles` 下验证 XLSX 业务日期；公开 PR 的 push/pull-request 两个 CI `verify` 均成功（基于上一提交）。
+- 真实验收仍未完成：Connection/Auth/listTools、真实 Tool Schema、真实市场/ASIN/竞品候选、真实历史回填、同运行 Dashboard/Evidence、Demo Cleanup 与 Live 激活均等待本机凭据和业务主数据，不能以模拟测试替代。
 
 ## V2.1 视觉验收
 

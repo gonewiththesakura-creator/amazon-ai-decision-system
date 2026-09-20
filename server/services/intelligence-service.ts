@@ -936,7 +936,7 @@ export class IntelligenceService {
       if (!staged.available) return empty;
     }
     const market = settings.defaultMarketId ? this.repository.getMarket(settings.defaultMarketId) : null;
-    const owned = this.repository.getOwnedProducts();
+    const owned = this.repository.getSellableOwnedProducts();
     const comparableOwned = owned.filter((item) => item.relativePerformanceAvailable);
     const formallyAnalyzedOwned = comparableOwned.filter((item) => isFormalWorkflowInsight(item.insight));
     const projects = this.repository.getDevelopmentProjects();
@@ -1287,7 +1287,7 @@ export class IntelligenceService {
       ['owned_sku_refresh', 'product_refresh'].includes(normalizedTaskType)
       && (target === '' || target === 'all' || target === 'owned-products')
     ) {
-      for (const owned of this.repository.getOwnedProducts()) {
+      for (const owned of this.repository.getSellableOwnedProducts()) {
         refreshed += await this.appendProductSnapshot(owned.id, adapter);
       }
     } else if (
@@ -1300,7 +1300,10 @@ export class IntelligenceService {
         JOIN products owned ON owned.id = relation.owned_product_id
         JOIN products competitor ON competitor.id = relation.competitor_product_id
         WHERE relation.relation_type = 'direct'
-          AND owned.marketplace = ? AND competitor.marketplace = ?
+          AND owned.marketplace = ? AND owned.is_owned = 1 AND owned.is_parent = 0
+          AND owned.status = 'active' AND competitor.marketplace = ?
+          AND competitor.is_owned = 0 AND competitor.is_parent = 0
+          AND competitor.status = 'active'
       `).all(
         this.repository.getSettings().marketplace,
         this.repository.getSettings().marketplace,
@@ -1320,7 +1323,7 @@ export class IntelligenceService {
           const defaultMarketId = this.repository.getSettings().defaultMarketId;
           if (defaultMarketId) refreshed += await this.appendMarketSnapshot(defaultMarketId, adapter);
         }
-        for (const owned of this.repository.getOwnedProducts()) {
+        for (const owned of this.repository.getSellableOwnedProducts()) {
           refreshed += await this.appendProductSnapshot(owned.id, adapter);
         }
       } else {
@@ -1368,14 +1371,15 @@ export class IntelligenceService {
       ? await this.prepareMarketSnapshot(settings.defaultMarketId, adapter)
       : null;
     const productIds = this.database.prepare(`
-      SELECT id FROM products WHERE is_owned = 1 AND marketplace = ?
+      SELECT id FROM products WHERE is_owned = 1 AND is_parent = 0 AND marketplace = ?
       UNION
       SELECT relation.competitor_product_id AS id
       FROM competitor_relations relation
       JOIN products owned ON owned.id = relation.owned_product_id
       JOIN products competitor ON competitor.id = relation.competitor_product_id
       WHERE relation.relation_type = 'direct'
-        AND owned.marketplace = ? AND competitor.marketplace = ?
+        AND owned.marketplace = ? AND owned.is_parent = 0
+        AND competitor.marketplace = ? AND competitor.is_parent = 0
       ORDER BY id
     `).all(settings.marketplace, settings.marketplace, settings.marketplace) as Array<{ id: string }>;
     const products: PreparedProductSnapshot[] = [];
@@ -1477,7 +1481,8 @@ export class IntelligenceService {
   private analyzeMarketSnapshot(marketId: string): void {
     this.ai.analyze({ entityType: 'market', entityId: marketId });
     const ownedRows = this.database.prepare(`
-      SELECT id FROM products WHERE is_owned = 1 AND market_node_id = ? AND marketplace = ?
+      SELECT id FROM products
+      WHERE is_owned = 1 AND is_parent = 0 AND market_node_id = ? AND marketplace = ?
     `).all(marketId, this.repository.getSettings().marketplace) as Array<{ id: string }>;
     ownedRows.forEach((row) => this.ai.analyze({ entityType: 'owned_product', entityId: row.id }));
     const projectRows = this.database.prepare(`

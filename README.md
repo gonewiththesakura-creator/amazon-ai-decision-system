@@ -7,7 +7,7 @@ Research Job -> Data -> Normalize -> Snapshot -> Rule -> AI Explanation
              -> Evidence -> Review Gap -> Reverse Review -> Approval -> Decision
 ```
 
-系统优先服务于记忆棉枕头市场和自有 SKU 的诊断，同时支持相邻产品与全新赛道的开发决策。V2.1 建立图表优先的经营驾驶舱；V2.2 正在接入真实 SellerSprite MCP、动态产品主数据和审核式历史导入。真实自有 ASIN 与细分市场节点仍需业务核实，不能把公开竞品验证视为自有 SKU 的 Live 验收。
+系统优先服务于记忆棉枕头市场和自有 SKU 的诊断，同时支持相邻产品与全新赛道的开发决策。V2.1 建立图表优先的经营驾驶舱；V2.2 已实现 SellerSprite MCP Transport、动态产品主数据、审核式历史导入和运行级 Go Live 证明。真实连接与业务验收仍需本机凭据、真实自有 ASIN 和已核实的细分市场节点，不能把模拟契约测试或公开竞品验证视为自有 SKU 的 Live 验收。
 
 ## 本地运行
 
@@ -35,7 +35,7 @@ npm start
 
 ## V2.2 真实数据操作
 
-按 [V2.2 真实数据接入操作手册](docs/V2_2_REAL_DATA_RUNBOOK.md) 配置服务端 MCP 凭据、验证连接与能力、审核导入产品主数据、同步关键批次、审核竞品候选，并在备份及 Dry Run 后清理 Demo、验证覆盖、切换 Live。密钥只放本机/服务器的 `.env`，不要提交或放进 `VITE_*`；公开仓库也不应包含真实业务报表。
+先阅读 [V2.2 实施计划](V2_2_REAL_DATA_PLAN.md)，再按 [V2.2 真实数据接入操作手册](docs/V2_2_REAL_DATA_RUNBOOK.md) 配置服务端 MCP 凭据、验证连接与能力、审核导入产品主数据、同步关键批次、审核竞品候选，并在备份及 Dry Run 后清理 Demo、验证覆盖、切换 Live。密钥只放本机/服务器的 `.env`，不要提交或放进 `VITE_*`；公开仓库也不应包含真实业务报表。
 
 自有产品主数据模板：[owned-product-master-template.csv](examples/owned-product-master-template.csv)。增加 SKU 无需修改代码；父子 ASIN 使用 Variation Family 区分。默认数据库在 `data/opportunity-intelligence.db`，备份默认在 `data/backups/`。当前本地 Admin/Viewer 是权限预览，不等于生产身份认证。
 

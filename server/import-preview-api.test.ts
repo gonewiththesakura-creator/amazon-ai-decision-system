@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it } from 'vitest';
 import request from 'supertest';
+import * as XLSX from 'xlsx';
 import { ImportService } from './services/import-service.js';
 import { openDatabase, type AppDatabase } from './database/database.js';
 import { SellerSpriteImportAdapter } from './adapters/import-adapters.js';
@@ -19,6 +20,32 @@ const productMasterCsv = [
   'marketplace,asin,sku,internalName,brand,title,productType,parentAsin,variationTheme,marketNode,monitoringEnabled,status',
   'US,B0OWNED001,OWN-001,Contour Pillow,Northstar,Contour Pillow,memory foam,B0PARENT01,SizeName,Memory Foam,true,active',
 ].join('\n');
+
+function productSnapshotWorkbook(): Buffer {
+  const excelDate = (Date.UTC(2026, 5, 30) - Date.UTC(1899, 11, 30)) / 86_400_000;
+  const workbook = XLSX.utils.book_new();
+  const worksheet = XLSX.utils.aoa_to_sheet([
+    [
+      'ASIN', 'SKU', 'Brand', 'Title', 'MarketNodeId', 'MarketName', 'Price', 'Rating',
+      'ReviewCount', 'BSR', 'EstimatedSales', 'SellerCount', 'Growth7D', 'Growth30D',
+      'Growth90D', 'IsEstimated', 'Confidence', 'Date',
+    ],
+    [
+      'B0XLSX001', 'XLSX-001', 'Test Brand', 'Test Pillow', 'xlsx-market', 'XLSX Market',
+      39.99, 4.5, 120, 1000, 280, 1, 1.2, 4.1, 8.2, false, 0.9,
+      excelDate,
+    ],
+  ]);
+  worksheet.R2!.z = 'yyyy-mm-dd';
+  XLSX.utils.book_append_sheet(workbook, worksheet, 'Snapshots');
+  return XLSX.write(workbook, { type: 'buffer', bookType: 'xlsx', cellDates: true }) as Buffer;
+}
+
+function unknownWorkbook(): Buffer {
+  const workbook = XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(workbook, XLSX.utils.aoa_to_sheet([['Mystery'], ['value']]), 'Unknown');
+  return XLSX.write(workbook, { type: 'buffer', bookType: 'xlsx' }) as Buffer;
+}
 
 describe('import preview API', () => {
   it('previews the owned product master without writing business data, then confirms exactly once', async () => {
@@ -137,6 +164,66 @@ describe('import preview API', () => {
     expect(confirmed.body.data).toMatchObject({ successCount: 1, failureCount: 0 });
     const owned = await request(app).get('/api/owned-products').expect(200);
     expect(owned.body.data).toEqual([expect.objectContaining({ asin: 'B0OWNED001', isOwned: true })]);
+  });
+
+  it('imports an XLSX product snapshot over HTTP only after confirmation and keeps the observation idempotent', async () => {
+    database = openDatabase(':memory:');
+    const app = createApp({ database });
+    const workbook = productSnapshotWorkbook();
+
+    const preview = await request(app).post('/api/import/preview/xlsx')
+      .attach('file', workbook, 'product-snapshot.xlsx')
+      .expect(200);
+    expect(preview.body.data).toMatchObject({
+      detectedType: 'sellersprite_product', entityType: 'product', totalCount: 1,
+      newCount: 1, errorCount: 0,
+    });
+    expect(database.prepare('SELECT COUNT(*) AS count FROM products').get()).toEqual({ count: 0 });
+    expect(database.prepare('SELECT COUNT(*) AS count FROM product_snapshots').get()).toEqual({ count: 0 });
+    expect(database.prepare('SELECT COUNT(*) AS count FROM import_batches').get()).toEqual({ count: 0 });
+
+    const confirmed = await request(app).post('/api/import/confirm')
+      .send({ token: preview.body.data.token })
+      .expect(201);
+    expect(confirmed.body.data).toMatchObject({ successCount: 1, failureCount: 0 });
+    expect(database.prepare(`
+      SELECT COUNT(*) AS count, MIN(observation_date) AS observationDate
+      FROM product_snapshots
+    `).get()).toEqual({ count: 1, observationDate: '2026-06-30' });
+    expect(database.prepare('SELECT format FROM import_batches').all()).toEqual([{ format: 'xlsx' }]);
+
+    await request(app).post('/api/import/confirm')
+      .send({ token: preview.body.data.token })
+      .expect(201);
+    expect(database.prepare('SELECT COUNT(*) AS count FROM product_snapshots').get()).toEqual({ count: 1 });
+    expect(database.prepare('SELECT COUNT(*) AS count FROM import_batches').get()).toEqual({ count: 1 });
+
+    const replayPreview = await request(app).post('/api/import/preview/xlsx')
+      .attach('file', workbook, 'product-snapshot.xlsx')
+      .expect(200);
+    expect(replayPreview.body.data).toMatchObject({ duplicateCount: 1, newCount: 0, errorCount: 0 });
+    await request(app).post('/api/import/confirm')
+      .send({ token: replayPreview.body.data.token })
+      .expect(201);
+    expect(database.prepare('SELECT COUNT(*) AS count FROM product_snapshots').get()).toEqual({ count: 1 });
+    expect(database.prepare('SELECT format FROM import_batches ORDER BY imported_at').all())
+      .toEqual([{ format: 'xlsx' }, { format: 'xlsx' }]);
+  });
+
+  it('does not let an unknown XLSX file bypass preview confirmation', async () => {
+    database = openDatabase(':memory:');
+    const app = createApp({ database });
+    const preview = await request(app).post('/api/import/preview/xlsx')
+      .attach('file', unknownWorkbook(), 'unknown.xlsx')
+      .expect(200);
+
+    expect(preview.body.data).toMatchObject({ detectedType: 'unknown', entityType: null, errorCount: 1 });
+    await request(app).post('/api/import/confirm')
+      .send({ token: preview.body.data.token })
+      .expect(400);
+    expect(database.prepare('SELECT COUNT(*) AS count FROM products').get()).toEqual({ count: 0 });
+    expect(database.prepare('SELECT COUNT(*) AS count FROM product_snapshots').get()).toEqual({ count: 0 });
+    expect(database.prepare('SELECT COUNT(*) AS count FROM import_batches').get()).toEqual({ count: 0 });
   });
 
   it('preserves Demo and real lineage during import until explicit scoped Demo disable', () => {

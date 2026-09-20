@@ -841,6 +841,18 @@ describe('GoLiveMigrationService', () => {
       sellerSpriteConnectionVerified: true, hasMinimumRealCoverage: true,
       sellerSpriteCriticalRunId: expect.any(String),
     });
+    database.prepare(`
+      INSERT INTO products (
+        id, asin, sku, brand, title, image_url, marketplace, product_type, is_owned,
+        market_node_id, source_type, created_at, status, parent_asin, is_parent
+      ) VALUES (
+        'mock-parent', 'B0MOCKPAR1', 'MOCK-PARENT', 'Mock', 'Mock parent', '', 'US',
+        'pillow', 1, 'market-us', 'mock', '2026-09-21', 'active', 'B0MOCKPAR1', 1
+      )
+    `).run();
+    expect(service.verify()).toMatchObject({ hasMinimumRealCoverage: false });
+    database.prepare(`DELETE FROM products WHERE id = 'mock-parent'`).run();
+    expect(service.verify()).toMatchObject({ hasMinimumRealCoverage: true });
     database.prepare(`UPDATE data_sources SET status = 'disconnected'
       WHERE id = 'source-sellersprite-mcp'`).run();
     expect(service.verify()).toMatchObject({

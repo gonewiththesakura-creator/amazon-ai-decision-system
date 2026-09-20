@@ -197,6 +197,7 @@ export class IntelligenceRepository {
       )
       ${PRODUCT_SELECT}
       WHERE p.market_node_id IN (SELECT id FROM descendants) AND p.status = 'active'
+        AND p.is_parent = 0
       ORDER BY p.id
     `).all(id) as DbRow[];
     return rows.map((row) => this.mapProduct(row)).sort((left, right) => (
@@ -207,9 +208,20 @@ export class IntelligenceRepository {
   }
 
   getOwnedProducts(): OwnedProductSummary[] {
+    return this.getOwnedProductSummaries(false);
+  }
+
+  getSellableOwnedProducts(): OwnedProductSummary[] {
+    return this.getOwnedProductSummaries(true);
+  }
+
+  private getOwnedProductSummaries(sellableOnly: boolean): OwnedProductSummary[] {
     const rows = this.database.prepare(`
-      ${PRODUCT_SELECT} WHERE p.is_owned = 1 AND p.status = 'active' AND p.marketplace = ? ORDER BY p.created_at, p.id
-    `).all(this.getSettings().marketplace) as DbRow[];
+      ${PRODUCT_SELECT}
+      WHERE p.is_owned = 1 AND p.status = 'active' AND p.marketplace = ?
+        AND (? = 0 OR p.is_parent = 0)
+      ORDER BY p.created_at, p.id
+    `).all(this.getSettings().marketplace, sellableOnly ? 1 : 0) as DbRow[];
     return rows.map((row) => this.mapOwnedSummary(row));
   }
 

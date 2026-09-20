@@ -635,9 +635,10 @@ export class SellerSpriteSyncService {
       JOIN products owned ON owned.id = relation.owned_product_id
       JOIN products competitor ON competitor.id = relation.competitor_product_id
       WHERE relation.relation_type = 'direct'
-        AND owned.marketplace = ? AND owned.is_owned = 1 AND owned.status = 'active'
+        AND owned.marketplace = ? AND owned.is_owned = 1 AND owned.is_parent = 0 AND owned.status = 'active'
         AND owned.source_type <> 'mock'
         AND competitor.marketplace = owned.marketplace AND competitor.is_owned = 0
+        AND competitor.is_parent = 0
         AND competitor.status = 'active' AND competitor.source_type <> 'mock'
       ORDER BY competitor.id
     `).all(marketplace) as unknown as ProductRow[];
@@ -1035,7 +1036,8 @@ export class SellerSpriteSyncService {
   private activeOwnedProducts(marketplace: string, rootMarketId: string): ProductRow[] {
     const total = this.database.prepare(`
       SELECT COUNT(*) AS count FROM products
-      WHERE marketplace = ? AND is_owned = 1 AND status = 'active' AND source_type <> 'mock'
+      WHERE marketplace = ? AND is_owned = 1 AND is_parent = 0
+        AND status = 'active' AND source_type <> 'mock'
     `).get(marketplace) as { count: number };
     const rows = this.database.prepare(`
       WITH RECURSIVE market_scope(id) AS (
@@ -1053,7 +1055,7 @@ export class SellerSpriteSyncService {
         AND market.marketplace = product.marketplace
         AND market.status = 'active' AND market.source_type <> 'mock'
       JOIN market_scope scope ON scope.id = product.market_node_id
-      WHERE product.marketplace = ? AND product.is_owned = 1
+      WHERE product.marketplace = ? AND product.is_owned = 1 AND product.is_parent = 0
         AND product.status = 'active' AND product.source_type <> 'mock'
       ORDER BY product.id
     `).all(rootMarketId, marketplace, marketplace, marketplace) as unknown as ProductRow[];
@@ -1069,9 +1071,10 @@ export class SellerSpriteSyncService {
       JOIN products owned ON owned.id = relation.owned_product_id
       JOIN products competitor ON competitor.id = relation.competitor_product_id
       WHERE relation.competitor_product_id = ? AND relation.relation_type = 'direct'
-        AND owned.marketplace = ? AND owned.is_owned = 1 AND owned.status = 'active'
+        AND owned.marketplace = ? AND owned.is_owned = 1 AND owned.is_parent = 0 AND owned.status = 'active'
         AND owned.source_type <> 'mock'
         AND competitor.marketplace = owned.marketplace AND competitor.is_owned = 0
+        AND competitor.is_parent = 0
         AND competitor.status = 'active' AND competitor.source_type <> 'mock'
       LIMIT 1
     `).get(competitorId, marketplace));
@@ -1119,9 +1122,9 @@ export class SellerSpriteSyncService {
       JOIN products owned ON owned.id = relation.owned_product_id
       JOIN products competitor ON competitor.id = relation.competitor_product_id
       WHERE relation.owned_product_id = ? AND relation.competitor_product_id = ?
-        AND owned.is_owned = 1 AND owned.status = 'active'
+        AND owned.is_owned = 1 AND owned.is_parent = 0 AND owned.status = 'active'
         AND owned.source_type <> 'mock'
-        AND competitor.is_owned = 0 AND competitor.status = 'active'
+        AND competitor.is_owned = 0 AND competitor.is_parent = 0 AND competitor.status = 'active'
         AND competitor.source_type <> 'mock'
         AND competitor.marketplace = owned.marketplace
       LIMIT 1

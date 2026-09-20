@@ -522,7 +522,7 @@ export function createApp(options: CreateAppOptions = {}): express.Express {
       .parse(request.body ?? {});
     const productIds = input.productIds ?? database.prepare(`
       SELECT id FROM products
-      WHERE marketplace = ? AND is_owned = 1 AND status = 'active'
+      WHERE marketplace = ? AND is_owned = 1 AND is_parent = 0 AND status = 'active'
       ORDER BY id
     `).all(repository.getSettings().marketplace).map((row) => String((row as { id: string }).id));
     const results = [];

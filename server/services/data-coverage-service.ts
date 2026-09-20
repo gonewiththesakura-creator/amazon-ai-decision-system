@@ -36,12 +36,13 @@ export class DataCoverageService {
     const activeOwnedTotal = this.count(`
       SELECT COUNT(*) AS count
       FROM products
-      WHERE marketplace = ? AND is_owned = 1 AND status = 'active'
+      WHERE marketplace = ? AND is_owned = 1 AND status = 'active' AND is_parent = 0
     `, marketplace);
     const activeOwnedCovered = this.count(`
       SELECT COUNT(DISTINCT product.id) AS count
       FROM products product
       WHERE product.marketplace = ? AND product.is_owned = 1 AND product.status = 'active'
+        AND product.is_parent = 0
         AND ${productEvidence('product.id')}
     `, marketplace);
     const coreCompetitorTotal = this.count(`
@@ -49,16 +50,18 @@ export class DataCoverageService {
       FROM competitor_relations relation
       JOIN products owned ON owned.id = relation.owned_product_id
       JOIN products competitor ON competitor.id = relation.competitor_product_id
-      WHERE owned.marketplace = ? AND owned.is_owned = 1 AND owned.status = 'active'
-        AND competitor.marketplace = ? AND relation.relation_type = 'direct'
+      WHERE owned.marketplace = ? AND owned.is_owned = 1 AND owned.status = 'active' AND owned.is_parent = 0
+        AND competitor.marketplace = ? AND competitor.is_parent = 0
+        AND relation.relation_type = 'direct'
     `, marketplace, marketplace);
     const coreCompetitorCovered = this.count(`
       SELECT COUNT(DISTINCT relation.competitor_product_id) AS count
       FROM competitor_relations relation
       JOIN products owned ON owned.id = relation.owned_product_id
       JOIN products competitor ON competitor.id = relation.competitor_product_id
-      WHERE owned.marketplace = ? AND owned.is_owned = 1 AND owned.status = 'active'
-        AND competitor.marketplace = ? AND relation.relation_type = 'direct'
+      WHERE owned.marketplace = ? AND owned.is_owned = 1 AND owned.status = 'active' AND owned.is_parent = 0
+        AND competitor.marketplace = ? AND competitor.is_parent = 0
+        AND relation.relation_type = 'direct'
         AND ${productEvidence('competitor.id')}
     `, marketplace, marketplace);
     const history90dCovered = this.count(`
@@ -67,6 +70,7 @@ export class DataCoverageService {
         FROM products product
         JOIN product_snapshots snapshot ON snapshot.product_id = product.id
         WHERE product.marketplace = ? AND product.is_owned = 1 AND product.status = 'active'
+          AND product.is_parent = 0
           AND snapshot.source_type IN (${REAL_SOURCE_TYPES})
           AND ${PRODUCT_METRICS}
           AND date(COALESCE(snapshot.observation_date, snapshot.date)) IS NOT NULL
@@ -79,6 +83,7 @@ export class DataCoverageService {
       SELECT COUNT(DISTINCT product.id) AS count
       FROM products product
       WHERE product.marketplace = ? AND product.is_owned = 1 AND product.status = 'active'
+        AND product.is_parent = 0
         AND ${productEvidence('product.id', true)}
     `, marketplace);
 
@@ -132,6 +137,7 @@ export class DataCoverageService {
     const owned = this.database.prepare(`
       SELECT product.id FROM products product
       WHERE product.marketplace = ? AND product.is_owned = 1 AND product.status = 'active'
+        AND product.is_parent = 0
         AND product.source_type <> 'mock'
       ORDER BY product.id
     `).all(marketplace) as Array<{ id: string }>;
@@ -147,6 +153,7 @@ export class DataCoverageService {
       SELECT product.id FROM products product
       JOIN market_scope scope ON scope.id = product.market_node_id
       WHERE product.marketplace = ? AND product.is_owned = 1 AND product.status = 'active'
+        AND product.is_parent = 0
         AND product.source_type <> 'mock'
       ORDER BY product.id
     `).all(primaryMarketId, marketplace, marketplace, marketplace) as Array<{ id: string }>;
@@ -164,9 +171,10 @@ export class DataCoverageService {
       JOIN products owned ON owned.id = relation.owned_product_id
       JOIN market_scope scope ON scope.id = owned.market_node_id
       JOIN products competitor ON competitor.id = relation.competitor_product_id
-      WHERE owned.marketplace = ? AND owned.is_owned = 1 AND owned.status = 'active'
+      WHERE owned.marketplace = ? AND owned.is_owned = 1 AND owned.status = 'active' AND owned.is_parent = 0
         AND owned.source_type <> 'mock' AND relation.relation_type = 'direct'
         AND competitor.marketplace = owned.marketplace AND competitor.is_owned = 0
+        AND competitor.is_parent = 0
         AND competitor.status = 'active' AND competitor.source_type <> 'mock'
       ORDER BY competitor.id
     `).all(primaryMarketId, marketplace, marketplace, marketplace) as Array<{ id: string }>;

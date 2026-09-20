@@ -165,7 +165,7 @@ export class ExecutiveDashboardService {
   private activeOwnedProducts(marketplace: string): OwnedProductSummary[] {
     const activeIds = new Set((this.database.prepare(`
       SELECT id FROM products
-      WHERE marketplace = ? AND is_owned = 1 AND status = 'active'
+      WHERE marketplace = ? AND is_owned = 1 AND status = 'active' AND is_parent = 0
     `).all(marketplace) as unknown as Array<{ id: string }>).map((row) => row.id));
     return this.intelligence.getOwnedProducts().filter((product) => activeIds.has(product.id));
   }

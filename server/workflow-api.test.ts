@@ -637,18 +637,19 @@ describe('V2 workflow API', () => {
       .get() as { id: string };
     const runId = 'valid-peer-run';
     completeMcpRun(runId);
-    for (const [peer, asin, status, sourceType, isOwned, current] of [
-      ['valid-peer', 'B0VALID001', 'active', 'import', 0, 120],
-      ['inactive-peer', 'B0INACT001', 'inactive', 'import', 0, 500],
-      ['demo-peer', 'B0DEMO0001', 'active', 'mock', 0, 400],
-      ['owned-peer', 'B0OWNED001', 'active', 'import', 1, 300],
+    for (const [peer, asin, status, sourceType, isOwned, current, isParent] of [
+      ['valid-peer', 'B0VALID001', 'active', 'import', 0, 120, 0],
+      ['inactive-peer', 'B0INACT001', 'inactive', 'import', 0, 500, 0],
+      ['demo-peer', 'B0DEMO0001', 'active', 'mock', 0, 400, 0],
+      ['owned-peer', 'B0OWNED001', 'active', 'import', 1, 300, 0],
+      ['parent-peer', 'B0PARENT01', 'active', 'import', 0, 900, 1],
     ] as const) {
       database!.prepare(`INSERT INTO products (
         id, asin, brand, title, image_url, marketplace, product_type,
-        is_owned, market_node_id, status, source_type, created_at
+        is_owned, is_parent, market_node_id, status, source_type, created_at
       ) VALUES (?, ?, 'Peer', 'Comparable pillow', '', 'US', 'competitor',
-        ?, 'mkt-gray-e2e', ?, ?, '2026-09-20T00:00:00Z')`)
-        .run(peer, asin, isOwned, status, sourceType);
+        ?, ?, 'mkt-gray-e2e', ?, ?, '2026-09-20T00:00:00Z')`)
+        .run(peer, asin, isOwned, isParent, status, sourceType);
       database!.prepare(`INSERT INTO competitor_relations (
         id, owned_product_id, competitor_product_id, relation_type,
         similarity_score, reason, ai_tags_json, created_at, last_verified_at

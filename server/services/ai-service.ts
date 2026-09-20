@@ -115,8 +115,8 @@ export class DeterministicAIService {
       return this.answerFromWorkflow(contextualType, contextualId);
     }
     const lower = question.toLowerCase();
-    const owned = this.repository.getOwnedProducts();
-    const explicitlyNamedProducts = owned.filter((product) => [
+    const owned = this.repository.getSellableOwnedProducts();
+    const explicitlyNamedProducts = this.repository.getOwnedProducts().filter((product) => [
       product.id, product.asin, product.sku, product.internalName, product.title,
     ].some((alias) => alias && lower.includes(alias.toLowerCase())));
     if (explicitlyNamedProducts.length > 1) {

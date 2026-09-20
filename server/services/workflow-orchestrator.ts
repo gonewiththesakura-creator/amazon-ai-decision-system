@@ -1071,6 +1071,7 @@ export class WorkflowOrchestrator {
       JOIN product_snapshots snapshot ON snapshot.product_id = candidate.id
       WHERE candidate.market_node_id = ? AND candidate.marketplace = ?
         AND candidate.is_owned = 0 AND candidate.status = 'active'
+        AND candidate.is_parent = 0
         AND (? = 1 OR candidate.source_type <> 'mock')
         AND (? IS NULL OR candidate.id <> ?)
       ORDER BY candidate.id, snapshot.date DESC, snapshot.collected_at DESC, snapshot.id DESC
@@ -1156,6 +1157,7 @@ export class WorkflowOrchestrator {
       JOIN products competitor ON competitor.id = relation.competitor_product_id
       WHERE relation.owned_product_id = ? AND relation.relation_type = 'direct'
         AND competitor.marketplace = ? AND competitor.is_owned = 0
+        AND competitor.is_parent = 0
         AND competitor.status = 'active' AND (? = 1 OR competitor.source_type <> 'mock')
     `).all(productId, job.marketplace, job.isDemo ? 1 : 0) as Array<{ product_id: string }>;
     const competitorGrowths = competitorRows.map(({ product_id: competitorId }) => ({
