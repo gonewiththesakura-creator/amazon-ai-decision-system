@@ -47,6 +47,111 @@ describe('SellerSpriteMCPAdapter', () => {
       expect(transport.calls).toHaveLength(2);
     } finally { database.close(); }
   });
+  it.each([
+    ['marketplace', { marketplace: 'CA', nodeIdPath: '1055398:1063252', month: '2026-08' }],
+    ['node', { marketplace: 'US', nodeIdPath: '9999999', month: '2026-08' }],
+    ['month', { marketplace: 'US', nodeIdPath: '1055398:1063252', month: '2026-07' }],
+  ])('rejects mismatched market %s before certifying or caching the response', async (_field, invalid) => {
+    const database = openDatabase(':memory:');
+    try {
+      const transport = new AdapterTransport();
+      transport.responseData = { products: 100, ...invalid };
+      const adapter = new SellerSpriteMCPAdapter({ client: new SellerSpriteMcpClient({
+        transport, ledgerStore: new SqliteMcpCallLedgerStore(database),
+        cacheStore: new SqliteMcpResponseCacheStore(database),
+      }) });
+      const input = { marketplace: 'US', nodeIdPath: '1055398:1063252', month: '202608' };
+
+      await expect(adapter.fetchMarketStatistics(input)).rejects.toMatchObject({ code: 'INVALID_SCHEMA' });
+      expect(database.prepare('SELECT status, error_code FROM mcp_call_logs').all()).toEqual([
+        { status: 'failed', error_code: 'INVALID_SCHEMA' },
+      ]);
+      expect(database.prepare('SELECT COUNT(*) AS total FROM mcp_response_cache').get()).toEqual({ total: 0 });
+
+      transport.responseData = { products: 100, marketplace: 'US', nodeIdPath: input.nodeIdPath, month: '2026-08' };
+      await expect(adapter.fetchMarketStatistics(input)).resolves.toMatchObject({ data: { products: 100 } });
+      expect(transport.calls).toHaveLength(2);
+    } finally { database.close(); }
+  });
+  it.each([
+    ['identity', { asin: { asin: 'B000TEST02', marketplace: 'US' }, salesTrendPoints: [{ month: '2026-07', childUnitSales: 10 }] }],
+    ['history', { asin: { asin: 'B000TEST01', marketplace: 'US' }, salesTrendPoints: [{ asin: 'B000TEST02', month: '2026-07', childUnitSales: 10 }] }],
+    ['marketplace', { asin: { asin: 'B000TEST01', marketplace: 'CA' }, salesTrendPoints: [{ month: '2026-07', childUnitSales: 10 }] }],
+    ['top-level marketplace', { marketplace: 'CA', asin: { asin: 'B000TEST01', marketplace: 'US' }, salesTrendPoints: [{ month: '2026-07', childUnitSales: 10 }] }],
+  ])('rejects mismatched ASIN %s before certifying or caching the response', async (_field, invalid) => {
+    const database = openDatabase(':memory:');
+    try {
+      const transport = new AdapterTransport();
+      transport.responseData = invalid;
+      const adapter = new SellerSpriteMCPAdapter({ client: new SellerSpriteMcpClient({
+        transport, ledgerStore: new SqliteMcpCallLedgerStore(database),
+        cacheStore: new SqliteMcpResponseCacheStore(database),
+      }) });
+      const input = { marketplace: 'US', asin: 'B000TEST01' };
+
+      await expect(adapter.fetchAsinSalesTrend(input)).rejects.toMatchObject({ code: 'INVALID_SCHEMA' });
+      expect(database.prepare('SELECT status, error_code FROM mcp_call_logs').all()).toEqual([
+        { status: 'failed', error_code: 'INVALID_SCHEMA' },
+      ]);
+      expect(database.prepare('SELECT COUNT(*) AS total FROM mcp_response_cache').get()).toEqual({ total: 0 });
+
+      transport.responseData = undefined;
+      await expect(adapter.fetchAsinSalesTrend(input)).resolves.toMatchObject({ data: { asin: { asin: input.asin } } });
+      expect(transport.calls).toHaveLength(2);
+    } finally { database.close(); }
+  });
+  it.each([
+    ['concentration', [{ asin: 'B000TEST01', marketplace: 'CA' }]],
+    ['research', { items: [{ asin: 'B000TEST02', title: 'Test', nodeIdPath: 'wrong' }] }],
+    ['competitors', [{ asin: 'B000TEST02', marketplace: 'CA' }]],
+  ])('does not certify wrong-scope %s items', async (kind, invalid) => {
+    const database = openDatabase(':memory:');
+    try {
+      const transport = new AdapterTransport();
+      transport.responseData = invalid;
+      const adapter = new SellerSpriteMCPAdapter({ client: new SellerSpriteMcpClient({
+        transport, ledgerStore: new SqliteMcpCallLedgerStore(database),
+        cacheStore: new SqliteMcpResponseCacheStore(database),
+      }) });
+
+      const request = kind === 'concentration'
+        ? adapter.fetchMarketConcentration({ marketplace: 'US', nodeIdPath: '1055398:1063252' })
+        : kind === 'research'
+          ? adapter.fetchMarketProducts({ marketplace: 'US', marketId: '1055398:1063252', keywords: ['pillow'] })
+          : adapter.discoverAsinCompetitors({ marketplace: 'US', asin: 'B000TEST01' });
+      await expect(request).rejects.toMatchObject({ code: 'INVALID_SCHEMA' });
+      expect(database.prepare('SELECT status, error_code FROM mcp_call_logs').all()).toEqual([
+        { status: 'failed', error_code: 'INVALID_SCHEMA' },
+      ]);
+      expect(database.prepare('SELECT COUNT(*) AS total FROM mcp_response_cache').get()).toEqual({ total: 0 });
+    } finally { database.close(); }
+  });
+  it('revalidates previously cached wrong-scope data before recording a cache-hit success', async () => {
+    const database = openDatabase(':memory:');
+    try {
+      const transport = new AdapterTransport();
+      transport.responseData = { products: 100, marketplace: 'CA' };
+      const client = new SellerSpriteMcpClient({ transport,
+        ledgerStore: new SqliteMcpCallLedgerStore(database),
+        cacheStore: new SqliteMcpResponseCacheStore(database),
+      });
+      const input = { marketplace: 'US', nodeIdPath: '1055398:1063252', month: '202608' };
+      await client.callTool({
+        tool: 'market_research_statistics', arguments: { request: input },
+        context: { capability: 'MARKET_STATISTICS' },
+      });
+      transport.responseData = { products: 100, marketplace: 'US', nodeIdPath: input.nodeIdPath, month: input.month };
+
+      const result = await new SellerSpriteMCPAdapter({ client }).fetchMarketStatistics(input);
+
+      expect(result.data.marketplace).toBe('US');
+      expect(transport.calls).toHaveLength(2);
+      expect(database.prepare('SELECT status, cache_hit FROM mcp_call_logs ORDER BY rowid').all()).toEqual([
+        { status: 'success', cache_hit: 0 },
+        { status: 'success', cache_hit: 0 },
+      ]);
+    } finally { database.close(); }
+  });
   it('marks a malformed SellerSprite envelope as a schema failure without retrying', async () => {
     const database = openDatabase(':memory:');
     try {

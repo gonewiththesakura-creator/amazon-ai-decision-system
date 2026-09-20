@@ -220,6 +220,7 @@ export class SellerSpriteMCPAdapter implements MarketDataAdapter {
       catch { throw new SellerSpriteMcpError('INVALID_SCHEMA', 'Invalid SellerSprite response envelope'); }
       const parsed = schema.safeParse(payload);
       if (!parsed.success) throw new SellerSpriteMcpError('INVALID_SCHEMA', 'SellerSprite response does not match discovered capability');
+      validateCapabilityScope(capability, parsed.data, request);
       return parsed.data;
     });
     return {
@@ -230,6 +231,77 @@ export class SellerSpriteMCPAdapter implements MarketDataAdapter {
       },
     };
   }
+}
+
+function validateCapabilityScope(
+  capability: SellerSpriteCapability, data: unknown, request: Record<string, unknown>,
+): void {
+  if (capability === 'MARKET_STATISTICS') {
+    assertRequestedScope(data as Record<string, unknown>, request);
+  } else if (capability === 'PRODUCT_CONCENTRATION' || capability === 'ASIN_COMPETITOR_DISCOVERY') {
+    for (const item of data as Array<Record<string, unknown>>) assertRequestedScope(item, request);
+  } else if (capability === 'MARKET_RESEARCH') {
+    const research = data as { items: Array<Record<string, unknown>> } & Record<string, unknown>;
+    assertRequestedScope(research, request);
+    for (const item of research.items) assertRequestedScope(item, request);
+  } else if (capability === 'ASIN_SALES_TREND') {
+    const trend = data as SellerSpriteAsinTrend;
+    assertRequestedScope(data as Record<string, unknown>, request);
+    assertRequestedScope(trend.asin, request);
+    assertRequestedAsin(trend.asin, request);
+    for (const point of trend.salesTrendPoints) {
+      assertRequestedScope(point, request);
+      assertRequestedAsin(point, request);
+    }
+  }
+}
+
+function assertRequestedScope(data: Record<string, unknown>, request: Record<string, unknown>): void {
+  for (const key of ['marketplace', 'nodeIdPath'] as const) {
+    const actual = scopeString(data[key]);
+    const expected = scopeString(request[key]);
+    if (actual && expected && (key === 'marketplace'
+      ? actual.toUpperCase() !== expected.toUpperCase() : actual !== expected)) {
+      throw new SellerSpriteMcpError('INVALID_SCHEMA', `SellerSprite response ${key} does not match request`);
+    }
+  }
+  if (request.month !== undefined && data.month !== undefined && data.month !== null) {
+    const actual = normalizedMonth(data.month);
+    const expected = normalizedMonth(request.month);
+    if (actual !== expected) {
+      throw new SellerSpriteMcpError('INVALID_SCHEMA', 'SellerSprite response month does not match request');
+    }
+  }
+}
+
+function assertRequestedAsin(data: Record<string, unknown>, request: Record<string, unknown>): void {
+  const actual = scopeString(data.asin);
+  const expected = scopeString(request.asin);
+  if (actual && expected && actual.toUpperCase() !== expected.toUpperCase()) {
+    throw new SellerSpriteMcpError('INVALID_SCHEMA', 'SellerSprite response ASIN does not match request');
+  }
+}
+
+function scopeString(value: unknown): string | null {
+  if (value === undefined || value === null) return null;
+  if (typeof value !== 'string' || !value.trim()) {
+    throw new SellerSpriteMcpError('INVALID_SCHEMA', 'SellerSprite response scope is invalid');
+  }
+  return value.trim();
+}
+
+function normalizedMonth(value: unknown): string {
+  const text = typeof value === 'number' && Number.isInteger(value) ? String(value) : scopeString(value);
+  const match = text && /^(\d{4})-?(\d{2})(?:-(\d{2}))?$/.exec(text);
+  if (!match) throw new SellerSpriteMcpError('INVALID_SCHEMA', 'SellerSprite response month is invalid');
+  const year = Number(match[1]);
+  const month = Number(match[2]);
+  const day = match[3] ? Number(match[3]) : 1;
+  const date = new Date(Date.UTC(year, month - 1, day));
+  if (date.getUTCFullYear() !== year || date.getUTCMonth() + 1 !== month || date.getUTCDate() !== day) {
+    throw new SellerSpriteMcpError('INVALID_SCHEMA', 'SellerSprite response month is invalid');
+  }
+  return `${match[1]}${match[2]}`;
 }
 
 function optionalMonth(month?: string): { month?: string } { return month ? { month } : {}; }
