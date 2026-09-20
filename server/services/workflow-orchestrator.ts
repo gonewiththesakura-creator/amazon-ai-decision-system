@@ -879,7 +879,7 @@ export class WorkflowOrchestrator {
     });
   }
 
-  private collectMarket(job: ResearchJobDetail): CollectedWorkflowData {
+  private collectMarket(job: ResearchJobDetail): CollectedWorkflowData & { growthPair?: SnapshotGrowthPair } {
     const marketId = requiredEntityId(job);
     const allRows = this.database.prepare(`
       SELECT snapshot.* FROM market_snapshots snapshot
@@ -1052,7 +1052,7 @@ export class WorkflowOrchestrator {
       calculations.market_growth_30d = growthCalculation('Market sales', growth);
       calculations.market_growth_elapsed_days = `Snapshot dates ${growth.latest.date} and ${growth.baseline.date}: ${growth.elapsedDays} elapsed days.`;
     }
-    return { values, sources, calculations, reviews: [] };
+    return { values, sources, calculations, reviews: [], growthPair: growth ?? undefined };
   }
 
   private hasTop100History(marketId: string, marketplace: string, allowMock: boolean): boolean {
@@ -1151,6 +1151,12 @@ export class WorkflowOrchestrator {
       productSalesHistory.find((point) => point.id === rawSkuGrowth.baseline.id)?.source ?? null,
     ], job.marketplace) ? rawSkuGrowth : null;
     const market = this.collectMarket({ ...job, entityId: owned.marketNodeId });
+    const skuGrowthSource = skuGrowth
+      ? productSalesHistory.find((point) => point.id === skuGrowth.latest.id)?.source ?? null : null;
+    const coreGrowthSources = [skuGrowthSource, market.sources.market_growth_30d ?? null];
+    const comparableSkuGrowth = skuGrowth && market.growthPair
+      && sameGrowthMonths(skuGrowth, market.growthPair)
+      && this.sharesCompleteMcpRun(coreGrowthSources, job.marketplace) ? skuGrowth : null;
     const competitorRows = this.database.prepare(`
       SELECT relation.competitor_product_id AS product_id
       FROM competitor_relations relation
@@ -1163,13 +1169,25 @@ export class WorkflowOrchestrator {
     const competitorGrowths = competitorRows.map(({ product_id: competitorId }) => ({
       competitorId,
       pair: this.getProductGrowth(competitorId, job.marketplace),
-    })).filter((item): item is { competitorId: string; pair: SourcedGrowthPair } => item.pair !== null);
+    })).filter((item): item is { competitorId: string; pair: SourcedGrowthPair } => (
+      item.pair !== null && comparableSkuGrowth !== null
+        && sameGrowthMonths(item.pair, comparableSkuGrowth)
+        && this.sharesCompleteMcpRun([
+          ...coreGrowthSources, item.pair.latestSource, item.pair.baselineSource,
+        ], job.marketplace)
+    ));
     const top100Growths = this.top100ProductIds(
       owned.marketNodeId, job.marketplace, job.isDemo, productId,
     ).map((candidateId) => ({
       productId: candidateId,
       pair: this.getProductGrowth(candidateId, job.marketplace),
-    })).filter((item): item is { productId: string; pair: SourcedGrowthPair } => item.pair !== null);
+    })).filter((item): item is { productId: string; pair: SourcedGrowthPair } => (
+      item.pair !== null && comparableSkuGrowth !== null
+        && sameGrowthMonths(item.pair, comparableSkuGrowth)
+        && this.sharesCompleteMcpRun([
+          ...coreGrowthSources, item.pair.latestSource, item.pair.baselineSource,
+        ], job.marketplace)
+    ));
     const comparableCompetitorGrowths = this.hasOneCompleteMcpRun(competitorGrowths.flatMap((item) => (
       [item.pair.latestSource, item.pair.baselineSource]
     )), job.marketplace) ? competitorGrowths : [];
@@ -1179,7 +1197,7 @@ export class WorkflowOrchestrator {
     const latest = productRows.at(-1);
     const skuSource = latest ? this.productMetricSource(latest, 'estimated_sales') : unknownSource(job);
     const values: Record<string, unknown> = {
-      sku_growth_30d: skuGrowth?.growth ?? null,
+      sku_growth_30d: comparableSkuGrowth?.growth ?? null,
       market_growth_30d: market.values.market_growth_30d ?? null,
       market_growth_baseline: market.values.market_growth_baseline ?? null,
       direct_competitor_growth_30d: comparableCompetitorGrowths.length > 0
@@ -1197,7 +1215,7 @@ export class WorkflowOrchestrator {
       current_bsr: latest?.bsr ?? null,
     };
     const sources: Record<string, FieldSource> = {
-      sku_growth_30d: { ...skuSource, sourceRecordId: skuGrowth?.latest.id ?? skuSource.sourceRecordId, period: '30D' },
+      sku_growth_30d: { ...skuSource, sourceRecordId: comparableSkuGrowth?.latest.id ?? skuSource.sourceRecordId, period: '30D' },
       market_growth_30d: market.sources.market_growth_30d ?? unknownSource(job),
       market_growth_baseline: market.sources.market_growth_baseline ?? unknownSource(job),
       direct_competitor_growth_30d: comparableCompetitorGrowths[0]
@@ -1213,7 +1231,7 @@ export class WorkflowOrchestrator {
       ['current_review_count', 'review_count'], ['current_bsr', 'bsr'],
     ] as const) sources[field] = latest ? this.productMetricSource(latest, metric) : unknownSource(job);
     const calculations: Record<string, string> = { ...market.calculations };
-    if (skuGrowth) calculations.sku_growth_30d = growthCalculation('SKU estimated sales', skuGrowth);
+    if (comparableSkuGrowth) calculations.sku_growth_30d = growthCalculation('SKU estimated sales', comparableSkuGrowth);
     if (comparableCompetitorGrowths.length > 0) {
       calculations.direct_competitor_growth_30d = `mean(${comparableCompetitorGrowths.map((item) => (
         `${item.competitorId}:${item.pair.latest.id}/${item.pair.baseline.id}=${item.pair.growth}%`
@@ -1276,6 +1294,14 @@ export class WorkflowOrchestrator {
     const runs = sources.map((source) => source?.sourceType === 'mcp' && source.sourceRecordId
       ? this.completeMcpRunForRecord(source.sourceRecordId, marketplace) : null);
     return runs.length > 0 && runs[0] !== null && runs.every((run) => run === runs[0]);
+  }
+
+  private sharesCompleteMcpRun(sources: Array<FieldSource | null>, marketplace: string): boolean {
+    const mcpSources = sources.filter((source): source is FieldSource => source?.sourceType === 'mcp');
+    if (mcpSources.length === 0) return true;
+    const runs = mcpSources.map((source) => source.sourceRecordId
+      ? this.completeMcpRunForRecord(source.sourceRecordId, marketplace) : null);
+    return runs[0] !== null && runs.every((run) => run === runs[0]);
   }
 
   private completeMcpRunForRecord(recordId: string, marketplace: string): string | null {
@@ -1689,6 +1715,11 @@ function comparableSnapshotGrowth(
     id: point.id, date: point.date,
     value: comparableSources(latest.source, point.source) ? point.value : null,
   })));
+}
+
+function sameGrowthMonths(left: SnapshotGrowthPair, right: SnapshotGrowthPair): boolean {
+  return left.latest.date.slice(0, 7) === right.latest.date.slice(0, 7)
+    && left.baseline.date.slice(0, 7) === right.baseline.date.slice(0, 7);
 }
 
 function unknownSource(job: ResearchJobDetail, source = 'Missing source record'): FieldSource {

@@ -91,7 +91,7 @@
 - Review Gap、Reverse Review、Approval、Decision：已覆盖。
 - 灰色 SKU 与 U 型枕两个 V2 端到端任务：已覆盖。
 - 动态 SKU `0/1/4/5/12/50`、父子体、历史导入幂等、MCP 模拟契约、运行级追溯、Live no-Mock 与 Demo 清理门禁：已由自动化测试覆盖。
-- 2026-09-21 的最新交付验证为 lint、typecheck、51 个测试文件共 533 项和 production build 全部通过；额外在 `TZ=America/Los_Angeles` 下验证 XLSX 业务日期；公开 PR 当前提交的 push/pull-request 两个 CI `verify` 均成功。
+- 2026-09-21 的本地交付验证为 lint、typecheck、54 个测试文件共 619 项和 production build 全部通过；额外在 `TZ=America/Los_Angeles` 下验证 XLSX 业务日期。公开 PR 的上一提交两个 CI `verify` 均成功；本次变更需在推送后重新确认 CI。
 - 真实验收仍未完成：Connection/Auth/listTools、真实 Tool Schema、真实市场/ASIN/竞品候选、真实历史回填、同运行 Dashboard/Evidence、Demo Cleanup 与 Live 激活均等待本机凭据和业务主数据，不能以模拟测试替代。
 
 ## V2.1 视觉验收

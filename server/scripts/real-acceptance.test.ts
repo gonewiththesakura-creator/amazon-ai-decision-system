@@ -59,11 +59,14 @@ describe('real SellerSprite acceptance runner', () => {
     const summary = JSON.parse(output[0]!) as Record<string, unknown>;
     expect(summary).toEqual({
       ok: true,
+      acceptanceScope: 'critical_market_and_owned_skus',
+      manualCompetitorReview: 'not_checked',
       checks: {
         preflight: true,
         connection: true,
         schemas: true,
         criticalSync: true,
+        secondaryCoverage: true,
         workflows: true,
         evidence: true,
         dashboard: true,
@@ -74,6 +77,12 @@ describe('real SellerSprite acceptance runner', () => {
         requiredCapabilities: 5,
         schemaHashes: 5,
         ownedProducts: 2,
+        candidateDiscoveryProducts: 2,
+        candidateDiscoveryFailures: 0,
+        competitorCandidates: 0,
+        directCompetitors: 0,
+        refreshedDirectCompetitors: 0,
+        failedDirectCompetitors: 0,
         marketSnapshots: 2,
         productSnapshots: 4,
         jobs: 3,
@@ -86,8 +95,9 @@ describe('real SellerSprite acceptance runner', () => {
       runId: RUN_ID,
       schemaHashes: HASHES,
     });
+    const safeLabels = new Set([RUN_ID, 'critical_market_and_owned_skus', 'not_checked']);
     expect(allStringValues(summary).every((value) => (
-      value === RUN_ID || /^[a-f0-9]{64}$/.test(value)
+      safeLabels.has(value) || /^[a-f0-9]{64}$/.test(value)
     ))).toBe(true);
     expect(output[0]).not.toMatch(/PRIVATE|SECRET|ASIN|title|endpoint|https?:\/\//i);
     expect(api.requests).toEqual([
@@ -113,6 +123,80 @@ describe('real SellerSprite acceptance runner', () => {
     expect(api.requests.join('\n')).not.toMatch(
       /go-live\/(?:preview|backup|cleanup|activate)|competitor-candidates\/.*\/(?:confirm|reject)/,
     );
+  });
+
+  it('reports secondary coverage without claiming human competitor review', async () => {
+    const api = await startApi({
+      candidateCoverage: { status: 'success', total: 2, success: 2, failed: 0, candidates: 3 },
+      competitorCoverage: { status: 'partial', total: 2, success: 1, failed: 1 },
+    });
+    const output: string[] = [];
+
+    const exitCode = await runAcceptanceCli([
+      '--base-url', api.baseUrl, '--month', '202609',
+    ], { writeOutput: (value) => output.push(value) });
+
+    expect(exitCode).toBe(0);
+    expect(JSON.parse(output[0]!)).toMatchObject({
+      ok: true,
+      acceptanceScope: 'critical_market_and_owned_skus',
+      manualCompetitorReview: 'not_checked',
+      checks: { secondaryCoverage: true },
+      counts: {
+        candidateDiscoveryProducts: 2,
+        candidateDiscoveryFailures: 0,
+        competitorCandidates: 3,
+        directCompetitors: 2,
+        refreshedDirectCompetitors: 1,
+        failedDirectCompetitors: 1,
+      },
+    });
+    expect(api.requests.join('\n')).not.toMatch(/competitor-candidates\/.*\/(?:confirm|reject)/);
+  });
+
+  it('rejects candidate coverage for a different owned-SKU roster before dashboard or jobs', async () => {
+    const api = await startApi({
+      candidateCoverage: { status: 'success', total: 1, success: 1, failed: 0, candidates: 1 },
+    });
+    const output: string[] = [];
+
+    const exitCode = await runAcceptanceCli([
+      '--base-url', api.baseUrl, '--month', '202609',
+    ], { writeOutput: (value) => output.push(value) });
+
+    expect(exitCode).toBe(1);
+    expect(JSON.parse(output[0]!)).toMatchObject({
+      ok: false, checks: { criticalSync: true, secondaryCoverage: false, dashboard: false },
+    });
+    expect(api.requests).not.toContain('GET /api/dashboard/executive?range=30D');
+    expect(api.requests).not.toContain('POST /api/research-jobs');
+  });
+
+  it('keeps observed secondary failure counts when the run cannot be accepted', async () => {
+    const api = await startApi({
+      candidateCoverage: { status: 'partial', total: 2, success: 1, failed: 1, candidates: 2 },
+      competitorCoverage: { status: 'failed', total: 2, success: 0, failed: 2 },
+    });
+    const output: string[] = [];
+
+    const exitCode = await runAcceptanceCli([
+      '--base-url', api.baseUrl, '--month', '202609',
+    ], { writeOutput: (value) => output.push(value) });
+
+    expect(exitCode).toBe(1);
+    expect(JSON.parse(output[0]!)).toMatchObject({
+      ok: false,
+      checks: { criticalSync: true, secondaryCoverage: false, dashboard: false },
+      counts: {
+        candidateDiscoveryProducts: 1,
+        candidateDiscoveryFailures: 1,
+        competitorCandidates: 2,
+        directCompetitors: 2,
+        refreshedDirectCompetitors: 0,
+        failedDirectCompetitors: 2,
+      },
+    });
+    expect(api.requests).not.toContain('GET /api/dashboard/executive?range=30D');
   });
 
   it('does not print an HTTP error body, endpoint, private data, or secret canaries', async () => {
@@ -282,6 +366,13 @@ interface ApiOptions {
   evidenceRunId?: string;
   dashboardProductIds?: string[];
   includeMockEvidence?: boolean;
+  candidateCoverage?: {
+    status: 'success' | 'partial' | 'failed'; total: number; success: number; failed: number;
+    candidates: number;
+  };
+  competitorCoverage?: {
+    status: 'success' | 'partial' | 'failed'; total: number; success: number; failed: number;
+  };
   dashboardProof?: {
     passed: boolean;
     marketVerified: boolean;
@@ -357,8 +448,10 @@ async function startApi(options: ApiOptions = {}): Promise<{
     if (route === 'POST /api/integrations/sellersprite/sync/critical') {
       respondData(response, {
         runId: RUN_ID, taskId: RUN_ID, marketSnapshots: 2, productSnapshots: 4,
-        candidateCoverage: { status: 'success', total: 2, success: 2, failed: 0, candidates: 0 },
-        competitorCoverage: { status: 'success', total: 0, success: 0, failed: 0 },
+        candidateCoverage: options.candidateCoverage
+          ?? { status: 'success', total: 2, success: 2, failed: 0, candidates: 0 },
+        competitorCoverage: options.competitorCoverage
+          ?? { status: 'success', total: 0, success: 0, failed: 0 },
         private: PRIVATE_CANARY,
       }, 201);
       return;

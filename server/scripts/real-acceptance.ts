@@ -31,10 +31,22 @@ const capabilitiesSchema = z.object({
     schemaHash: z.string().regex(HASH_PATTERN).nullable(),
   })).min(1),
 });
+const secondaryCoverageSchema = z.object({
+  status: z.enum(['success', 'partial', 'failed']),
+  total: z.number().int().nonnegative(),
+  success: z.number().int().nonnegative(),
+  failed: z.number().int().nonnegative(),
+}).refine((coverage) => coverage.success + coverage.failed === coverage.total
+  && coverage.status === (coverage.failed === 0 ? 'success'
+    : coverage.success === 0 ? 'failed' : 'partial'));
 const criticalRunSchema = z.object({
   runId: z.string().uuid(),
   marketSnapshots: z.number().int().nonnegative(),
   productSnapshots: z.number().int().nonnegative(),
+  candidateCoverage: secondaryCoverageSchema.extend({
+    candidates: z.number().int().nonnegative(),
+  }),
+  competitorCoverage: secondaryCoverageSchema,
 });
 const runRosterSchema = z.object({
   marketId: z.string().min(1),
@@ -81,11 +93,14 @@ interface AcceptanceArguments {
 
 interface AcceptanceSummary {
   ok: boolean;
+  acceptanceScope: 'critical_market_and_owned_skus';
+  manualCompetitorReview: 'not_checked';
   checks: {
     preflight: boolean;
     connection: boolean;
     schemas: boolean;
     criticalSync: boolean;
+    secondaryCoverage: boolean;
     workflows: boolean;
     evidence: boolean;
     dashboard: boolean;
@@ -96,6 +111,12 @@ interface AcceptanceSummary {
     requiredCapabilities: number;
     schemaHashes: number;
     ownedProducts: number;
+    candidateDiscoveryProducts: number;
+    candidateDiscoveryFailures: number;
+    competitorCandidates: number;
+    directCompetitors: number;
+    refreshedDirectCompetitors: number;
+    failedDirectCompetitors: number;
     marketSnapshots: number;
     productSnapshots: number;
     jobs: number;
@@ -149,6 +170,14 @@ export async function runAcceptanceCli(
     summary.counts.marketSnapshots = critical.marketSnapshots;
     summary.counts.productSnapshots = critical.productSnapshots;
     summary.checks.criticalSync = true;
+    const candidate = critical.candidateCoverage;
+    const competitor = critical.competitorCoverage;
+    summary.counts.candidateDiscoveryProducts = candidate.success;
+    summary.counts.candidateDiscoveryFailures = candidate.failed;
+    summary.counts.competitorCandidates = candidate.candidates;
+    summary.counts.directCompetitors = competitor.total;
+    summary.counts.refreshedDirectCompetitors = competitor.success;
+    summary.counts.failedDirectCompetitors = competitor.failed;
 
     const roster = runRosterSchema.parse(await request(
       `/api/integrations/sellersprite/sync/critical/${encodeURIComponent(critical.runId)}/roster`,
@@ -156,6 +185,11 @@ export async function runAcceptanceCli(
     requireCondition(roster.marketId === settings.defaultMarketId
       && new Set(roster.ownedProductIds).size === roster.ownedProductIds.length);
     summary.counts.ownedProducts = roster.ownedProductIds.length;
+    requireCondition(candidate.status === 'success'
+      && candidate.total === roster.ownedProductIds.length
+      && candidate.success === candidate.total && candidate.failed === 0
+      && (competitor.total === 0 || competitor.success > 0));
+    summary.checks.secondaryCoverage = true;
 
     const capabilities = capabilitiesSchema.parse(await request(
       `/api/integrations/sellersprite/capabilities?runId=${encodeURIComponent(critical.runId)}`,
@@ -338,11 +372,14 @@ function requireCondition(condition: unknown): asserts condition {
 function emptySummary(): AcceptanceSummary {
   return {
     ok: false,
+    acceptanceScope: 'critical_market_and_owned_skus',
+    manualCompetitorReview: 'not_checked',
     checks: {
       preflight: false,
       connection: false,
       schemas: false,
       criticalSync: false,
+      secondaryCoverage: false,
       workflows: false,
       evidence: false,
       dashboard: false,
@@ -353,6 +390,12 @@ function emptySummary(): AcceptanceSummary {
       requiredCapabilities: 0,
       schemaHashes: 0,
       ownedProducts: 0,
+      candidateDiscoveryProducts: 0,
+      candidateDiscoveryFailures: 0,
+      competitorCandidates: 0,
+      directCompetitors: 0,
+      refreshedDirectCompetitors: 0,
+      failedDirectCompetitors: 0,
       marketSnapshots: 0,
       productSnapshots: 0,
       jobs: 0,
