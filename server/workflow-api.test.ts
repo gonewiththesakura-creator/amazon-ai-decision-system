@@ -137,6 +137,260 @@ function cloneUShapedFixture(): Record<string, unknown> {
 }
 
 describe('V2 workflow API', () => {
+  it('does not turn a missing real market sales metric into a zero-growth Evidence chain', async () => {
+    const app = testApp();
+    await importCsv(app, 'market', 'market-baseline.csv', grayMarketCsv('2026-08-10', 20_000));
+    database!.prepare(`
+      INSERT INTO market_snapshots (
+        id, market_node_id, date, monthly_sales, avg_price, source, source_type,
+        collected_at, period, is_estimated, confidence, observation_date, dedup_key
+      ) VALUES ('mcp-market-no-sales', 'mkt-gray-e2e', '2026-09-09', NULL, 40,
+        'SellerSprite MCP', 'mcp', '2026-09-10T00:00:00Z', '30D', 1, 0.8,
+        '2026-09-09', 'mcp-market-no-sales')
+    `).run();
+    const job = await createJob(app, {
+      name: 'Missing real market sales', type: 'existing_market', entityType: 'market_node',
+      entityId: 'mkt-gray-e2e', createdBy: 'E2E Runner', input: {}, taskBook: {},
+    });
+
+    const result = await runJob(app, job.id);
+
+    expect(result.status).toBe('needs_data');
+    expect(result.latestRuleExecution).toMatchObject({ hardGateStatus: 'needs_data', input: {
+      monthly_sales: null, market_growth_30d: null,
+    } });
+    expect(result.latestInsight).toBeUndefined();
+    const missing = (await request(app).get(`/api/research-jobs/${job.id}/missing-data`).expect(200))
+      .body.data as MissingDataItem[];
+    expect(missing.map((item) => item.fieldName)).toEqual(expect.arrayContaining([
+      'monthly_sales', 'market_growth_baseline',
+    ]));
+  });
+
+  it('uses SellerSprite MCP market facts over later imports in Rule output and Evidence', async () => {
+    const app = testApp();
+    await importCsv(app, 'market', 'market-baseline.csv', grayMarketCsv('2026-08-10', 20_000));
+    await importCsv(app, 'market', 'market-current.csv', grayMarketCsv('2026-09-09', 23_000));
+    for (const [id, date, sales] of [
+      ['mcp-market-baseline', '2026-08-10', 20_000],
+      ['mcp-market-current', '2026-09-09', 24_000],
+    ] as const) {
+      database!.prepare(`
+        INSERT INTO market_snapshots (
+          id, market_node_id, date, monthly_sales, source, source_type,
+          collected_at, period, is_estimated, confidence, observation_date, dedup_key
+        ) VALUES (?, 'mkt-gray-e2e', ?, ?, 'SellerSprite MCP', 'mcp',
+          '2026-08-01T00:00:00Z', '30D', 1, 0.8, ?, ?)
+      `).run(id, date, sales, date, id);
+    }
+    database!.prepare(`
+      INSERT INTO metric_facts (
+        id, entity_type, entity_id, marketplace, metric_name, numeric_value,
+        source, source_id, source_type, is_estimated, confidence,
+        observation_date, collected_at, dedup_key
+      ) VALUES ('mcp-market-current-fact', 'market', 'mkt-gray-e2e', 'US',
+        'monthly_sales', 24000, 'SellerSprite MCP', 'source-sellersprite-mcp', 'mcp',
+        1, 0.8, '2026-09-09', '2026-09-10T00:00:00Z', 'mcp-market-current-fact')
+    `).run();
+    const job = await createJob(app, {
+      name: 'Authoritative real market', type: 'existing_market', entityType: 'market_node',
+      entityId: 'mkt-gray-e2e', createdBy: 'E2E Runner', input: {}, taskBook: {},
+    });
+
+    const result = await runJob(app, job.id);
+    const evidence = (await request(app).get(`/api/research-jobs/${job.id}/evidence`).expect(200))
+      .body.data as WorkflowEvidence[];
+
+    expect(result).toMatchObject({ status: 'monitoring', latestRuleExecution: {
+      output: { monthly_sales: 24_000, market_growth_30d: 20 },
+    } });
+    expect(evidence.find((item) => item.metricName === 'monthly_sales')).toMatchObject({
+      metricValue: 24_000, sourceType: 'mcp', sourceRecordId: 'mcp-market-current-fact', period: '30D',
+    });
+  });
+
+  it('uses Amazon actual SKU sales ahead of later MCP estimates for Rules and Evidence', async () => {
+    const app = testApp();
+    await importCsv(app, 'product', 'owned-baseline.csv', graySkuCsv('2026-08-10', 100, 0));
+    await importCsv(app, 'product', 'owned-current.csv', graySkuCsv('2026-09-09', 110, 0));
+    await importCsv(app, 'market', 'market-baseline.csv', grayMarketCsv('2026-08-10', 20_000));
+    await importCsv(app, 'market', 'market-current.csv', grayMarketCsv('2026-09-09', 23_000));
+    const product = (await request(app).get('/api/owned-products').expect(200)).body.data
+      .find((item: { asin: string }) => item.asin === 'B0GRAYE2E01') as { id: string };
+    for (const [id, date, sales, source, sourceType, estimated, collectedAt] of [
+      ['amazon-aug', '2026-08-10', 100, 'Amazon Business Report', 'amazon', 0, '2026-08-12T00:00:00Z'],
+      ['amazon-sep', '2026-09-09', 120, 'Amazon Business Report', 'amazon', 0, '2026-09-10T00:00:00Z'],
+      ['mcp-sep', '2026-09-09', 80, 'SellerSprite MCP', 'mcp', 1, '2026-09-20T00:00:00Z'],
+    ] as const) {
+      database!.prepare(`
+        INSERT INTO product_snapshots (
+          id, product_id, date, estimated_sales, source, source_type,
+          collected_at, period, is_estimated, confidence, observation_date, dedup_key
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, '30D', ?, 0.9, ?, ?)
+      `).run(id, product.id, date, sales, source, sourceType, collectedAt, estimated, date, id);
+    }
+    const job = await createJob(app, {
+      name: 'Authoritative owned SKU', type: 'owned_product', entityType: 'owned_product',
+      entityId: product.id, createdBy: 'E2E Runner', input: {}, taskBook: {},
+    });
+
+    const result = await runJob(app, job.id);
+    const evidence = (await request(app).get(`/api/research-jobs/${job.id}/evidence`).expect(200))
+      .body.data as WorkflowEvidence[];
+
+    expect(result).toMatchObject({ status: 'monitoring', latestRuleExecution: {
+      output: { sku_growth_30d: 20, relative_delta: 5 },
+    } });
+    expect(evidence.find((item) => item.metricName === 'sku_growth_30d')).toMatchObject({
+      metricValue: 20, sourceType: 'amazon', sourceRecordId: 'amazon-sep',
+    });
+  });
+
+  it('compares monthly Amazon Business Reports while preserving their exact observation periods', async () => {
+    const app = testApp();
+    await importCsv(app, 'market', 'market-june.csv', grayMarketCsv('2026-06-30', 20_000));
+    await importCsv(app, 'market', 'market-july.csv', grayMarketCsv('2026-07-31', 23_000));
+    const report = (units: number) => [
+      '(Parent) ASIN,(Child) ASIN,Title,SKU,Units Ordered,Ordered Product Sales,Sessions - Total',
+      `B0PARENT01,B0ACTUAL01,Contour Pillow,PILLOW-01,${units},"$1,299.50",803`,
+    ].join('\n');
+    await previewAndConfirmCsv(app, report(100), 'sales-june.csv', {
+      entityType: 'product', sourceType: 'amazon', marketplace: 'US',
+      reportStartDate: '2026-06-01', reportEndDate: '2026-06-30',
+    });
+    await previewAndConfirmCsv(app, report(120), 'sales-july.csv', {
+      entityType: 'product', sourceType: 'amazon', marketplace: 'US',
+      reportStartDate: '2026-07-01', reportEndDate: '2026-07-31',
+    });
+    const product = database!.prepare("SELECT id FROM products WHERE asin = 'B0ACTUAL01'")
+      .get() as { id: string };
+    database!.prepare("UPDATE products SET market_node_id = 'mkt-gray-e2e' WHERE id = ?")
+      .run(product.id);
+    const observations = database!.prepare(`
+      SELECT id, period FROM product_snapshots WHERE product_id = ? ORDER BY observation_date
+    `).all(product.id) as Array<{ id: string; period: string }>;
+    expect(observations.map((item) => item.period)).toEqual([
+      '2026-06-01/2026-06-30', '2026-07-01/2026-07-31',
+    ]);
+    const job = await createJob(app, {
+      name: 'Monthly actual SKU trend', type: 'owned_product', entityType: 'owned_product',
+      entityId: product.id, createdBy: 'E2E Runner', input: {}, taskBook: {},
+    });
+
+    const result = await runJob(app, job.id);
+    const evidence = (await request(app).get(`/api/research-jobs/${job.id}/evidence`).expect(200))
+      .body.data as WorkflowEvidence[];
+
+    expect(result).toMatchObject({ status: 'monitoring', latestRuleExecution: {
+      output: { sku_growth_30d: 20, market_growth_30d: 15, relative_delta: 5 },
+    } });
+    expect(evidence.find((item) => item.metricName === 'sku_growth_30d')).toMatchObject({
+      metricValue: 20, sourceType: 'amazon', sourceRecordId: observations[1].id,
+      period: '30D',
+    });
+    expect(new IntelligenceRepository(database!).getProductSnapshots(product.id).at(-1))
+      .toMatchObject({ estimatedSales: 120, provenance: {
+        sourceType: 'amazon', period: '2026-07-01/2026-07-31',
+      } });
+  });
+
+  it('keeps selected MCP fact lineage in direct-competitor Evidence despite import snapshots', async () => {
+    const app = testApp();
+    await importCsv(app, 'product', 'owned-baseline.csv', graySkuCsv('2026-08-10', 100, 0));
+    await importCsv(app, 'product', 'owned-current.csv', graySkuCsv('2026-09-09', 110, 0));
+    await importCsv(app, 'market', 'market-baseline.csv', grayMarketCsv('2026-08-10', 20_000));
+    await importCsv(app, 'market', 'market-current.csv', grayMarketCsv('2026-09-09', 23_000));
+    const product = (await request(app).get('/api/owned-products').expect(200)).body.data
+      .find((item: { asin: string }) => item.asin === 'B0GRAYE2E01') as { id: string };
+    database!.prepare(`
+      INSERT INTO products (
+        id, asin, brand, title, image_url, marketplace, product_type,
+        is_owned, market_node_id, source_type, created_at
+      ) VALUES ('competitor-lineage', 'B0COMPET01', 'Peer', 'Comparable pillow', '',
+        'US', 'competitor', 0, 'mkt-gray-e2e', 'import', '2026-09-10T00:00:00Z')
+    `).run();
+    database!.prepare(`
+      INSERT INTO competitor_relations (
+        id, owned_product_id, competitor_product_id, relation_type,
+        similarity_score, reason, ai_tags_json, created_at, last_verified_at
+      ) VALUES ('confirmed-peer-lineage', ?, 'competitor-lineage', 'direct',
+        85, 'Human-reviewed peer', '[]', '2026-09-10T00:00:00Z', '2026-09-10T00:00:00Z')
+    `).run(product.id);
+    for (const [date, importedSales, mcpSales, suffix, importPeriod] of [
+      ['2026-08-10', 500, 100, 'aug', '7D'],
+      ['2026-09-09', 900, 120, 'sep', '30D'],
+    ] as const) {
+      database!.prepare(`
+        INSERT INTO product_snapshots (
+          id, product_id, date, estimated_sales, bsr, source, source_type,
+          collected_at, period, is_estimated, confidence, observation_date, dedup_key
+        ) VALUES (?, 'competitor-lineage', ?, ?, 100, 'SellerSprite Import', 'import',
+          '2026-09-20T00:00:00Z', ?, 1, 0.8, ?, ?)
+      `).run(`peer-import-${suffix}`, date, importedSales, importPeriod, date, `peer-import-${suffix}`);
+      database!.prepare(`
+        INSERT INTO metric_facts (
+          id, entity_type, entity_id, marketplace, metric_name, numeric_value,
+          source, source_id, source_type, is_estimated, confidence,
+          observation_date, collected_at, dedup_key
+        ) VALUES (?, 'competitor', 'competitor-lineage', 'US', 'estimated_sales', ?,
+          'SellerSprite MCP', 'source-sellersprite-mcp', 'mcp', 1, 0.8, ?,
+          '2026-09-10T00:00:00Z', ?)
+      `).run(`peer-mcp-fact-${suffix}`, mcpSales, date, `peer-mcp-fact-${suffix}`);
+    }
+    const job = await createJob(app, {
+      name: 'Competitor fact lineage', type: 'owned_product', entityType: 'owned_product',
+      entityId: product.id, createdBy: 'E2E Runner', input: {}, taskBook: {},
+    });
+
+    const result = await runJob(app, job.id);
+    const evidence = (await request(app).get(`/api/research-jobs/${job.id}/evidence`).expect(200))
+      .body.data as WorkflowEvidence[];
+
+    expect(result).toMatchObject({ status: 'monitoring', latestRuleExecution: {
+      output: { direct_competitor_growth_30d: 20, top100_growth_30d: 20 },
+    } });
+    for (const metric of ['direct_competitor_growth_30d', 'top100_growth_30d']) {
+      expect(evidence.find((item) => item.metricName === metric)).toMatchObject({
+        metricValue: 20, sourceType: 'mcp', sourceRecordId: 'peer-mcp-fact-sep',
+      });
+    }
+  });
+
+  it('does not count mixed-source child-market observations as comparable submarket history', async () => {
+    const app = testApp();
+    await importCsv(app, 'market', 'market-baseline.csv', grayMarketCsv('2026-08-10', 20_000));
+    await importCsv(app, 'market', 'market-current.csv', grayMarketCsv('2026-09-09', 23_000));
+    database!.prepare(`
+      INSERT INTO market_nodes (id, name, parent_id, level, marketplace, status, source_type, created_at)
+      VALUES ('mkt-gray-child', 'Child memory foam pillows', 'mkt-gray-e2e', 2, 'US',
+        'active', 'import', '2026-09-10T00:00:00Z')
+    `).run();
+    for (const [id, date, sales, source, sourceType, collectedAt] of [
+      ['child-import-aug', '2026-08-10', 100, 'SellerSprite Import', 'import', '2026-08-11T00:00:00Z'],
+      ['child-mcp-sep', '2026-09-09', 120, 'SellerSprite MCP', 'mcp', '2026-09-10T00:00:00Z'],
+      ['child-import-sep', '2026-09-09', 900, 'SellerSprite Import', 'import', '2026-09-20T00:00:00Z'],
+    ] as const) {
+      database!.prepare(`
+        INSERT INTO market_snapshots (
+          id, market_node_id, date, monthly_sales, source, source_type,
+          collected_at, period, is_estimated, confidence, observation_date, dedup_key
+        ) VALUES (?, 'mkt-gray-child', ?, ?, ?, ?, ?,
+          '30D', 1, 0.8, ?, ?)
+      `).run(id, date, sales, source, sourceType, collectedAt, date, id);
+    }
+    const job = await createJob(app, {
+      name: 'Mixed child-market history', type: 'existing_market', entityType: 'market_node',
+      entityId: 'mkt-gray-e2e', createdBy: 'E2E Runner', input: {}, taskBook: {},
+    });
+
+    const result = await runJob(app, job.id);
+
+    expect(result).toMatchObject({ status: 'monitoring', latestRuleExecution: {
+      output: { diagnostic_coverage: { submarket_history: false } },
+    } });
+    expect(result.latestInsight?.missingData).toContain('submarket_history');
+  });
+
   it('appends both snapshot observations and calculates gray SKU -5% versus market +15% as -20pp', async () => {
     const app = testApp();
 

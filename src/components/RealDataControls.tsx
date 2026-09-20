@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react';
 import { DatabaseBackup, PlugZap, RefreshCw, Save, ShieldCheck, Trash2 } from 'lucide-react';
-import { api } from '../lib/api';
+import { api, ApiError } from '../lib/api';
 
 interface ConnectionDiagnostics {
   connected: boolean;
@@ -37,6 +37,7 @@ interface GoLiveVerification {
   sellerSpriteCapabilitiesAvailable: boolean;
   sellerSpriteMarketCalls: number;
   sellerSpriteAsinCalls: number;
+  readyForDemoCleanup: boolean;
   hasMinimumRealCoverage: boolean;
 }
 
@@ -129,7 +130,14 @@ export default function RealDataControls({
     setError(null);
     setNotice(null);
     try { await action(); }
-    catch { setError('操作失败，请检查服务端配置或数据覆盖。'); }
+    catch (failure) {
+      if (failure instanceof ApiError && failure.status === 409 && failure.message.startsWith('备份已过期')) {
+        setBackupName(null);
+        setError('备份已过期：数据库已变更，请重新备份。');
+      } else {
+        setError('操作失败，请检查服务端配置或数据覆盖。');
+      }
+    }
     finally { setBusy(false); }
   }
 
@@ -185,6 +193,7 @@ export default function RealDataControls({
               });
               setMappedPath(nodePath);
               setMappingConfirmed(false);
+              setBackupName(null);
               setNotice('市场节点映射已保存。');
             })}><Save size={16} />保存映射</button>
         </div>
@@ -200,6 +209,7 @@ export default function RealDataControls({
                 marketId,
                 month: month.replace('-', ''),
               });
+              setBackupName(null);
               setNotice('关键市场与自有 SKU 历史已同步。');
               await refresh();
             })}>
@@ -240,7 +250,8 @@ export default function RealDataControls({
         {verification && (
           <div className="real-data-verification" role="status">
             <ShieldCheck size={17} />
-            <span>{verification.hasMinimumRealCoverage ? '真实数据覆盖满足切换条件' : '真实数据覆盖不足'} ·
+            <span>{verification.readyForDemoCleanup ? '清理前真实链路已通过' : '清理前真实链路未通过'} ·
+              {' '}{verification.hasMinimumRealCoverage ? 'Live 切换条件已满足' : 'Live 切换条件未满足'} ·
               {' '}主市场 {verification.realMarketSnapshots} · 自有 SKU {verification.realOwnedProductSnapshots} / {verification.activeOwnedProducts} · Mock {verification.mockObservations}
               <br />SellerSprite 连接 {verification.sellerSpriteConnectionVerified ? '已验证' : '未验证'} · 市场 {verification.sellerSpriteMarketSnapshots} · 自有 SKU {verification.sellerSpriteOwnedProductSnapshots} ·
               {' '}能力 {verification.sellerSpriteCapabilitiesAvailable ? '已发现' : '未验证'} · 市场调用 {verification.sellerSpriteMarketCalls} · ASIN 调用 {verification.sellerSpriteAsinCalls}</span>
@@ -263,7 +274,8 @@ export default function RealDataControls({
               onChange={(event) => setCleanupText(event.target.value)} placeholder="CLEAR DEMO DATA" />
           </label>
           <button className="button button-danger" type="button"
-            disabled={busy || isViewer || !backupName || Boolean(preview?.blockers?.length) || cleanupText !== 'CLEAR DEMO DATA'}
+            disabled={busy || isViewer || verification?.readyForDemoCleanup !== true || !backupName
+              || Boolean(preview?.blockers?.length) || cleanupText !== 'CLEAR DEMO DATA'}
             onClick={() => void run(async () => {
               await api.post('/api/go-live/cleanup', { confirmation: cleanupText });
               setCleanupText('');

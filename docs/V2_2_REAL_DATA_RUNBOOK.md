@@ -35,13 +35,14 @@ npm run dev
 
 ## Demo 清理与 Live 激活
 
-只有真实链路和产品身份已核对后，才在“设置 -> 数据源 -> Go Live 迁移”操作：
+只有真实链路和产品身份已核对后，才在“设置 -> 数据源 -> Go Live 迁移”操作。不要先清 Demo 再尝试证明真实链路：
 
 1. 查看 Dry Run 的预计删除、归档、保留和引用阻断项；先处理真实工作流对 Demo 记录的引用。清理只针对明确登记或可识别的 Demo 观察及相关演示实体，不是数据库重置；产品主数据、规则和真实历史应保留，未知或混合来源的 Mock 记录会阻断清理。
-2. 点击“备份数据库”，确认备份创建。备份目录默认为 `data/backups/`，位于本机且不进 Git；另行按业务要求保护和保留备份。
-3. 输入精确确认文本 `CLEAR DEMO DATA`，再清除演示数据。没有真实快照/引用的 4 个种子自有 SKU 和 8 个种子竞品会归档为 inactive，主档仍保留；已有真实引用的种子产品不会被盲目归档。清理后重新检查预览和数据覆盖。
-4. 在“数据任务”查看主市场、active 自有产品、核心竞品、90 天历史及 Amazon 实际值的覆盖。Go Live 校验还要求 Mock 观察为零、当前主市场有有意义的真实与 MCP 快照、自有产品均有真实快照、至少一个自有 ASIN 有 MCP 快照、必需 MCP 能力、近 24 小时内已连接验证/同步以及匹配当前节点/自有 ASIN 的成功调用账本。覆盖不足时保持非 Live，不绕过校验。
-5. 只有 `/api/go-live/verify` 的 `hasMinimumRealCoverage` 为 `true`，才输入 `ACTIVATE LIVE` 切换。切换后刷新驾驶舱，核对真实来源、趋势、缺失提示及 Evidence。Live 同步失败应保留上一版真实快照并显示未更新，不得使用 Mock 兜底。
+2. **备份和清理之前**，先验证当前站点的主市场节点有带有效业务指标的真实 MCP 市场 Snapshot，且 MCP 调用账本记录了匹配当前节点的成功调用；至少一个该市场节点或子节点中 active **自有** ASIN 有非 Mock 主档、MCP 历史 Snapshot 和匹配该 ASIN 的成功趋势调用。核对站点、节点路径、ASIN、来源及采集日期；公开竞品 ASIN 或 Demo Snapshot 不可替代。刷新迁移状态，只有 `/api/go-live/verify` 的 `readyForDemoCleanup` 为 `true`，才继续备份和清理。这只是清理前证明，**不代表**已满足 Live 切换条件。
+3. 点击“备份数据库”，确认备份创建。备份目录默认为 `data/backups/`，位于本机且不进 Git；另行按业务要求保护和保留备份。备份后若数据库又发生写入（包括重新同步或导入），原备份会过期，清理前必须重新备份。
+4. 输入精确确认文本 `CLEAR DEMO DATA`，再清除演示数据。缺少清理前证明、备份或有引用阻断项时按钮不可用，服务端也会拒绝清理。没有真实快照/引用的 4 个种子自有 SKU 和 8 个种子竞品会归档为 inactive，主档仍保留；已有真实引用的种子产品不会被盲目归档。清理后重新检查预览和数据覆盖。
+5. 在“数据任务”查看主市场、active 自有产品、核心竞品、90 天历史及 Amazon 实际值的覆盖。Go Live 校验还要求 Mock 观察为零、当前主市场有有意义的真实与 MCP 快照、自有产品均有真实快照、至少一个自有 ASIN 有 MCP 快照、必需 MCP 能力、近 24 小时内已连接验证/同步以及匹配当前节点/自有 ASIN 的成功调用账本。覆盖不足时保持非 Live，不绕过校验。
+6. 只有 `/api/go-live/verify` 的 `hasMinimumRealCoverage` 为 `true`，才输入 `ACTIVATE LIVE` 切换。切换后刷新驾驶舱，核对真实来源、趋势、缺失提示及 Evidence。Live 同步失败应保留上一版真实快照并显示未更新，不得使用 Mock 兜底。
 
 服务端对应的诊断和操作接口为 `/api/integrations/sellersprite/test`、`/api/integrations/sellersprite/capabilities`、`/api/integrations/sellersprite/sync/critical`、`/api/integrations/sellersprite/sync/competitor`、`/api/data-coverage` 与 `/api/go-live/{preview,backup,cleanup,verify,activate}`。写操作仅用于当前本地 Admin 角色；备份后同一服务进程内才允许清理。MCP 调用账本记录工具、范围实体、结果数量、参数哈希、状态、耗时和缓存命中，不记录 Secret。
 

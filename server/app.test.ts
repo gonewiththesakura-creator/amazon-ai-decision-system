@@ -8,6 +8,7 @@ import type { SellerSpriteConnectionDiagnostics } from './adapters/sellersprite-
 import { createApp } from './app.js';
 import { openDatabase, type AppDatabase } from './database/database.js';
 import { previewAndConfirmCsv } from './test-utils/import-api.js';
+import { addVerifiedMcpCoverage } from './test-utils/verified-mcp-coverage.js';
 import type { SellerSpriteSyncPort } from './services/sellersprite-sync-service.js';
 
 let database: AppDatabase | undefined;
@@ -89,11 +90,38 @@ describe('V2.2 real-data administration routes', () => {
     const backup = await request(app).post('/api/go-live/backup').send({}).expect(201);
     expect(backup.body.data).toMatchObject({ created: true, filename: expect.stringMatching(/\.db$/) });
     await request(app).post('/api/go-live/cleanup')
+      .send({ confirmation: 'CLEAR DEMO DATA' }).expect(409);
+    expect((await request(app).get('/api/go-live/verify').expect(200)).body.data)
+      .toMatchObject({ readyForDemoCleanup: false, hasMinimumRealCoverage: false });
+    addVerifiedMcpCoverage(database);
+    expect((await request(app).get('/api/go-live/verify').expect(200)).body.data)
+      .toMatchObject({ readyForDemoCleanup: true, hasMinimumRealCoverage: false });
+    await request(app).post('/api/go-live/cleanup')
+      .send({ confirmation: 'CLEAR DEMO DATA' }).expect(409);
+    const freshBackup = await request(app).post('/api/go-live/backup').send({}).expect(201);
+    expect(freshBackup.body.data.filename).not.toBe(backup.body.data.filename);
+    await request(app).post('/api/go-live/cleanup')
       .send({ confirmation: 'CLEAR DEMO DATA' }).expect(200);
     const verification = await request(app).get('/api/go-live/verify').expect(200);
-    expect(verification.body.data).toMatchObject({ mockObservations: 0, hasMinimumRealCoverage: false });
+    expect(verification.body.data).toMatchObject({ mockObservations: 0, hasMinimumRealCoverage: true });
     await request(app).post('/api/go-live/activate')
-      .send({ confirmation: 'ACTIVATE LIVE' }).expect(409);
+      .send({ confirmation: 'ACTIVATE LIVE' }).expect(200);
+  });
+
+  it('expires a Go Live backup when another database connection writes afterward', async () => {
+    temporaryDirectory = mkdtempSync(join(tmpdir(), 'ys-go-live-external-write-'));
+    database = openDatabase(join(temporaryDirectory, 'business.db'));
+    const app = createApp({ database, backupDirectory: temporaryDirectory });
+    await request(app).post('/api/go-live/backup').send({}).expect(201);
+    const otherConnection = openDatabase(join(temporaryDirectory, 'business.db'));
+    try {
+      otherConnection.prepare(`UPDATE app_settings SET refresh_frequency = 'weekly' WHERE id = 1`).run();
+    } finally {
+      otherConnection.close();
+    }
+    const cleanup = await request(app).post('/api/go-live/cleanup')
+      .send({ confirmation: 'CLEAR DEMO DATA' }).expect(409);
+    expect(cleanup.body.error).toMatch(/备份已过期/);
   });
 
   it('returns only sanitized SellerSprite connection and capability diagnostics', async () => {
@@ -781,6 +809,9 @@ describe('workflow mutations', () => {
 
     await request(app).post('/api/settings/demo').send({ enabled: true }).expect(200);
     await request(app).post('/api/settings/demo').send({ enabled: false }).expect(409);
+    const importedMarketId = (database!.prepare('SELECT market_node_id FROM products WHERE id = ?')
+      .get(importedProduct.id) as { market_node_id: string }).market_node_id;
+    addVerifiedMcpCoverage(database!, importedMarketId, importedProduct.id);
     temporaryDirectory = mkdtempSync(join(tmpdir(), 'ys-demo-cleanup-'));
     const migrationApp = createApp({ database: database!, backupDirectory: temporaryDirectory });
     await request(migrationApp).post('/api/go-live/backup').send({}).expect(201);

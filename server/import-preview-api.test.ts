@@ -6,6 +6,7 @@ import { SellerSpriteImportAdapter } from './adapters/import-adapters.js';
 import { createApp } from './app.js';
 import { disableDemoMode, seedDemoData } from './database/demo-seed.js';
 import { GoLiveMigrationService } from './services/go-live-migration-service.js';
+import { addVerifiedMcpCoverage } from './test-utils/verified-mcp-coverage.js';
 
 let database: AppDatabase | undefined;
 
@@ -162,6 +163,9 @@ describe('import preview API', () => {
 
     expect(() => disableDemoMode(database!)).toThrow(/Go Live/);
     expect(new GoLiveMigrationService(database).preview().blockers).toEqual([]);
+    const importedProduct = database.prepare(`SELECT id, market_node_id FROM products WHERE asin = 'B0REAL0001'`)
+      .get() as { id: string; market_node_id: string };
+    addVerifiedMcpCoverage(database, importedProduct.market_node_id, importedProduct.id);
     new GoLiveMigrationService(database).clearDemoObservations();
     disableDemoMode(database);
     expect(database.prepare('SELECT mode FROM app_settings WHERE id = 1').get()).toMatchObject({ mode: 'empty' });

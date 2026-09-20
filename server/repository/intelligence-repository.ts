@@ -559,9 +559,24 @@ export class IntelligenceRepository {
     }
     const authority = new MetricAuthorityResolver(this.database);
     return [...byDate.entries()].map(([date, candidates]) => {
-      const resolve = (metric: string) => authority.resolveMetric({
-        entityType, entityId, metric, observationDate: date,
-      }).selected;
+      const resolve = (metric: string): MetricFact | null => {
+        const selected = authority.resolveMetric({
+          entityType, entityId, metric, observationDate: date,
+        }).selected;
+        if (entityType !== 'competitor'
+          || (selected?.sourceRecordType === 'metric_fact' && selected.sourceType === 'mcp'
+            && selected.sourceId === 'source-sellersprite-mcp')) return selected;
+
+        // Pre-fix competitor syncs saved facts under 'product'. Keep those immutable
+        // records usable until a canonical competitor fact exists for this metric.
+        const historical = authority.resolveMetric({
+          entityType: 'product', entityId, metric, observationDate: date,
+        });
+        return [historical.selected, ...historical.alternatives].find((fact) => (
+          fact?.sourceRecordType === 'metric_fact' && fact.sourceType === 'mcp'
+            && fact.sourceId === 'source-sellersprite-mcp'
+        )) ?? selected;
+      };
       const primary = resolve(primaryMetric);
       const representative = candidates.find((row) => row.id === primary?.id)
         ?? candidates.find((row) => (

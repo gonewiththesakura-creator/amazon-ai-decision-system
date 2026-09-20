@@ -15,16 +15,27 @@ const preview = {
 };
 const verification = {
   mockObservations: 6, realMarketSnapshots: 0, realOwnedProductSnapshots: 0,
-  activeOwnedProducts: 4, sellerSpriteConnectionVerified: false, hasMinimumRealCoverage: false,
+  activeOwnedProducts: 4, sellerSpriteMarketSnapshots: 0, sellerSpriteOwnedProductSnapshots: 0,
+  sellerSpriteConnectionVerified: false, sellerSpriteCapabilitiesAvailable: false,
+  sellerSpriteMarketCalls: 0, sellerSpriteAsinCalls: 0,
+  readyForDemoCleanup: false, hasMinimumRealCoverage: false,
 };
+let currentVerification = verification;
+let cleanupExpired = false;
 
 const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
   const url = String(input);
+  if (url.endsWith('/api/go-live/cleanup') && cleanupExpired) {
+    return {
+      ok: false, status: 409, headers: { get: () => 'application/json' },
+      json: async () => ({ error: '备份已过期：数据库在备份后发生变更，请重新备份。' }),
+    } as unknown as Response;
+  }
   const data = url.endsWith('/api/go-live/preview') ? preview
     : url.endsWith('/api/markets/market-1') ? { node: { categoryId: '' } }
       : url.endsWith('/api/markets/market-1/sellersprite-node')
         ? { marketId: 'market-1', nodeIdPath: '1055398:1063252:1199122:10671043011' }
-    : url.endsWith('/api/go-live/verify') ? verification
+    : url.endsWith('/api/go-live/verify') ? currentVerification
       : url.endsWith('/api/integrations/sellersprite/capabilities')
         ? { toolCount: 0, required: [], collectedAt: null }
         : url.endsWith('/api/integrations/sellersprite/test')
@@ -46,16 +57,56 @@ afterEach(() => {
   cleanup();
   vi.unstubAllGlobals();
   fetchMock.mockClear();
+  currentVerification = verification;
+  cleanupExpired = false;
 });
 
 describe('real-data administration controls', () => {
+  it('requires another backup when the database changed after backup', async () => {
+    currentVerification = { ...verification, readyForDemoCleanup: true };
+    cleanupExpired = true;
+    vi.stubGlobal('fetch', fetchMock);
+    render(<RealDataControls isViewer={false} marketId="market-1" />);
+
+    await screen.findByText(/清理前真实链路已通过/);
+    fireEvent.click(screen.getByRole('button', { name: '备份数据库' }));
+    await waitFor(() => expect(screen.getByText(/backup.db/)).toBeInTheDocument());
+    fireEvent.change(screen.getByLabelText('清理确认文本'), { target: { value: 'CLEAR DEMO DATA' } });
+    fireEvent.click(screen.getByRole('button', { name: '清除演示数据' }));
+
+    expect(await screen.findByRole('alert')).toHaveTextContent(/备份已过期.*重新备份/);
+    expect(screen.queryByText('backup.db')).not.toBeInTheDocument();
+    expect(screen.getByRole('button', { name: '清除演示数据' })).toBeDisabled();
+  });
+
+  it('keeps demo cleanup disabled when pre-cleanup real proof is missing', async () => {
+    vi.stubGlobal('fetch', fetchMock);
+    render(<RealDataControls isViewer={false} marketId="market-1" />);
+
+    expect(await screen.findByText(/清理前真实链路未通过/)).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: '备份数据库' }));
+    await waitFor(() => expect(screen.getByText(/backup.db/)).toBeInTheDocument());
+    fireEvent.change(screen.getByLabelText('清理确认文本'), { target: { value: 'CLEAR DEMO DATA' } });
+    expect(screen.getByRole('button', { name: '清除演示数据' })).toBeDisabled();
+    expect(fetchMock).not.toHaveBeenCalledWith('/api/go-live/cleanup', expect.anything());
+  });
+
   it('shows sanitized diagnostics and requires backup plus exact confirmation before cleanup', async () => {
+    currentVerification = {
+      ...verification,
+      realMarketSnapshots: 1, realOwnedProductSnapshots: 1,
+      sellerSpriteMarketSnapshots: 1, sellerSpriteOwnedProductSnapshots: 1,
+      sellerSpriteConnectionVerified: true, sellerSpriteCapabilitiesAvailable: true,
+      sellerSpriteMarketCalls: 1, sellerSpriteAsinCalls: 1,
+      readyForDemoCleanup: true,
+    };
     vi.stubGlobal('fetch', fetchMock);
     render(<RealDataControls isViewer={false} marketId="market-1" />);
 
     expect(await screen.findByText('Market Snapshots: 2')).toBeInTheDocument();
     expect(screen.getByText('演示产品主档: 12')).toBeInTheDocument();
-    expect(screen.getByText(/连接 未验证/)).toBeInTheDocument();
+    expect(screen.getByText(/清理前真实链路已通过/)).toBeInTheDocument();
+    expect(screen.getByText(/Live 切换条件未满足/)).toBeInTheDocument();
     expect(screen.getByRole('button', { name: '清除演示数据' })).toBeDisabled();
     fireEvent.click(screen.getByRole('button', { name: '连接测试' }));
     expect(await screen.findByText(/已认证.*49 个工具/)).toBeInTheDocument();

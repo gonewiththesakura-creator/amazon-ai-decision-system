@@ -1,4 +1,5 @@
 import { existsSync, mkdirSync } from 'node:fs';
+import { randomUUID } from 'node:crypto';
 import { basename, join, resolve } from 'node:path';
 import express, { type NextFunction, type Request, type Response } from 'express';
 import multer from 'multer';
@@ -148,7 +149,12 @@ export function createApp(options: CreateAppOptions = {}): express.Express {
     limits: { fileSize: 15 * 1024 * 1024, files: 1 },
   });
   const app = express();
-  let latestGoLiveBackup: { filename: string; createdAt: string } | null = null;
+  let latestGoLiveBackup: { filename: string; createdAt: string; revision: string } | null = null;
+  const databaseRevision = (): string => {
+    const ownWrites = database.prepare('SELECT total_changes() AS count').get() as { count: number };
+    const otherWrites = database.prepare('PRAGMA data_version').get() as { data_version: number };
+    return `${ownWrites.count}:${otherWrites.data_version}`;
+  };
   app.locals.database = database;
 
   app.disable('x-powered-by');
@@ -193,10 +199,17 @@ export function createApp(options: CreateAppOptions = {}): express.Express {
   app.post('/api/go-live/backup', adminOnly, asyncHandler(async (_request, response) => {
     const backupDirectory = resolve(options.backupDirectory ?? join('data', 'backups'));
     mkdirSync(backupDirectory, { recursive: true });
-    const filename = `opportunity-intelligence-${Date.now()}.db`;
+    const filename = `opportunity-intelligence-${Date.now()}-${randomUUID()}.db`;
+    const revisionBefore = databaseRevision();
     await goLive.backup(join(backupDirectory, filename));
-    latestGoLiveBackup = { filename, createdAt: new Date().toISOString() };
-    sendData(response, { created: true, ...latestGoLiveBackup }, repository, 201);
+    const revision = databaseRevision();
+    if (revision !== revisionBefore) {
+      latestGoLiveBackup = null;
+      throw httpError(409, '备份期间数据库已变更，请重新备份。');
+    }
+    const createdAt = new Date().toISOString();
+    latestGoLiveBackup = { filename, createdAt, revision };
+    sendData(response, { created: true, filename, createdAt }, repository, 201);
   }));
   app.post('/api/go-live/cleanup', adminOnly, (request, response) => {
     const input = z.object({ confirmation: z.string() }).parse(request.body ?? {});
@@ -204,6 +217,10 @@ export function createApp(options: CreateAppOptions = {}): express.Express {
       throw httpError(409, '确认文本不匹配，未清除任何数据。');
     }
     if (!latestGoLiveBackup) throw httpError(409, '清除 Demo 前必须先创建数据库备份。');
+    if (latestGoLiveBackup.revision !== databaseRevision()) {
+      latestGoLiveBackup = null;
+      throw httpError(409, '备份已过期：数据库在备份后发生变更，请重新备份。');
+    }
     sendData(response, {
       cleanup: goLive.clearDemoObservations(),
       backup: { filename: basename(latestGoLiveBackup.filename), createdAt: latestGoLiveBackup.createdAt },

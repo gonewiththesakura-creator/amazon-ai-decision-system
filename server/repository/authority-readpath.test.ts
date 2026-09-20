@@ -201,6 +201,54 @@ describe('read-time metric authority', () => {
       .toMatchObject({ source: 'Amazon SP-API', numeric_value: 140 });
   });
 
+  it('preserves lineage for historical competitor MCP facts recorded as product facts', () => {
+    const { db, repository } = openFixture();
+    db.prepare(`
+      INSERT INTO products (
+        id, asin, brand, title, image_url, marketplace, product_type,
+        is_owned, market_node_id, source_type, created_at
+      ) VALUES ('rival', 'B0RIVAL001', 'Rival', 'Rival pillow', '', 'US',
+        'competitor', 0, 'market-us', 'mcp', '2026-09-18T00:00:00Z')
+    `).run();
+    db.prepare(`
+      INSERT INTO product_snapshots (
+        id, product_id, date, estimated_sales, source, source_type,
+        collected_at, period, is_estimated, confidence, observation_date, dedup_key
+      ) VALUES (
+        'rival-mcp', 'rival', '2026-09-18', 120, 'SellerSprite MCP', 'mcp',
+        '2026-09-19T00:00:00Z', '1M', 1, 0.85, '2026-09-18', 'rival-mcp'
+      ), (
+        'rival-import', 'rival', '2026-09-18', 900, 'SellerSprite CSV', 'import',
+        '2026-09-20T00:00:00Z', '1M', 1, 0.99, '2026-09-18', 'rival-import'
+      )
+    `).run();
+    db.prepare(`
+      INSERT INTO metric_facts (
+        id, entity_type, entity_id, marketplace, metric_name, numeric_value,
+        source, source_id, source_type, is_estimated, confidence,
+        observation_date, collected_at, dedup_key
+      ) VALUES (
+        'historical-rival-sales', 'product', 'rival', 'US', 'estimated_sales', 125,
+        'SellerSprite MCP', 'source-sellersprite-mcp', 'mcp', 1, 0.85,
+        '2026-09-18', '2026-09-19T00:00:00Z', 'historical-rival-sales'
+      )
+    `).run();
+
+    const selected = repository.getProductSnapshots('rival')[0];
+    expect(selected).toMatchObject({
+      estimatedSales: 125,
+      provenance: { source: 'SellerSprite MCP', sourceType: 'mcp' },
+      metricProvenance: {
+        estimated_sales: {
+          sourceRecordId: 'historical-rival-sales', sourceRecordType: 'metric_fact',
+        },
+      },
+    });
+    expect(db.prepare(`SELECT entity_type, numeric_value FROM metric_facts WHERE id = ?`)
+      .get(selected.metricProvenance?.estimated_sales.sourceRecordId ?? ''))
+      .toEqual({ entity_type: 'product', numeric_value: 125 });
+  });
+
   it('excludes archived seed SKUs from active owned and market portfolios without deleting their history', () => {
     const { db, repository } = openFixture();
     addProduct(db);

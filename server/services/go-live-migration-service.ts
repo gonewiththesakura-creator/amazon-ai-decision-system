@@ -24,6 +24,7 @@ export interface GoLiveVerification {
   sellerSpriteCapabilitiesAvailable: boolean;
   sellerSpriteMarketCalls: number;
   sellerSpriteAsinCalls: number;
+  readyForDemoCleanup: boolean;
   hasMinimumRealCoverage: boolean;
 }
 
@@ -152,6 +153,9 @@ export class GoLiveMigrationService {
     transaction(this.database, () => {
       const blockers = this.cleanupBlockers();
       if (blockers.length > 0) throw new Error(`Demo 记录存在引用或未归属的 Mock 观察，禁止清理：${blockers.join('；')}`);
+      if (!this.verify().readyForDemoCleanup) {
+        throw new Error('Go Live 迁移需要先验证真实 SellerSprite MCP 市场及自有 ASIN 数据，禁止清理 Demo。');
+      }
       for (const table of [
         'import_batches', 'competitor_relations', 'watchlist_items', 'development_projects',
         'opportunities', 'research_results', 'ai_insights', 'product_snapshots', 'market_snapshots', 'data_tasks',
@@ -198,6 +202,10 @@ export class GoLiveMigrationService {
     const activeOwnedProducts = this.count(`
       SELECT COUNT(*) AS count FROM products WHERE is_owned = 1 AND status = 'active' AND marketplace = ?
     `, false, settings.marketplace);
+    const activeMockOwnedProducts = this.count(`
+      SELECT COUNT(*) AS count FROM products
+      WHERE is_owned = 1 AND status = 'active' AND source_type = 'mock' AND marketplace = ?
+    `, false, settings.marketplace);
     const realOwnedProductSnapshots = this.count(`
       SELECT COUNT(DISTINCT snapshot.product_id) AS count
       FROM product_snapshots snapshot
@@ -238,17 +246,37 @@ export class GoLiveMigrationService {
           SELECT category_id FROM market_nodes WHERE id = ? AND marketplace = ?)
         AND result_count > 0
     `, false, settings.default_market_id, settings.marketplace);
+    const marketNode = this.database.prepare(`
+      SELECT category_id FROM market_nodes WHERE id = ? AND marketplace = ?
+    `).get(settings.default_market_id, settings.marketplace) as { category_id: string | null } | undefined;
+    const verifiedMarketPath = /^\d+(?::\d+)*$/.test(marketNode?.category_id ?? '');
     const sellerSpriteAsinCalls = this.count(`
+      WITH RECURSIVE market_scope(id) AS (
+        SELECT id FROM market_nodes WHERE id = ? AND marketplace = ?
+        UNION
+        SELECT child.id FROM market_nodes child
+        JOIN market_scope parent ON child.parent_id = parent.id
+        WHERE child.marketplace = ?
+      )
       SELECT COUNT(*) AS count FROM mcp_call_logs log
       JOIN products product ON product.asin = log.entity_id
-        AND product.is_owned = 1 AND product.status = 'active' AND product.marketplace = ?
+        AND product.is_owned = 1 AND product.status = 'active'
+        AND product.source_type <> 'mock' AND product.marketplace = ?
+      JOIN market_scope scope ON scope.id = product.market_node_id
       WHERE log.provider_id = 'sellersprite' AND log.status = 'success'
         AND log.capability = 'ASIN_SALES_TREND' AND log.entity_type = 'product'
         AND log.result_count > 0
         AND EXISTS (SELECT 1 FROM product_snapshots snapshot
           WHERE snapshot.product_id = product.id AND snapshot.source_type = 'mcp'
             AND ${PRODUCT_METRICS})
-    `, false, settings.marketplace);
+    `, false, settings.default_market_id, settings.marketplace,
+      settings.marketplace, settings.marketplace);
+    const readyForDemoCleanup = verifiedMarketPath
+      && sellerSpriteConnectionVerified
+      && sellerSpriteCapabilitiesAvailable
+      && sellerSpriteMarketSnapshots > 0
+      && sellerSpriteMarketCalls > 0
+      && sellerSpriteAsinCalls > 0;
     return {
       mockObservations,
       realMarketSnapshots,
@@ -260,16 +288,14 @@ export class GoLiveMigrationService {
       sellerSpriteCapabilitiesAvailable,
       sellerSpriteMarketCalls,
       sellerSpriteAsinCalls,
+      readyForDemoCleanup,
       hasMinimumRealCoverage: mockObservations === 0
         && activeOwnedProducts > 0
+        && activeMockOwnedProducts === 0
         && realMarketSnapshots > 0
         && realOwnedProductSnapshots === activeOwnedProducts
-        && sellerSpriteMarketSnapshots > 0
         && sellerSpriteOwnedProductSnapshots > 0
-        && sellerSpriteConnectionVerified
-        && sellerSpriteCapabilitiesAvailable
-        && sellerSpriteMarketCalls > 0
-        && sellerSpriteAsinCalls > 0,
+        && readyForDemoCleanup,
     };
   }
 

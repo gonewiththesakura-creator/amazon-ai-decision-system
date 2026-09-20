@@ -7,6 +7,7 @@ import { GoLiveMigrationService } from './go-live-migration-service.js';
 import { seedDemoData } from '../database/demo-seed.js';
 import { IntelligenceService } from './intelligence-service.js';
 import { IntelligenceRepository } from '../repository/intelligence-repository.js';
+import { addVerifiedMcpCoverage } from '../test-utils/verified-mcp-coverage.js';
 
 let database: AppDatabase | undefined;
 let temporaryDirectory: string | undefined;
@@ -65,15 +66,44 @@ function insertObservationFixture(
 }
 
 describe('GoLiveMigrationService', () => {
-  it('reports exact demo observation counts, removes only observations, and rejects activation before real coverage', async () => {
+  it('preserves Demo until the current market and a real owned ASIN have verified MCP coverage', () => {
+    database = openDatabase(':memory:');
+    seedDemoData(database);
+    const service = new GoLiveMigrationService(database);
+    const before = service.verify().mockObservations;
+
+    expect(service.verify()).toMatchObject({ readyForDemoCleanup: false });
+    expect(() => service.clearDemoObservations()).toThrow(/真实.*MCP|MCP.*真实/);
+    expect(service.verify().mockObservations).toBe(before);
+    expect(database.prepare('SELECT COUNT(*) AS count FROM demo_seed_records').get())
+      .not.toEqual({ count: 0 });
+    addVerifiedMcpCoverage(database);
+    expect(service.verify()).toMatchObject({ readyForDemoCleanup: true, hasMinimumRealCoverage: false });
+    database.prepare(`UPDATE products SET source_type = 'mock' WHERE id = 'verified-owned'`).run();
+    expect(service.verify()).toMatchObject({ readyForDemoCleanup: false });
+    database.prepare(`UPDATE products SET source_type = 'import' WHERE id = 'verified-owned'`).run();
+    database.prepare(`INSERT INTO market_nodes (
+      id, name, level, marketplace, status, source_type, created_at
+    ) VALUES ('unrelated-market', 'Unrelated market', 1, 'US', 'active', 'import', '2026-09-19')`).run();
+    database.prepare(`UPDATE products SET market_node_id = 'unrelated-market' WHERE id = 'verified-owned'`).run();
+    expect(service.verify()).toMatchObject({ readyForDemoCleanup: false });
+    database.prepare(`UPDATE products SET market_node_id = 'mkt-cervical' WHERE id = 'verified-owned'`).run();
+    expect(service.verify()).toMatchObject({ readyForDemoCleanup: true });
+    database.prepare(`UPDATE market_nodes SET category_id = 'unverified-path' WHERE id = 'mkt-memory-foam'`).run();
+    expect(service.verify()).toMatchObject({ readyForDemoCleanup: false });
+  });
+
+  it('requires verified coverage before clearing observations and rejects Live with active mock masters', async () => {
     database = openDatabase(':memory:');
     insertObservationFixture(database, 'mock');
     const service = new GoLiveMigrationService(database);
 
     expect(service.preview().delete).toMatchObject({ marketSnapshots: 1, productSnapshots: 1 });
     expect(() => service.activateLiveMode()).toThrow(/真实数据覆盖|Mock/);
+    expect(() => service.clearDemoObservations()).toThrow(/真实.*MCP/);
+    addVerifiedMcpCoverage(database, 'market-us');
     service.clearDemoObservations();
-    expect(database.prepare('SELECT COUNT(*) AS count FROM products').get()).toMatchObject({ count: 1 });
+    expect(database.prepare('SELECT COUNT(*) AS count FROM products').get()).toMatchObject({ count: 2 });
     expect(service.verify()).toMatchObject({ mockObservations: 0, hasMinimumRealCoverage: false });
     expect(() => service.activateLiveMode()).toThrow(/真实数据覆盖/);
     temporaryDirectory = mkdtempSync(join(tmpdir(), 'go-live-backup-'));
@@ -225,6 +255,8 @@ describe('GoLiveMigrationService', () => {
 
     const service = new GoLiveMigrationService(database);
     expect(service.preview().archive).toMatchObject({ products: 10 });
+    addVerifiedMcpCoverage(database, 'mkt-memory-foam', 'real-owned');
+    expect(service.verify().readyForDemoCleanup).toBe(true);
     service.clearDemoObservations();
     expect(database.prepare(`
       SELECT id, status FROM products WHERE is_owned = 1 ORDER BY id
@@ -287,6 +319,7 @@ describe('GoLiveMigrationService', () => {
       .toEqual({ id: 'demo-refresh' });
     database.prepare(`DELETE FROM market_snapshots WHERE id = 'unrelated-mock'`).run();
 
+    addVerifiedMcpCoverage(database);
     service.clearDemoObservations();
     expect(database.prepare(`SELECT id FROM market_snapshots WHERE id = 'demo-refresh'`).get())
       .toBeUndefined();
@@ -346,6 +379,7 @@ describe('GoLiveMigrationService', () => {
     expect(service.preview().delete.productSnapshots).toBe(33);
     expect(service.preview().archive.products).toBe(12);
     expect(service.preview().blockers).toEqual([]);
+    addVerifiedMcpCoverage(database);
     service.clearDemoObservations();
     expect(database.prepare(`SELECT id FROM product_snapshots WHERE source_type = 'mock'`).all()).toEqual([]);
     expect(database.prepare(`SELECT status FROM products WHERE id = 'owned-sku-02'`).get())
@@ -392,11 +426,12 @@ describe('GoLiveMigrationService', () => {
     `).run(profile.id, profile.version);
     const service = new GoLiveMigrationService(database);
     expect(service.preview().archive.products).toBe(11);
+    addVerifiedMcpCoverage(database);
     service.clearDemoObservations();
     expect(database.prepare(`SELECT status FROM products WHERE id = 'owned-sku-04'`).get())
       .toEqual({ status: 'active' });
     expect(database.prepare(`SELECT entity_id FROM research_jobs WHERE id = 'real-sku-job'`).get())
       .toEqual({ entity_id: 'owned-sku-04' });
-    expect(service.verify()).toMatchObject({ activeOwnedProducts: 1, hasMinimumRealCoverage: false });
+    expect(service.verify()).toMatchObject({ activeOwnedProducts: 2, hasMinimumRealCoverage: false });
   });
 });

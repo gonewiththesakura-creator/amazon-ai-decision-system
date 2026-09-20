@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it } from 'vitest';
 import { openDatabase, type AppDatabase } from '../database/database.js';
+import { IntelligenceRepository } from '../repository/intelligence-repository.js';
 import { SellerSpriteSyncService, type SellerSpriteSyncPort } from './sellersprite-sync-service.js';
 import { MetricAuthorityResolver } from './metric-authority-resolver.js';
 
@@ -388,12 +389,57 @@ describe('SellerSprite real-data sync', () => {
     ]);
     expect(database.prepare(`
       SELECT metric_name, numeric_value, source_type FROM metric_facts
-      WHERE entity_type = 'product' AND entity_id = ? AND metric_name = 'estimated_sales'
+      WHERE entity_type = 'competitor' AND entity_id = ? AND metric_name = 'estimated_sales'
       ORDER BY observation_date
     `).all(competitorProductId)).toEqual([
       { metric_name: 'estimated_sales', numeric_value: 100, source_type: 'mcp' },
       { metric_name: 'estimated_sales', numeric_value: 120, source_type: 'mcp' },
     ]);
+  });
+
+  it('selects a confirmed competitor MCP fact over a later same-date import with fact lineage', async () => {
+    database = fixtureDatabase();
+    const service = new SellerSpriteSyncService(database, fixturePort());
+    await service.discoverCompetitors({ ownedProductId: 'owned-1' });
+    const { competitorProductId } = service.confirmCompetitorCandidate({
+      ownedProductId: 'owned-1', candidateId: service.listCompetitorCandidates('owned-1')[0]!.id,
+      relationType: 'direct', reason: '人工核对后确认',
+    });
+    await service.syncConfirmedCompetitor({ ownedProductId: 'owned-1', competitorProductId });
+    database.prepare(`
+      INSERT INTO product_snapshots (
+        id, product_id, date, estimated_sales, estimated_revenue, review_count,
+        source, source_type, collected_at, period, is_estimated, confidence,
+        observation_date, dedup_key
+      ) VALUES (
+        'later-import', ?, '2026-08-31', 900, 36000, 70,
+        'SellerSprite CSV', 'import', '2026-09-20T02:30:00Z', '1M', 1, 0.99,
+        '2026-08-31', 'later-import-competitor'
+      )
+    `).run(competitorProductId);
+
+    const snapshots = new IntelligenceRepository(database).getProductSnapshots(competitorProductId);
+    const selected = snapshots.at(-1)!;
+    const fact = database.prepare(`
+      SELECT id FROM metric_facts
+      WHERE entity_type = 'competitor' AND entity_id = ?
+        AND metric_name = 'estimated_sales' AND observation_date = '2026-08-31'
+    `).get(competitorProductId) as { id: string } | undefined;
+
+    expect(fact).toBeDefined();
+    expect(snapshots).toHaveLength(2);
+    expect(selected).toMatchObject({
+      date: '2026-08-31', estimatedSales: 120, estimatedRevenue: 5040, reviewCount: 70,
+      provenance: { source: 'SellerSprite MCP', sourceType: 'mcp' },
+      metricProvenance: {
+        estimated_sales: { sourceRecordId: fact!.id, sourceRecordType: 'metric_fact',
+          source: 'SellerSprite MCP', sourceType: 'mcp' },
+        review_count: { sourceRecordId: 'later-import', sourceRecordType: 'snapshot' },
+      },
+    });
+    expect(database.prepare(`SELECT numeric_value FROM metric_facts WHERE id = ?`)
+      .get(selected.metricProvenance?.estimated_sales.sourceRecordId ?? ''))
+      .toEqual({ numeric_value: 120 });
   });
 
   it('rejects a mismatched remote competitor ASIN before writing any observation', async () => {

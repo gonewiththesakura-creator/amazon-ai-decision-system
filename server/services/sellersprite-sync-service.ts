@@ -182,7 +182,7 @@ export class SellerSpriteSyncService {
         || current.marketNodeId !== product.marketNodeId) {
         throw new Error('竞品身份或市场节点在同步期间发生变化，请重新请求。');
       }
-      return { inserted: this.persistProduct(prepared) };
+      return { inserted: this.persistProduct(prepared, 'competitor') };
     });
   }
 
@@ -524,7 +524,7 @@ export class SellerSpriteSyncService {
     return Number(result.changes);
   }
 
-  private persistProduct(prepared: PreparedProductObservation): number {
+  private persistProduct(prepared: PreparedProductObservation, entityType: 'product' | 'competitor' = 'product'): number {
     if (prepared.parentAsin) {
       this.identityResolver.resolve({
         marketplace: prepared.product.marketplace,
@@ -567,7 +567,7 @@ export class SellerSpriteSyncService {
       inserted += Number(result.changes);
       for (const metric of PRODUCT_METRICS) {
         this.persistFact(
-          'product', prepared.product.id, prepared.product.marketplace, PRODUCT_METRIC_COLUMNS[metric],
+          entityType, prepared.product.id, prepared.product.marketplace, PRODUCT_METRIC_COLUMNS[metric],
           point[metric], point.observationDate, prepared.provenance,
         );
       }
@@ -576,7 +576,7 @@ export class SellerSpriteSyncService {
   }
 
   private persistFact(
-    entityType: 'market' | 'product', entityId: string, marketplace: string,
+    entityType: 'market' | 'product' | 'competitor', entityId: string, marketplace: string,
     metricName: string, value: number | null, observationDate: string, provenance: Provenance,
   ): void {
     const period = normalizeKeyPart(provenance.period);
