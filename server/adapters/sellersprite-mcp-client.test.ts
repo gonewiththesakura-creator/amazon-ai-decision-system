@@ -68,17 +68,18 @@ describe('SellerSpriteMcpClient', () => {
       const request = {
         tool: 'market_research_statistics',
         arguments: { request: { marketplace: 'US', nodeIdPath: '1055398:1063252' } },
-        context: { capability: 'MARKET_STATISTICS', runId },
+        context: { capability: 'MARKET_STATISTICS', runId, observationMonth: '202609' },
       };
 
       await client.callTool(request);
       await client.callTool(request);
 
       expect(transport.callCount).toBe(1);
-      expect(database.prepare(`SELECT sync_run_id, cache_hit, status FROM mcp_call_logs ORDER BY rowid`).all())
+      expect(database.prepare(`SELECT sync_run_id, cache_hit, status, observation_month
+        FROM mcp_call_logs ORDER BY rowid`).all())
         .toEqual([
-          { sync_run_id: runId, cache_hit: 0, status: 'success' },
-          { sync_run_id: runId, cache_hit: 1, status: 'success' },
+          { sync_run_id: runId, cache_hit: 0, status: 'success', observation_month: '202609' },
+          { sync_run_id: runId, cache_hit: 1, status: 'success', observation_month: '202609' },
         ]);
     } finally { database.close(); }
   });
@@ -90,7 +91,17 @@ describe('SellerSpriteMcpClient', () => {
       const ledgerStore = new SqliteMcpCallLedgerStore(database);
       const cacheStore = new SqliteMcpResponseCacheStore(database);
       const transport = new FakeTransport({
-        callOutcomes: [callResult({ code: 'OK', data: { total: 42 } })],
+        callOutcomes: [callResult({ code: 'OK', data: {
+          total: 42,
+          auth: 'pin-123',
+          authHeader: 'opaque-header-987',
+          authenticationHeader: 'opaque-header-654',
+          note: 'Bearer opaque-bearer-321',
+          session: 'sess-456',
+          cookie: 'cookie-789',
+          credential: { value: 'credential-012' },
+          clientSecret: 'client-345',
+        } })],
       });
       capabilityStore.save({
         id: 'discovery-1', provider: 'sellersprite', discoveredAt: '2026-09-19T00:00:00.000Z',
@@ -125,6 +136,9 @@ describe('SellerSpriteMcpClient', () => {
       const cached = database.prepare('SELECT cache_key, response_json FROM mcp_response_cache').get();
       expect(cached).toMatchObject({ cache_key: expect.stringMatching(/^[a-f0-9]{64}$/) });
       expect(JSON.stringify(cached)).not.toContain('Home/Bed');
+      expect(JSON.stringify(cached)).not.toMatch(
+        /pin-123|opaque-header-987|opaque-header-654|opaque-bearer-321|sess-456|cookie-789|credential-012|client-345/,
+      );
     } finally { database.close(); }
   });
 
@@ -344,12 +358,13 @@ describe('SellerSpriteMcpClient', () => {
   it('redacts query credentials, authorization, tokens, and secret-key values', () => {
     const secretBearingError = new Error(
       'Authorization: Bearer secret-value; https://example.test/mcp?token=secret-value&x=1 '
-      + '{"secretKey":"secret-value","api_key":"secret-value"} secret-key=secret-value',
+      + '{"secretKey":"secret-value","api_key":"secret-value","auth":"opaque-pin"} '
+      + 'secret-key=secret-value session=opaque-session credential=opaque-credential',
     );
 
     const diagnostic = sanitizeMcpError(secretBearingError);
 
-    expect(diagnostic).not.toMatch(/secret-value|Authorization/i);
+    expect(diagnostic).not.toMatch(/secret-value|Authorization|opaque-pin|opaque-session|opaque-credential/i);
     expect(diagnostic).toContain('[REDACTED]');
   });
 
@@ -361,6 +376,11 @@ describe('SellerSpriteMcpClient', () => {
       .toThrow(/URL.*凭据|credential/i);
     expect(() => sellerSpriteEndpoint('https://mcp.sellersprite.com/mcp?secret-key=old'))
       .toThrow(/URL.*凭据|credential/i);
+    for (const key of ['auth', 'x-auth', 'authHeader', 'authenticationHeader',
+      'credential', 'session', 'cookie', 'access_key']) {
+      expect(() => sellerSpriteEndpoint(`https://mcp.sellersprite.com/mcp?${key}=old`))
+        .toThrow(/URL.*凭据|credential/i);
+    }
     expect(() => sellerSpriteEndpoint('https://user:password@mcp.sellersprite.com/mcp', 'test-secret'))
       .toThrow(/URL.*凭据|credential/i);
   });

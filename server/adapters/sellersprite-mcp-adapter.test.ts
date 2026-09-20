@@ -11,6 +11,54 @@ import { GoLiveMigrationService } from '../services/go-live-migration-service.js
 import { WorkflowOrchestrator } from '../services/workflow-orchestrator.js';
 
 describe('SellerSpriteMCPAdapter', () => {
+  it('pins callable tool schemas to each run when two run discoveries interleave', async () => {
+    class RotatingTransport extends AdapterTransport {
+      catalogVersion: 'a' | 'b' = 'a';
+
+      override async listTools(): Promise<unknown> {
+        const result = await super.listTools() as { tools: Array<{ name: string; description: string }> };
+        if (this.catalogVersion === 'b') {
+          result.tools = result.tools.map((entry) => entry.name === 'market_research_statistics'
+            ? { ...entry, name: 'market_statistics_v2', description: 'Market statistics v2' }
+            : entry);
+        }
+        return result;
+      }
+    }
+    const transport = new RotatingTransport();
+    transport.responseData = {
+      marketplace: 'US', nodeIdPath: '1055398:1063252', products: 100,
+    };
+    const adapter = new SellerSpriteMCPAdapter({ client: new SellerSpriteMcpClient({ transport }) });
+    const input = { marketplace: 'US', nodeIdPath: '1055398:1063252' };
+    const runA = '123e4567-e89b-42d3-a456-426614174001';
+    const runB = '123e4567-e89b-42d3-a456-426614174002';
+
+    await adapter.fetchMarketStatistics(input, { runId: runA });
+    transport.catalogVersion = 'b';
+    await adapter.fetchMarketStatistics(input, { runId: runB });
+    await adapter.fetchMarketStatistics(input, { runId: runA });
+
+    expect(transport.calls.map((call) => call.name)).toEqual([
+      'market_research_statistics', 'market_statistics_v2', 'market_research_statistics',
+    ]);
+    expect(transport.listToolsCallCount).toBe(2);
+  });
+
+  it('discovers one immutable schema for parallel calls in the same run', async () => {
+    const transport = new AdapterTransport();
+    const adapter = new SellerSpriteMCPAdapter({ client: new SellerSpriteMcpClient({ transport }) });
+    const input = { marketplace: 'US', nodeIdPath: '1055398:1063252' };
+    const runId = '123e4567-e89b-42d3-a456-426614174003';
+
+    await Promise.all([
+      adapter.fetchMarketStatistics(input, { runId }),
+      adapter.fetchMarketConcentration(input, { runId }),
+    ]);
+
+    expect(transport.listToolsCallCount).toBe(1);
+  });
+
   it('certifies one real transport run through workflows, dashboard, and Go Live Evidence', async () => {
     const database = openDatabase(':memory:');
     try {

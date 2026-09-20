@@ -188,6 +188,11 @@ export class IntelligenceRepository {
     return this.getMarketSnapshotRows(id).map((row) => this.mapTrend(row));
   }
 
+  getSelectedMarketSnapshotId(id: string): string | null {
+    const latest = this.getMarketSnapshotRows(id).at(-1);
+    return latest ? stringValue(latest.id) : null;
+  }
+
   getMarketProducts(id: string): Product[] {
     const rows = this.database.prepare(`
       WITH RECURSIVE descendants(id) AS (

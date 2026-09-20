@@ -136,6 +136,9 @@ describe('database migrations', () => {
         .map((column) => String((column as { name: unknown }).name));
       expect(columns).toContain('sync_run_id');
     }
+    const callLogColumns = db.prepare('PRAGMA table_info(mcp_call_logs)').all()
+      .map((column) => String((column as { name: unknown }).name));
+    expect(callLogColumns).toContain('observation_month');
     expect(db.prepare(`SELECT name FROM sqlite_master
       WHERE type = 'table' AND name = 'mcp_sync_observation_links'`).get())
       .toMatchObject({ name: 'mcp_sync_observation_links' });
@@ -292,7 +295,7 @@ describe('database migrations', () => {
     `).all() as Array<{ version: number }>;
 
     expect(versions.map((row) => Number(row.version))).toEqual(
-      Array.from({ length: 25 }, (_, index) => index + 1),
+      Array.from({ length: 26 }, (_, index) => index + 1),
     );
     expect(db.prepare('PRAGMA foreign_key_check').all()).toEqual([]);
     expect(db.prepare('PRAGMA quick_check').get()).toMatchObject({ quick_check: 'ok' });

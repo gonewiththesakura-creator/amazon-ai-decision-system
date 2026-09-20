@@ -12,6 +12,7 @@ import {
 } from './sellersprite-mcp-schemas.js';
 import {
   SqliteMcpCallLedgerStore, SqliteMcpCapabilityStore, SqliteMcpResponseCacheStore,
+  type McpCapabilityStore,
 } from './sellersprite-mcp-store.js';
 import {
   SELLERSPRITE_CAPABILITIES,
@@ -64,9 +65,10 @@ export class SellerSpriteMCPAdapter implements MarketDataAdapter {
 
   private readonly client: SellerSpriteMcpClient;
   private readonly registry: SellerSpriteToolRegistry;
+  private readonly capabilityStore?: McpCapabilityStore;
+  private readonly runRegistries = new Map<string, Promise<SellerSpriteToolRegistry>>();
   private readonly injectedClient: boolean;
   private discovered = false;
-  private discoveredRunId: string | null = null;
 
   constructor(options: {
     client?: SellerSpriteMcpClient;
@@ -77,8 +79,8 @@ export class SellerSpriteMCPAdapter implements MarketDataAdapter {
       ledgerStore: new SqliteMcpCallLedgerStore(options.database),
       cacheStore: new SqliteMcpResponseCacheStore(options.database),
     } : {});
-    this.registry = options.registry ?? new SellerSpriteToolRegistry(options.database
-      ? { store: new SqliteMcpCapabilityStore(options.database) } : {});
+    this.capabilityStore = options.database ? new SqliteMcpCapabilityStore(options.database) : undefined;
+    this.registry = options.registry ?? new SellerSpriteToolRegistry({ store: this.capabilityStore });
     this.injectedClient = Boolean(options.client);
   }
 
@@ -90,7 +92,6 @@ export class SellerSpriteMCPAdapter implements MarketDataAdapter {
       await this.registry.refresh(() => this.client.listTools());
       missingCapabilities = this.registry.missing();
       this.discovered = true;
-      this.discoveredRunId = null;
     }
     return {
       ...status,
@@ -213,7 +214,22 @@ export class SellerSpriteMCPAdapter implements MarketDataAdapter {
   async close(): Promise<void> {
     await this.client.close();
     this.discovered = false;
-    this.discoveredRunId = null;
+    this.runRegistries.clear();
+  }
+
+  private async registryForRun(runId: string): Promise<SellerSpriteToolRegistry> {
+    const existing = this.runRegistries.get(runId);
+    if (existing) return existing;
+    const registry = new SellerSpriteToolRegistry({ store: this.capabilityStore });
+    const discovery = registry.refresh(
+      () => this.client.listTools({ fresh: true, runId }), runId,
+    ).then(() => registry);
+    this.runRegistries.set(runId, discovery);
+    try { return await discovery; }
+    catch (error) {
+      if (this.runRegistries.get(runId) === discovery) this.runRegistries.delete(runId);
+      throw error;
+    }
   }
 
   private async fetchCapability<T>(
@@ -223,28 +239,30 @@ export class SellerSpriteMCPAdapter implements MarketDataAdapter {
     if (!this.injectedClient && !process.env.SELLERSPRITE_MCP_URL) {
       throw new AdapterUnavailableError('未配置 SELLERSPRITE_MCP_URL，请在服务端环境变量中设置。');
     }
-    if (!this.discovered || (context?.runId !== undefined && this.discoveredRunId !== context.runId)) {
-      await this.registry.refresh(
-        () => this.client.listTools({ fresh: true, runId: context?.runId }),
-        context?.runId ?? null,
-      );
-      this.discovered = true;
-      this.discoveredRunId = context?.runId ?? null;
+    let registry: SellerSpriteToolRegistry;
+    if (context?.runId) {
+      registry = await this.registryForRun(context.runId);
+    } else {
+      if (!this.discovered) {
+        await this.registry.refresh(() => this.client.listTools());
+        this.discovered = true;
+      }
+      registry = this.registry;
     }
-    const tool = this.registry.resolve(capability);
+    const tool = registry.resolve(capability);
     if (!tool) throw new SellerSpriteMcpError('TOOL_NOT_FOUND', `SellerSprite capability unavailable: ${capability}`);
     const request = args.request && typeof args.request === 'object'
       ? args.request as Record<string, unknown> : args;
     if (context?.requireObservationMonth
       && (capability === 'MARKET_STATISTICS' || capability === 'PRODUCT_CONCENTRATION')
-      && (!this.registry.supportsArgument(capability, 'month') || request.month === undefined)) {
+      && (!registry.supportsArgument(capability, 'month') || request.month === undefined)) {
       throw new SellerSpriteMcpError(
         'INVALID_SCHEMA',
         `SellerSprite ${capability} cannot certify a requested observation month`,
       );
     }
     let toolArgs: Record<string, unknown>;
-    try { toolArgs = this.registry.argumentsFor(capability, args); }
+    try { toolArgs = registry.argumentsFor(capability, args); }
     catch { throw new SellerSpriteMcpError('INVALID_SCHEMA', 'SellerSprite tool arguments do not match discovered schema'); }
     const entityType = capability === 'ASIN_SALES_TREND' || capability === 'ASIN_COMPETITOR_DISCOVERY'
       ? 'product' as const : 'market' as const;
@@ -252,6 +270,8 @@ export class SellerSpriteMCPAdapter implements MarketDataAdapter {
     const accepted = await this.client.callTool({ tool: tool.name, arguments: toolArgs, context: {
       capability, operation, entityType,
       ...(typeof entityId === 'string' ? { entityId: entityId.toUpperCase() } : {}),
+      ...((capability === 'MARKET_STATISTICS' || capability === 'PRODUCT_CONCENTRATION')
+        && typeof request.month === 'string' ? { observationMonth: request.month } : {}),
       ...(context?.runId ? { runId: context.runId } : {}),
       ...(context?.runId ? { fresh: true } : {}),
     } }, (result, acquisition) => {

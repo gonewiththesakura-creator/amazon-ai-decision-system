@@ -262,6 +262,46 @@ describe('import preview API', () => {
       .toMatchObject({ count: 1 });
   });
 
+  it('keeps a same-name real market node separate from the retained Demo node', () => {
+    database = openDatabase(':memory:');
+    seedDemoData(database);
+    const service = new ImportService(database);
+    const sameNameMaster = productMasterCsv
+      .replace('Memory Foam,true,active', 'Memory Foam Pillow,true,active');
+
+    expect(service.confirm(service.preview(Buffer.from(sameNameMaster), {
+      format: 'csv', filename: 'same-name-real-master.csv',
+    }).token)).toMatchObject({ successCount: 1, failureCount: 0 });
+
+    const imported = database.prepare(`
+      SELECT product.market_node_id AS marketNodeId, market.source_type AS sourceType
+      FROM products product
+      JOIN market_nodes market ON market.id = product.market_node_id
+      WHERE product.asin = 'B0OWNED001'
+    `).get() as { marketNodeId: string; sourceType: string };
+    expect(imported).toMatchObject({ sourceType: 'import' });
+    expect(imported.marketNodeId).not.toBe('mkt-memory-foam');
+    expect(database.prepare(`
+      SELECT source_type AS sourceType FROM market_nodes WHERE id = 'mkt-memory-foam'
+    `).get()).toEqual({ sourceType: 'mock' });
+
+    const secondMaster = sameNameMaster
+      .replace('B0OWNED001', 'B0OWNED002')
+      .replace('OWN-001', 'OWN-002')
+      .replace('Contour Pillow,Northstar', 'Second Pillow,Northstar');
+    expect(service.confirm(service.preview(Buffer.from(secondMaster), {
+      format: 'csv', filename: 'same-name-second-master.csv',
+    }).token)).toMatchObject({ successCount: 1, failureCount: 0 });
+    expect(database.prepare(`
+      SELECT COUNT(DISTINCT market_node_id) AS count FROM products
+      WHERE asin IN ('B0OWNED001', 'B0OWNED002')
+    `).get()).toEqual({ count: 1 });
+    expect(database.prepare(`
+      SELECT COUNT(*) AS count FROM market_nodes
+      WHERE name = 'Memory Foam Pillow' AND source_type <> 'mock'
+    `).get()).toEqual({ count: 1 });
+  });
+
   it('requires an explicit type before confirming an unknown file', async () => {
     database = openDatabase(':memory:');
     const service = new ImportService(database);

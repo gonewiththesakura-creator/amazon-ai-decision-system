@@ -16,12 +16,20 @@ npm run dev
 
 默认前端为 `http://127.0.0.1:5173`，API 为 `http://127.0.0.1:8787`。首次打开数据库会执行向前迁移。不要对有业务数据的数据库运行 `npm run db:reset`，该命令会删除本地内容。
 
+市场节点与真实产品主数据完成核对后，可在 API 运行期间从另一个终端执行本地真实链验收：
+
+```powershell
+npm run --silent acceptance:real -- --month 202609
+```
+
+该命令按固定顺序执行预检、连接、关键同步与本次 fresh `listTools` schema 指纹检查、该运行捕获的真实子 SKU roster 对应的数据库驾驶舱读取及同 `runId` 指标读路径证明、市场/产品 Research Job、同 `runId` Evidence 及 Go Live 清理前证明。读路径证明允许其他 Demo 行保留，但本次主市场和每个真实子 SKU 当前选中的指标必须链接到本次运行；证明失败时不会创建验收 Job。默认连接本机 `127.0.0.1:8787`，单次请求最长等待两小时；可用 `--base-url http://127.0.0.1:<port>` 和 `--timeout-ms <milliseconds>` 指定其他本机 API 与 1 秒到 4 小时的边界。只连接可信的本机 API，不跟随 HTTP 重定向；当前 Admin/Viewer 不是真实部署身份认证。输出只有布尔状态、计数、服务端 `runId` 和安全规范化后的 schema 合同 SHA-256，不输出端点、原始 schema、ASIN、标题、文件路径、远端错误或 Secret。`dashboardOwnedProducts` 是页面实际行数，`verifiedDashboardOwnedProducts` 是本次运行 roster 中通过读路径证明的真实 SKU 数；保留 Demo 时两者可以不同。失败返回非零退出码。该命令不会预览/备份/清理 Demo、切换 Live、确认或拒绝竞品候选，也不会替代产品身份和市场节点的人工核实。
+
 ## 先验证真实链路
 
 1. 保留现有 Demo。打开“设置 -> 数据源”，执行“连接测试”。检查认证、工具数量、必需能力及延迟；能力列表来自实际 `listTools`。诊断不应显示密钥。
 2. 确认当前 Marketplace 和“默认市场节点”属于目标站点。在“设置 -> 数据源”输入并核对 SellerSprite 数字节点路径，勾选站点/类目范围确认后保存为 `market_nodes.category_id`；未映射的市场会拒绝同步，不退用本地节点 ID。不能因为名称包含 pillow 就把宽泛 Bed Pillows 类目当成已验证的 Memory Foam Pillow 细分市场。
 3. 打开“数据任务 -> 审核文件导入”，选取 `examples/owned-product-master-template.csv` 结构的真实产品主数据文件。预览识别类型、新增/更新/重复/错误计数、字段映射、样例行和拒绝原因；未知类型先人工选择，再用新预览确认。模板列为 `marketplace,asin,sku,internalName,brand,title,productType,parentAsin,variationTheme,marketNode,monitoringEnabled,status`。按真实父子 ASIN 填写 `parentAsin`/`variationTheme`，不要把父体销量与子 SKU 销量相加；被拒绝的行需明确确认只导入有效行。
-4. 在“设置 -> 数据源”选观察月份后执行“同步关键数据”。服务端先创建唯一 `runId` 和运行中的 `critical_sync` DataTask；本次 `listTools`/能力快照、主市场当前月与上月的统计/集中度、当前站点全部 active 且非 Mock 的自有 ASIN 趋势、候选发现、已确认直接竞品刷新、Snapshot、metric fact、coverage 和后续 Evidence 都用该 `runId` 关联。市场两个月份须由本次运行分别请求、校验和链接，不能拼接两次历史运行；关键市场工具必须在本次发现的 schema 中声明 `month` 参数，统计和集中度响应也必须回显与请求一致的月份，否则本次运行按契约失败处理，不能把无月份响应认证为对应历史月份。主市场双月与全部真实自有 SKU 是原子关键批次：任一关键调用失败时不写本批业务观察，只留下脱敏失败任务和不完整 coverage，并继续展示上一次合法真实 Snapshot，不回退 Mock。相同周期只有在标准化结果完全一致时才可通过 run-to-observation 链接复用；Snapshot 和 fact 的首次来源不被改写，Evidence 继承最近一次完整复核运行，值发生修订则拒绝认证。
+4. 在“设置 -> 数据源”选观察月份后执行“同步关键数据”。服务端先创建唯一 `runId` 和运行中的 `critical_sync` DataTask；本次 `listTools`/能力快照、主市场及每个当前真实自有 SKU 所在 distinct 子市场的当前月与上月统计/集中度、当前站点全部 active 且非 Mock 的自有 ASIN 趋势、候选发现、已确认直接竞品刷新、Snapshot、metric fact、coverage 和后续 Evidence 都用该 `runId` 关联。所有市场节点的两个月份须由本次运行分别请求、校验和链接，不能拼接两次历史运行；关键市场工具必须在本次发现的 schema 中声明 `month` 参数，统计和集中度响应也必须回显与请求一致的月份，否则本次运行按契约失败处理，不能把无月份响应认证为对应历史月份。主市场、所需子市场双月与全部真实自有 SKU 是原子关键批次：任一关键调用失败时不写本批业务观察，只留下脱敏失败任务和不完整 coverage，并继续展示上一次合法真实 Snapshot，不回退 Mock。相同周期只有在标准化结果完全一致时才可通过 run-to-observation 链接复用；Snapshot 和 fact 的首次来源不被改写，Evidence 继承最近一次完整复核运行，值发生修订则拒绝认证。
 5. 关键批次成功后，候选发现和已确认 `direct` 竞品作为非阻断 secondary 阶段继续运行并分别记录 coverage；单个竞品失败会形成 `partial`，不会推翻关键批次。候选只写入待审核池，不会自动成为直接竞品。到自有产品详情的“竞品”页按价格、形态、功能、人群及相似度人工核对，填写纳入理由并确认或拒绝；也可从该页再次发现候选或单独刷新已确认竞品。关系被撤销或远端 ASIN/站点不一致时拒绝落库。`observationDate` 采用业务月份或趋势点日期，`collectedAt` 是抓取时间。
 6. 查看“数据任务”的真实数据覆盖，以及市场、自有产品和驾驶舱上的来源、日期与缺失值。页面读取数据库 Snapshot，刷新页面不会触发 MCP。历史不足时继续通过已验证的 MCP 趋势和文件补数；为主市场及每个当前 active 自有 SKU 分别运行非 Demo Research Job，检查 Rule/Evidence 是否指向本次 `runId` 的真实来源记录，并确认工作流进入 monitoring、最终 Insight 引用了 Evidence、分析和报告步骤均完成。Go Live 面板中的“运行 Evidence”必须达到“主市场 + 当前全部自有 SKU”的覆盖数。竞品关系仍需人工审核。
 

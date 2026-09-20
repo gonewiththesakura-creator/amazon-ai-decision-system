@@ -1142,19 +1142,25 @@ export class ImportService {
   private ensureMarketNode(id: string | undefined, name: string, marketplace: string): string {
     if (id) {
       const existing = this.database.prepare(`
-        SELECT id, marketplace FROM market_nodes WHERE id = ?
-      `).get(id) as { id: string; marketplace: string } | undefined;
+        SELECT id, marketplace, source_type AS sourceType FROM market_nodes WHERE id = ?
+      `).get(id) as { id: string; marketplace: string; sourceType: string } | undefined;
       if (existing) {
         if (existing.marketplace !== marketplace) {
           throw new Error(`MarketNode ID「${id}」已属于 ${existing.marketplace} 站点，不能关联到 ${marketplace}。`);
+        }
+        if (existing.sourceType === 'mock') {
+          throw new Error(`MarketNode ID「${id}」属于 Demo，真实导入必须使用独立市场节点。`);
         }
         return id;
       }
     }
     const byName = this.database.prepare(`
-      SELECT id FROM market_nodes WHERE name = ? AND marketplace = ? LIMIT 1
-    `).get(name, marketplace) as { id: string } | undefined;
-    if (byName) return byName.id;
+      SELECT id, source_type AS sourceType FROM market_nodes
+      WHERE name = ? AND marketplace = ?
+      ORDER BY CASE WHEN source_type = 'mock' THEN 1 ELSE 0 END, created_at, id
+      LIMIT 1
+    `).get(name, marketplace) as { id: string; sourceType: string } | undefined;
+    if (byName && byName.sourceType !== 'mock') return byName.id;
     const marketId = id ?? randomUUID();
     this.database.prepare(`
       INSERT INTO market_nodes (

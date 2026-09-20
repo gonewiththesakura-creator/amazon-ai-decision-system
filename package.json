@@ -14,6 +14,7 @@
     "test": "vitest run",
     "test:v2": "vitest run server/app.test.ts server/workflow-api.test.ts server/workflow-security.test.ts server/review-import-workflow.test.ts server/review-gap-evidence.test.ts server/versioned-assets.test.ts server/adapters/import-adapters.test.ts server/database/migrations.test.ts server/domain/research-job-state-machine.test.ts server/domain/snapshot-growth.test.ts server/domain/workflow-rule-engine.test.ts server/domain/reverse-review-engine.test.ts src/components/AIComposer.test.tsx src/components/ResearchApprovalPanel.test.tsx src/lib/researchJobMissingData.test.ts src/lib/reviewInput.test.ts",
     "test:watch": "vitest",
+    "acceptance:real": "tsx server/scripts/real-acceptance.ts",
     "db:reset": "tsx server/scripts/reset-db.ts"
   },
   "dependencies": {

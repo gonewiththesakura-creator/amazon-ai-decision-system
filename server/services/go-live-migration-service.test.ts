@@ -65,6 +65,19 @@ function insertObservationFixture(
   }
 }
 
+function addChildMarketCriticalFixture(db: AppDatabase): string {
+  insertObservationFixture(db, 'mcp', 'mcp');
+  db.prepare(`INSERT INTO market_nodes (
+    id, name, parent_id, level, marketplace, category_id, status, source_type, created_at
+  ) VALUES ('child-market', 'Child market', 'market-us', 2, 'US',
+    '1055398:1063252:999', 'active', 'import', '2026-09-19')`).run();
+  db.prepare(`UPDATE products SET market_node_id = 'child-market'
+    WHERE id = 'owned-product'`).run();
+  addVerifiedMcpCoverage(db, 'market-us', 'owned-product');
+  return (db.prepare(`SELECT id FROM data_coverage_runs WHERE run_type = 'critical_sync'`)
+    .get() as { id: string }).id;
+}
+
 describe('GoLiveMigrationService', () => {
   it('itemizes retained Demo rule and rejection history without exposing record payloads', () => {
     database = openDatabase(':memory:');
@@ -223,6 +236,119 @@ describe('GoLiveMigrationService', () => {
     expect(service.verify()).toMatchObject({ sellerSpriteCriticalRunId: null, readyForDemoCleanup: false });
   });
 
+  it('records both root and child market months for an owned SKU assigned to a child node', () => {
+    database = openDatabase(':memory:');
+    const runId = addChildMarketCriticalFixture(database);
+    const run = database.prepare(`SELECT coverage_json AS coverageJson FROM data_coverage_runs
+      WHERE id = ?`).get(runId) as { coverageJson: string };
+    expect(JSON.parse(run.coverageJson)).toMatchObject({
+      marketNodes: [
+        { id: 'market-us', nodeIdPath: '1055398:1063252' },
+        { id: 'child-market', nodeIdPath: '1055398:1063252:999' },
+      ],
+    });
+    expect(database.prepare(`SELECT total, success FROM data_tasks WHERE id = ?`)
+      .get(runId)).toEqual({ total: 3, success: 3 });
+    expect(database.prepare(`SELECT market_node_id AS marketId, COUNT(*) AS count
+      FROM market_snapshots WHERE sync_run_id = ? GROUP BY market_node_id ORDER BY market_node_id`)
+      .all(runId)).toEqual([
+      { marketId: 'child-market', count: 2 }, { marketId: 'market-us', count: 2 },
+    ]);
+    expect(database.prepare(`SELECT entity_id AS nodeIdPath, capability, COUNT(*) AS count
+      FROM mcp_call_logs WHERE sync_run_id = ? AND entity_type = 'market'
+      GROUP BY entity_id, capability ORDER BY entity_id, capability`).all(runId)).toEqual([
+      { nodeIdPath: '1055398:1063252', capability: 'MARKET_STATISTICS', count: 2 },
+      { nodeIdPath: '1055398:1063252', capability: 'PRODUCT_CONCENTRATION', count: 2 },
+      { nodeIdPath: '1055398:1063252:999', capability: 'MARKET_STATISTICS', count: 2 },
+      { nodeIdPath: '1055398:1063252:999', capability: 'PRODUCT_CONCENTRATION', count: 2 },
+    ]);
+  });
+
+  it('accepts a complete root and child market run for an owned SKU on the child node', () => {
+    database = openDatabase(':memory:');
+    const runId = addChildMarketCriticalFixture(database);
+
+    expect(new GoLiveMigrationService(database).verify()).toMatchObject({
+      sellerSpriteCriticalRunId: runId,
+      verifiedEvidenceEntities: 2,
+      requiredEvidenceEntities: 2,
+      readyForDemoCleanup: true,
+    });
+  });
+
+  it.each([
+    ['baseline statistics call', (db: AppDatabase, runId: string) => db.prepare(`
+      DELETE FROM mcp_call_logs WHERE sync_run_id = ? AND capability = 'MARKET_STATISTICS'
+        AND entity_id = '1055398:1063252:999' AND observation_month = '202608'
+    `).run(runId)],
+    ['current concentration call', (db: AppDatabase, runId: string) => db.prepare(`
+      DELETE FROM mcp_call_logs WHERE sync_run_id = ? AND capability = 'PRODUCT_CONCENTRATION'
+        AND entity_id = '1055398:1063252:999' AND observation_month = '202609'
+    `).run(runId)],
+    ['baseline snapshot link', (db: AppDatabase, runId: string) => db.prepare(`
+      DELETE FROM mcp_sync_observation_links WHERE sync_run_id = ? AND snapshot_kind = 'market'
+        AND entity_id = 'child-market' AND snapshot_id IN (
+          SELECT id FROM market_snapshots WHERE market_node_id = 'child-market'
+            AND observation_date = '2026-08-31'
+        )
+    `).run(runId)],
+    ['current fact link', (db: AppDatabase, runId: string) => db.prepare(`
+      DELETE FROM mcp_sync_observation_links WHERE sync_run_id = ? AND snapshot_kind = 'fact'
+        AND entity_id = 'child-market' AND snapshot_id IN (
+          SELECT id FROM metric_facts WHERE entity_type = 'market'
+            AND entity_id = 'child-market' AND observation_date = '2026-09-30'
+        )
+    `).run(runId)],
+  ])('rejects a child market missing its %s', (_case, removeLineage) => {
+    database = openDatabase(':memory:');
+    const runId = addChildMarketCriticalFixture(database);
+    const service = new GoLiveMigrationService(database);
+    expect(service.verify().sellerSpriteCriticalRunId).toBe(runId);
+
+    removeLineage(database, runId);
+
+    expect(service.verify()).toMatchObject({
+      sellerSpriteCriticalRunId: null,
+      readyForDemoCleanup: false,
+      hasMinimumRealCoverage: false,
+    });
+  });
+
+  it.each([
+    ['omits the child market', (db: AppDatabase, runId: string) => {
+      const row = db.prepare(`SELECT coverage_json AS coverageJson FROM data_coverage_runs WHERE id = ?`)
+        .get(runId) as { coverageJson: string };
+      const coverage = JSON.parse(row.coverageJson) as Record<string, unknown>;
+      coverage.marketNodes = [{ id: 'market-us', nodeIdPath: '1055398:1063252' }];
+      db.prepare(`UPDATE data_coverage_runs SET coverage_json = ? WHERE id = ?`)
+        .run(JSON.stringify(coverage), runId);
+    }],
+    ['changes the child node path', (db: AppDatabase, runId: string) => {
+      const row = db.prepare(`SELECT coverage_json AS coverageJson FROM data_coverage_runs WHERE id = ?`)
+        .get(runId) as { coverageJson: string };
+      const coverage = JSON.parse(row.coverageJson) as { marketNodes: Array<Record<string, unknown>> };
+      coverage.marketNodes[1]!.nodeIdPath = '1055398:1063252:777';
+      db.prepare(`UPDATE data_coverage_runs SET coverage_json = ? WHERE id = ?`)
+        .run(JSON.stringify(coverage), runId);
+    }],
+    ['uses the old root-only task total', (db: AppDatabase, runId: string) => {
+      db.prepare(`UPDATE data_tasks SET total = 2, success = 2 WHERE id = ?`).run(runId);
+    }],
+  ])('rejects a child market run whose coverage %s', (_case, corruptCoverage) => {
+    database = openDatabase(':memory:');
+    const runId = addChildMarketCriticalFixture(database);
+    const service = new GoLiveMigrationService(database);
+    expect(service.verify().sellerSpriteCriticalRunId).toBe(runId);
+
+    corruptCoverage(database, runId);
+
+    expect(service.verify()).toMatchObject({
+      sellerSpriteCriticalRunId: null,
+      readyForDemoCleanup: false,
+      hasMinimumRealCoverage: false,
+    });
+  });
+
   it('requires the latest SellerSprite capability catalog to be fresh', () => {
     database = openDatabase(':memory:');
     insertObservationFixture(database, 'mcp', 'mcp');
@@ -327,6 +453,31 @@ describe('GoLiveMigrationService', () => {
     expect(service.verify().sellerSpriteCriticalRunId).toBeNull();
   });
 
+  it.each([
+    ['runless', "sync_run_id = NULL"],
+    ['wrong-run', "sync_run_id = '00000000-0000-4000-8000-000000000001'"],
+    ['unfinished', "status = 'running', completed_at = NULL, success = 0"],
+  ])('requires %s workflow DataTask completion lineage for every Evidence entity', (_case, update) => {
+    database = openDatabase(':memory:');
+    insertObservationFixture(database, 'mcp', 'mcp');
+    addVerifiedMcpCoverage(database, 'market-us', 'owned-product');
+    const service = new GoLiveMigrationService(database);
+    expect(service.verify().readyForDemoCleanup).toBe(true);
+
+    const ownedJob = database.prepare(`
+      SELECT id FROM research_jobs WHERE entity_type = 'owned_product' LIMIT 1
+    `).get() as { id: string };
+    database.exec(`UPDATE data_tasks SET ${update} WHERE research_job_id = '${ownedJob.id}'`);
+
+    expect(service.verify()).toMatchObject({
+      sellerSpriteCriticalRunId: null,
+      verifiedEvidenceEntities: 1,
+      requiredEvidenceEntities: 2,
+      readyForDemoCleanup: false,
+      hasMinimumRealCoverage: false,
+    });
+  });
+
   it('rejects an Insight that mixes MCP Evidence from another run into the candidate run', () => {
     database = openDatabase(':memory:');
     insertObservationFixture(database, 'mcp', 'mcp');
@@ -386,6 +537,48 @@ describe('GoLiveMigrationService', () => {
       sellerSpriteCriticalRunId: null,
       readyForDemoCleanup: false,
       verifiedEvidenceEntities: 1,
+      requiredEvidenceEntities: 2,
+    });
+  });
+
+  it('rejects Mock components in a non-Demo Insight but permits real manual components', () => {
+    database = openDatabase(':memory:');
+    insertObservationFixture(database, 'mcp', 'mcp');
+    addVerifiedMcpCoverage(database, 'market-us', 'owned-product');
+    const service = new GoLiveMigrationService(database);
+    const job = database.prepare(`
+      SELECT job.id, job.data_version AS dataVersion, insight.id AS insightId,
+        insight.evidence_ids_json AS evidenceIdsJson
+      FROM research_jobs job
+      JOIN ai_insights insight ON insight.research_job_id = job.id
+      WHERE job.entity_id = 'owned-product' AND job.status = 'monitoring'
+      LIMIT 1
+    `).get() as { id: string; dataVersion: string; insightId: string; evidenceIdsJson: string };
+    const now = new Date().toISOString();
+    database.prepare(`INSERT INTO evidence_records (
+      id, research_job_id, insight_id, claim, metric_name, metric_value_json,
+      source, source_type, collected_at, period, is_estimated,
+      calculation, confidence, data_version, created_at
+    ) VALUES ('mixed-mock-component', ?, ?, 'Mock component', 'current_price', '99',
+      'Demo task input (DEMO)', 'mock', ?, 'point_in_time', 0,
+      'fixture', 0.9, ?, ?)`)
+      .run(job.id, job.insightId, now, job.dataVersion, now);
+    database.prepare(`UPDATE ai_insights SET evidence_ids_json = ? WHERE id = ?`)
+      .run(JSON.stringify([...JSON.parse(job.evidenceIdsJson) as string[], 'mixed-mock-component']),
+        job.insightId);
+
+    expect(service.verify()).toMatchObject({
+      sellerSpriteCriticalRunId: null,
+      readyForDemoCleanup: false,
+      verifiedEvidenceEntities: 1,
+      requiredEvidenceEntities: 2,
+    });
+
+    database.prepare(`UPDATE evidence_records SET source = 'Operator validation', source_type = 'manual'
+      WHERE id = 'mixed-mock-component'`).run();
+    expect(service.verify()).toMatchObject({
+      readyForDemoCleanup: true,
+      verifiedEvidenceEntities: 2,
       requiredEvidenceEntities: 2,
     });
   });
@@ -716,14 +909,55 @@ describe('GoLiveMigrationService', () => {
     expect(service.verify().readyForDemoCleanup).toBe(false);
   });
 
+  it('requires per-month market call lineage for the critical run', () => {
+    database = openDatabase(':memory:');
+    insertObservationFixture(database, 'mcp', 'mcp');
+    addVerifiedMcpCoverage(database, 'market-us', 'owned-product');
+    const service = new GoLiveMigrationService(database);
+    expect(service.verify().readyForDemoCleanup).toBe(true);
+
+    database.prepare(`DELETE FROM mcp_call_logs
+      WHERE capability = 'MARKET_STATISTICS' AND observation_month = '202608'`).run();
+
+    expect(service.verify()).toMatchObject({
+      sellerSpriteCriticalRunId: null,
+      readyForDemoCleanup: false,
+      hasMinimumRealCoverage: false,
+    });
+  });
+
+  it.each(['market', 'fact'] as const)(
+    'requires the previous month %s observation link in the same run', (kind) => {
+      database = openDatabase(':memory:');
+      insertObservationFixture(database, 'mcp', 'mcp');
+      addVerifiedMcpCoverage(database, 'market-us', 'owned-product');
+      const service = new GoLiveMigrationService(database);
+      expect(service.verify().readyForDemoCleanup).toBe(true);
+
+      const table = kind === 'market' ? 'market_snapshots' : 'metric_facts';
+      database.prepare(`
+        DELETE FROM mcp_sync_observation_links
+        WHERE snapshot_kind = ? AND snapshot_id IN (
+          SELECT id FROM ${table} WHERE observation_date = '2026-08-31'
+        )
+      `).run(kind);
+
+      expect(service.verify()).toMatchObject({
+        sellerSpriteCriticalRunId: null,
+        readyForDemoCleanup: false,
+        hasMinimumRealCoverage: false,
+      });
+    },
+  );
+
   it('accepts one complete roster across multiple nodes inside the main-market tree', () => {
     database = openDatabase(':memory:');
     insertObservationFixture(database, 'mcp', 'mcp');
     database.exec(`
       INSERT INTO market_nodes (
-        id, name, parent_id, level, marketplace, status, source_type, created_at
-      ) VALUES ('secondary-node', 'Secondary owned category', 'market-us', 2, 'US', 'active', 'import',
-        '2026-09-19T00:00:00.000Z');
+        id, name, parent_id, level, marketplace, category_id, status, source_type, created_at
+      ) VALUES ('secondary-node', 'Secondary owned category', 'market-us', 2, 'US',
+        '1055398:1063252:888', 'active', 'import', '2026-09-19T00:00:00.000Z');
       INSERT INTO products (
         id, asin, sku, brand, title, image_url, marketplace, product_type, is_owned,
         market_node_id, source_type, created_at

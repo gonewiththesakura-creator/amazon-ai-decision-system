@@ -5,6 +5,7 @@ import { afterEach, describe, expect, it } from 'vitest';
 import request from 'supertest';
 import type { AppSettings, DashboardData, MarketDetail, OwnedProductSummary } from '../shared/types.js';
 import type { SellerSpriteConnectionDiagnostics } from './adapters/sellersprite-mcp-adapter.js';
+import { sellerSpriteSchemaHash } from './adapters/sellersprite-tool-registry.js';
 import { createApp } from './app.js';
 import { openDatabase, type AppDatabase } from './database/database.js';
 import { previewAndConfirmCsv } from './test-utils/import-api.js';
@@ -147,6 +148,206 @@ describe('V2.2 real-data administration routes', () => {
     const capabilities = await request(app).get('/api/integrations/sellersprite/capabilities').expect(200);
     expect(capabilities.body.data).toMatchObject({ toolCount: 0, collectedAt: null });
     expect(capabilities.body.data.required).toHaveLength(5);
+  });
+
+  it('returns deterministic SellerSprite schema hashes without exposing schema metadata', async () => {
+    database = openDatabase(':memory:');
+    const safeLegacySchema = {
+      type: 'object',
+      properties: {
+        request: {
+          type: 'object',
+          properties: {
+            marketplace: { type: 'string' },
+            month: { type: 'string' },
+            nodeIdPath: { type: 'string' },
+          },
+          required: ['marketplace', 'nodeIdPath', 'month'],
+        },
+      },
+      required: ['request'],
+    };
+    const capabilitiesJson = JSON.stringify({
+      tools: [{
+        name: 'market_research_statistics',
+        description: 'PRIVATE_SCHEMA_CANARY',
+        schemaHash: 'f'.repeat(64),
+        inputSchema: safeLegacySchema,
+      }],
+      capabilities: { MARKET_STATISTICS: 'market_research_statistics' },
+      missingCapabilities: [
+        'MARKET_RESEARCH', 'PRODUCT_CONCENTRATION',
+        'ASIN_SALES_TREND', 'ASIN_COMPETITOR_DISCOVERY',
+      ],
+    });
+    database.prepare(`
+      INSERT INTO provider_capability_snapshots (
+        id, provider_id, capabilities_json, collected_at
+      ) VALUES ('schema-hash-test', 'sellersprite', ?, '2026-09-21T00:00:00.000Z')
+    `).run(capabilitiesJson);
+    const app = createApp({ database });
+
+    const response = await request(app).get('/api/integrations/sellersprite/capabilities').expect(200);
+    const statistic = response.body.data.required.find(
+      (item: { capability: string }) => item.capability === 'MARKET_STATISTICS',
+    );
+
+    expect(statistic).toMatchObject({ available: true });
+    expect(statistic.schemaHash).toBe(sellerSpriteSchemaHash(safeLegacySchema));
+    expect(statistic.schemaHash).not.toBe('f'.repeat(64));
+    expect(JSON.stringify(response.body)).not.toMatch(
+      /PRIVATE_SCHEMA_CANARY|market_research_statistics|nodeIdPath|inputSchema/,
+    );
+  });
+
+  it('uses capability-bound schema hashes when sanitized tool names collide', async () => {
+    database = openDatabase(':memory:');
+    const statisticsHash = 'a'.repeat(64);
+    const concentrationHash = 'b'.repeat(64);
+    const capabilitiesJson = JSON.stringify({
+      tools: [
+        { name: '[REDACTED]', schemaHash: statisticsHash, inputSchema: { type: 'object' } },
+        { name: '[REDACTED]', schemaHash: concentrationHash, inputSchema: { type: 'object' } },
+      ],
+      capabilities: {
+        MARKET_STATISTICS: '[REDACTED]',
+        PRODUCT_CONCENTRATION: '[REDACTED]',
+      },
+      capabilitySchemaHashes: {
+        MARKET_STATISTICS: statisticsHash,
+        PRODUCT_CONCENTRATION: concentrationHash,
+      },
+      missingCapabilities: [
+        'MARKET_RESEARCH', 'ASIN_SALES_TREND', 'ASIN_COMPETITOR_DISCOVERY',
+      ],
+    });
+    database.prepare(`
+      INSERT INTO provider_capability_snapshots (
+        id, provider_id, capabilities_json, collected_at
+      ) VALUES ('sanitized-name-collision', 'sellersprite', ?, '2026-09-21T00:00:00.000Z')
+    `).run(capabilitiesJson);
+    const app = createApp({ database });
+
+    const response = await request(app).get('/api/integrations/sellersprite/capabilities').expect(200);
+    const byCapability = Object.fromEntries(response.body.data.required.map(
+      (item: { capability: string; schemaHash: string | null }) => [item.capability, item],
+    ));
+
+    expect(byCapability.MARKET_STATISTICS).toMatchObject({
+      available: true, schemaHash: statisticsHash,
+    });
+    expect(byCapability.PRODUCT_CONCENTRATION).toMatchObject({
+      available: true, schemaHash: concentrationHash,
+    });
+
+    database.prepare(`
+      UPDATE provider_capability_snapshots SET capabilities_json = ?
+      WHERE id = 'sanitized-name-collision'
+    `).run(JSON.stringify({
+      tools: [
+        { name: '[REDACTED]', schemaHash: statisticsHash, inputSchema: { type: 'object' } },
+        { name: '[REDACTED]', schemaHash: concentrationHash, inputSchema: { type: 'object' } },
+      ],
+      capabilities: {
+        MARKET_STATISTICS: '[REDACTED]',
+        PRODUCT_CONCENTRATION: '[REDACTED]',
+      },
+      missingCapabilities: [
+        'MARKET_RESEARCH', 'ASIN_SALES_TREND', 'ASIN_COMPETITOR_DISCOVERY',
+      ],
+    }));
+    const ambiguousLegacy = (await request(app)
+      .get('/api/integrations/sellersprite/capabilities').expect(200)).body.data;
+    const ambiguousByCapability = Object.fromEntries(ambiguousLegacy.required.map(
+      (item: { capability: string; schemaHash: string | null }) => [item.capability, item],
+    ));
+    expect(ambiguousByCapability.MARKET_STATISTICS).toMatchObject({
+      available: false, schemaHash: null,
+    });
+    expect(ambiguousByCapability.PRODUCT_CONCENTRATION).toMatchObject({
+      available: false, schemaHash: null,
+    });
+  });
+
+  it('selects only the critical run capability schema when a run ID is supplied', async () => {
+    database = openDatabase(':memory:');
+    const old = JSON.stringify({
+      tools: [{ name: 'tool-old', inputSchema: { type: 'object', properties: { old: { type: 'string' } } } }],
+      capabilities: { MARKET_STATISTICS: 'tool-old' }, missingCapabilities: [],
+    });
+    const current = JSON.stringify({
+      tools: [{ name: 'tool-current', inputSchema: { type: 'object', properties: { month: { type: 'string' } } } }],
+      capabilities: { MARKET_STATISTICS: 'tool-current' }, missingCapabilities: [],
+    });
+    const runId = '11111111-1111-4111-8111-111111111111';
+    database.prepare(`
+      INSERT INTO data_tasks (
+        id, sync_run_id, name, task_type, target, source, marketplace,
+        status, total, success, failed, created_at
+      ) VALUES (?, ?, 'schema run', 'critical_sync', 'market-1',
+        'SellerSprite MCP', 'US', 'success', 1, 1, 0, '2026-09-21T01:00:00.000Z')
+    `).run(runId, runId);
+    database.prepare(`
+      INSERT INTO provider_capability_snapshots (
+        id, provider_id, capabilities_json, collected_at, sync_run_id
+      ) VALUES (?, 'sellersprite', ?, ?, ?)
+    `).run('old', old, '2026-09-21T02:00:00.000Z', null);
+    database.prepare(`
+      INSERT INTO provider_capability_snapshots (
+        id, provider_id, capabilities_json, collected_at, sync_run_id
+      ) VALUES (?, 'sellersprite', ?, ?, ?)
+    `).run('current', current, '2026-09-21T01:00:00.000Z', runId);
+    const app = createApp({ database });
+
+    const latest = (await request(app).get('/api/integrations/sellersprite/capabilities').expect(200)).body.data;
+    const scoped = (await request(app)
+      .get(`/api/integrations/sellersprite/capabilities?runId=${runId}`).expect(200)).body.data;
+
+    expect(scoped.required[1].schemaHash).toMatch(/^[a-f0-9]{64}$/);
+    expect(scoped.required[1].schemaHash).not.toBe(latest.required[1].schemaHash);
+    await request(app)
+      .get('/api/integrations/sellersprite/capabilities?runId=22222222-2222-4222-8222-222222222222')
+      .expect(404);
+  });
+
+  it('proves the Dashboard selected run-linked real observations while Demo is retained', async () => {
+    database = openDatabase(':memory:');
+    const app = createApp({ database });
+    await request(app).post('/api/settings/demo').send({ enabled: true }).expect(200);
+    database.exec(`
+      INSERT INTO market_nodes (
+        id, name, parent_id, level, marketplace, category_id, keywords_json,
+        status, source_type, created_at
+      ) VALUES (
+        'real-market', 'Verified market', NULL, 1, 'US', '1055398:1063252',
+        '[]', 'active', 'import', '2026-09-21T00:00:00.000Z'
+      );
+      INSERT INTO products (
+        id, asin, sku, brand, title, image_url, marketplace, product_type,
+        is_owned, market_node_id, source_type, created_at
+      ) VALUES (
+        'real-owned', 'B0REAL0001', 'REAL-1', 'Brand', 'Real owned SKU', '',
+        'US', 'pillow', 1, 'real-market', 'import', '2026-09-21T00:00:00.000Z'
+      );
+      UPDATE app_settings SET default_market_id = 'real-market' WHERE id = 1;
+    `);
+    addVerifiedMcpCoverage(database, 'real-market', 'real-owned');
+    const runId = (database.prepare(`
+      SELECT id FROM data_coverage_runs WHERE run_type = 'critical_sync'
+    `).get() as { id: string }).id;
+
+    const response = await request(app)
+      .get(`/api/dashboard/executive/run-proof/${runId}`).expect(200);
+    expect(response.body.data).toEqual({
+      passed: true, marketVerified: true, verifiedOwnedProducts: 1, requiredOwnedProducts: 1,
+    });
+    expect(JSON.stringify(response.body.data)).not.toMatch(/B0REAL0001|Real owned SKU|1055398/);
+
+    database.prepare(`DELETE FROM mcp_sync_observation_links
+      WHERE snapshot_kind = 'fact' AND entity_id = 'real-owned'`).run();
+    const stale = await request(app)
+      .get(`/api/dashboard/executive/run-proof/${runId}`).expect(200);
+    expect(stale.body.data).toMatchObject({ passed: false, verifiedOwnedProducts: 0 });
   });
 
   it('syncs market and owned history through admin routes without remote calls on dashboard GET', async () => {

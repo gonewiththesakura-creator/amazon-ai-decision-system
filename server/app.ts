@@ -19,12 +19,14 @@ import {
   SellerSpriteMCPAdapter,
   type SellerSpriteConnectionDiagnostics,
 } from './adapters/index.js';
+import { sellerSpriteSchemaHash } from './adapters/sellersprite-tool-registry.js';
 import type { SellerSpriteSyncPort } from './services/sellersprite-sync-service.js';
 import { openDatabase, type AppDatabase } from './database/database.js';
 import { IntelligenceRepository } from './repository/intelligence-repository.js';
 import { WorkflowRepository } from './repository/workflow-repository.js';
 import { ImportService } from './services/import-service.js';
 import { ExecutiveDashboardService } from './services/executive-dashboard-service.js';
+import { proveDashboardRunReadPath } from './services/dashboard-run-read-proof.js';
 import { DataCoverageService } from './services/data-coverage-service.js';
 import { IntelligenceService } from './services/intelligence-service.js';
 import { GoLiveMigrationService } from './services/go-live-migration-service.js';
@@ -248,6 +250,11 @@ export function createApp(options: CreateAppOptions = {}): express.Express {
     assertRequestedMarketplace(repository, query.marketplace);
     if (query.skuId) requireOwnedProduct(repository, query.skuId);
     sendData(response, executiveDashboard.getDashboard(query.range, query.skuId), repository);
+  });
+  app.get('/api/dashboard/executive/run-proof/:runId', adminOnly, (request, response) => {
+    const runId = z.string().uuid().parse(routeParam(request, 'runId'));
+    const roster = completedCriticalRoster(database, repository.getSettings().marketplace, runId);
+    sendData(response, proveDashboardRunReadPath(database, { runId, ...roster }), repository);
   });
   app.get('/api/data-coverage', (request, response) => {
     const query = z.object({ marketplace: z.string().trim().min(1).optional() }).parse(request.query);
@@ -487,25 +494,51 @@ export function createApp(options: CreateAppOptions = {}): express.Express {
     );
     sendData(response, result, repository);
   }));
-  app.get('/api/integrations/sellersprite/capabilities', (_request, response) => {
+  app.get('/api/integrations/sellersprite/capabilities', (request, response) => {
+    const query = z.object({ runId: z.string().uuid().optional() }).parse(request.query);
     const row = database.prepare(`
       SELECT capabilities_json AS capabilitiesJson, collected_at AS collectedAt
       FROM provider_capability_snapshots
-      WHERE provider_id = 'sellersprite'
+      WHERE provider_id = 'sellersprite' AND (? IS NULL OR sync_run_id = ?)
       ORDER BY collected_at DESC, rowid DESC LIMIT 1
-    `).get() as { capabilitiesJson: string; collectedAt: string } | undefined;
+    `).get(query.runId ?? null, query.runId ?? null) as {
+      capabilitiesJson: string; collectedAt: string;
+    } | undefined;
+    if (query.runId && !row) throw httpError(404, '该运行没有 SellerSprite 能力快照。');
     const payload = row ? safeJsonObject(row.capabilitiesJson) : {};
     const mappings = safeJsonObject(payload.capabilities);
+    const capabilitySchemaHashes = safeJsonObject(payload.capabilitySchemaHashes);
+    const tools = Array.isArray(payload.tools)
+      ? payload.tools.filter((tool): tool is Record<string, unknown> => (
+        Boolean(tool) && typeof tool === 'object' && !Array.isArray(tool)
+      ))
+      : [];
     const missing = Array.isArray(payload.missingCapabilities)
       ? new Set(payload.missingCapabilities.filter((value): value is string => typeof value === 'string'))
       : new Set<string>(SELLERSPRITE_CAPABILITIES);
     sendData(response, {
       collectedAt: row?.collectedAt ?? null,
-      toolCount: Array.isArray(payload.tools) ? payload.tools.length : 0,
-      required: SELLERSPRITE_CAPABILITIES.map((capability) => ({
-        capability,
-        available: !missing.has(capability) && typeof mappings[capability] === 'string',
-      })),
+      toolCount: tools.length,
+      required: SELLERSPRITE_CAPABILITIES.map((capability) => {
+        const mappedName = mappings[capability];
+        const matchingTools = typeof mappedName === 'string'
+          ? tools.filter((tool) => tool.name === mappedName)
+          : [];
+        const directHash = validSchemaHash(capabilitySchemaHashes[capability]);
+        const legacyTool = matchingTools.length === 1 ? matchingTools[0] : undefined;
+        const legacyHash = legacyTool?.inputSchema && typeof legacyTool.inputSchema === 'object'
+          ? sellerSpriteSchemaHash(legacyTool.inputSchema)
+          : null;
+        const schemaHash = directHash ?? legacyHash;
+        const available = !missing.has(capability)
+          && matchingTools.length > 0
+          && schemaHash !== null;
+        return {
+          capability,
+          available,
+          schemaHash: available ? schemaHash : null,
+        };
+      }),
     }, repository);
   });
 
@@ -548,6 +581,10 @@ export function createApp(options: CreateAppOptions = {}): express.Express {
     requireMarket(repository, input.marketId);
     sendData(response, await sellerSprite.syncCriticalBatch(input), repository, 201);
   }));
+  app.get('/api/integrations/sellersprite/sync/critical/:runId/roster', adminOnly, (request, response) => {
+    const runId = z.string().uuid().parse(routeParam(request, 'runId'));
+    sendData(response, completedCriticalRoster(database, repository.getSettings().marketplace, runId), repository);
+  });
   app.post('/api/owned-products/:id/competitor-candidates', adminOnly, asyncHandler(async (request, response) => {
     const ownedProductId = routeParam(request, 'id');
     requireOwnedProduct(repository, ownedProductId);
@@ -763,6 +800,37 @@ function safeJsonObject(value: unknown): Record<string, unknown> {
   } catch {
     return {};
   }
+}
+
+function validSchemaHash(value: unknown): string | null {
+  return typeof value === 'string' && /^[a-f0-9]{64}$/.test(value) ? value : null;
+}
+
+function completedCriticalRoster(
+  database: AppDatabase, marketplace: string, runId: string,
+): { marketId: string; ownedProductIds: string[] } {
+  const row = database.prepare(`
+    SELECT run.coverage_json AS coverageJson
+    FROM data_coverage_runs run
+    JOIN data_tasks task ON task.id = run.id AND task.sync_run_id = run.id
+    WHERE run.id = ? AND run.marketplace = ? AND run.run_type = 'critical_sync'
+      AND run.is_complete = 1 AND task.task_type = 'critical_sync' AND task.status = 'success'
+      AND task.success = task.total AND task.failed = 0
+  `).get(runId, marketplace) as { coverageJson: string } | undefined;
+  if (!row) throw httpError(404, '关键同步运行不存在或尚未完整完成。');
+  const coverage = safeJsonObject(row.coverageJson);
+  const roster = Array.isArray(coverage.ownedProducts) ? coverage.ownedProducts : [];
+  const ownedProductIds = roster.map((item) => (
+    item && typeof item === 'object' && !Array.isArray(item)
+      ? (item as Record<string, unknown>).id
+      : undefined
+  ));
+  if (typeof coverage.marketId !== 'string' || ownedProductIds.length === 0
+    || ownedProductIds.some((id) => typeof id !== 'string' || id.length === 0)
+    || new Set(ownedProductIds).size !== ownedProductIds.length) {
+    throw httpError(409, '关键同步运行范围记录无效。');
+  }
+  return { marketId: coverage.marketId, ownedProductIds: ownedProductIds as string[] };
 }
 
 function requireMarket(repository: IntelligenceRepository, id: string) {

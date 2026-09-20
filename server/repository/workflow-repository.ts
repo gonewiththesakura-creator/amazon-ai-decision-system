@@ -121,6 +121,12 @@ export class WorkflowRepository {
     const promptVersion = promptVersionFor(input.type);
     const initialInput = input.input ?? {};
     const dataVersion = workflowDataVersion(initialInput, input.taskBook ?? {}, promptVersion);
+    const isDemo = researchJobIsDemo(
+      this.database, settings.mode, input.entityType, input.entityId,
+    );
+    if (settings.mode !== 'demo' && isDemo) {
+      throw new Error('非 Demo 模式不能为 Mock 实体创建 Research Job。');
+    }
     this.database.prepare(`
       INSERT INTO research_jobs (
         id, name, job_type, marketplace, status, entity_type, entity_id,
@@ -133,7 +139,7 @@ export class WorkflowRepository {
       input.entityType ?? null, input.entityId ?? null,
       profile.id, profile.version, JSON.stringify(profile),
       JSON.stringify(initialInput), JSON.stringify(input.taskBook ?? {}),
-      settings.mode === 'demo' ? 1 : 0, input.createdBy, dataVersion,
+      isDemo ? 1 : 0, input.createdBy, dataVersion,
       promptVersion, now, now,
     );
     this.ensureStep(id, 'plan');
@@ -546,6 +552,7 @@ export class WorkflowRepository {
     if (input.syncRunId !== undefined && input.syncRunId !== syncRunId) {
       throw new Error('Evidence 同步批次必须匹配来源记录的实际同步批次。');
     }
+    if (syncRunId) this.assertJobTaskRunCompatible(jobId, syncRunId);
     const existing = this.database.prepare(`
       SELECT * FROM evidence_records
       WHERE research_job_id = ? AND claim = ? AND metric_name = ?
@@ -555,7 +562,10 @@ export class WorkflowRepository {
       jobId, input.claim, input.metricName, JSON.stringify(input.metricValue),
       input.sourceRecordId ?? null, input.dataVersion,
     ) as DbRow | undefined;
-    if (existing && nullableString(existing.sync_run_id) === syncRunId) return mapEvidence(existing);
+    if (existing && nullableString(existing.sync_run_id) === syncRunId) {
+      if (syncRunId) this.bindJobTasksToRun(jobId, syncRunId);
+      return mapEvidence(existing);
+    }
     const id = randomUUID();
     const now = new Date().toISOString();
     this.database.prepare(`
@@ -570,7 +580,24 @@ export class WorkflowRepository {
       input.sourceRecordId ?? null, input.collectedAt, input.period,
       input.isEstimated ? 1 : 0, input.calculation, input.confidence, input.dataVersion, now, syncRunId,
     );
+    if (syncRunId) this.bindJobTasksToRun(jobId, syncRunId);
     return this.getEvidence(jobId).find((item) => item.id === id)!;
+  }
+
+  private assertJobTaskRunCompatible(jobId: string, syncRunId: string): void {
+    const conflict = this.database.prepare(`
+      SELECT 1 FROM data_tasks
+      WHERE research_job_id = ? AND sync_run_id IS NOT NULL AND sync_run_id <> ?
+      LIMIT 1
+    `).get(jobId, syncRunId);
+    if (conflict) throw new Error('同一 Research Job 的 DataTask 和 Evidence 必须关联同一个 sync run。');
+  }
+
+  private bindJobTasksToRun(jobId: string, syncRunId: string): void {
+    this.database.prepare(`
+      UPDATE data_tasks SET sync_run_id = ?
+      WHERE research_job_id = ? AND sync_run_id IS NULL
+    `).run(syncRunId, jobId);
   }
 
   private sourceSyncRunId(
@@ -1366,6 +1393,27 @@ function validateJobEntity(
     throw new Error(`不支持的实体类型：${entityType}`);
   }
   if (!found) throw new Error('关联实体不存在或不属于当前站点。');
+}
+
+function researchJobIsDemo(
+  database: AppDatabase,
+  mode: 'empty' | 'demo' | 'live',
+  entityType?: string,
+  entityId?: string,
+): boolean {
+  if (entityId && (entityType === 'market' || entityType === 'market_node')) {
+    const row = database.prepare(`
+      SELECT source_type AS sourceType FROM market_nodes WHERE id = ?
+    `).get(entityId) as { sourceType: string } | undefined;
+    if (row) return row.sourceType === 'mock';
+  }
+  if (entityId && entityType === 'owned_product') {
+    const row = database.prepare(`
+      SELECT source_type AS sourceType FROM products WHERE id = ? AND is_owned = 1
+    `).get(entityId) as { sourceType: string } | undefined;
+    if (row) return row.sourceType === 'mock';
+  }
+  return mode === 'demo';
 }
 
 function assertTaskBookMarketplace(marketplace: string, taskBook: Record<string, unknown>): void {

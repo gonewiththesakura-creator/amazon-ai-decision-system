@@ -1,6 +1,7 @@
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { mcpToolSchema, type McpToolDefinition } from './sellersprite-mcp-schemas.js';
 import type { McpCapabilitySnapshot, McpCapabilityStore } from './sellersprite-mcp-store.js';
+import { isCredentialFieldName, redactCredentialAssignments } from './sensitive-field.js';
 
 export const SELLERSPRITE_CAPABILITIES = [
   'MARKET_RESEARCH',
@@ -58,11 +59,17 @@ export class SellerSpriteToolRegistry {
       discoveredAt: (this.options.now?.() ?? new Date()).toISOString(),
       tools: this.tools.map((tool) => ({
         name: safeMetadataText(tool.name),
-        description: tool.description ? safeMetadataText(tool.description) : undefined,
+        description: tool.description ? REDACTED_SCHEMA_VALUE : undefined,
         inputSchema: safeInputSchema(tool.inputSchema),
+        schemaHash: sellerSpriteSchemaHash(tool.inputSchema),
       })),
       capabilities: Object.fromEntries(
         [...this.mapping].map(([capability, tool]) => [capability, safeMetadataText(tool.name)]),
+      ) as Partial<Record<SellerSpriteCapability, string>>,
+      capabilitySchemaHashes: Object.fromEntries(
+        [...this.mapping].map(([capability, tool]) => [
+          capability, sellerSpriteSchemaHash(tool.inputSchema),
+        ]),
       ) as Partial<Record<SellerSpriteCapability, string>>,
       missingCapabilities: this.missing(),
     };
@@ -105,6 +112,125 @@ export class SellerSpriteToolRegistry {
   }
 }
 
+export function sellerSpriteSchemaHash(schema: unknown): string {
+  return createHash('sha256').update(canonicalJson(safeSchemaFingerprint(schema))).digest('hex');
+}
+
+const REDACTED_SCHEMA_VALUE = '[REDACTED]';
+const PII_PATH = /asin|sku|e-?mail|phone|customer|account|user(?:name|id)?|person|address|postal|zip|(?:^|[_-])name(?:$|[_-])|title|keyword|query/i;
+const SCHEMA_VALUE_KEY = /^(?:enum|const|default|examples?)$/i;
+const SCHEMA_TEXT_KEY = /^(?:description|title|\$comment|pattern|\$ref|\$id|\$schema)$/i;
+const SCHEMA_STRUCTURE_KEYS = new Set([
+  'type', 'properties', 'required', 'items', 'additionalProperties', 'format',
+  'oneOf', 'allOf', 'anyOf', '$defs', 'definitions',
+]);
+const JSON_SCHEMA_TYPES = new Set([
+  'array', 'boolean', 'integer', 'null', 'number', 'object', 'string',
+]);
+const JSON_SCHEMA_FORMATS = new Set([
+  'date', 'date-time', 'duration', 'email', 'hostname', 'idn-email', 'idn-hostname',
+  'ipv4', 'ipv6', 'iri', 'iri-reference', 'json-pointer', 'regex',
+  'relative-json-pointer', 'time', 'uri', 'uri-reference', 'uri-template', 'uuid',
+]);
+const MARKETPLACES = new Set([
+  'AE', 'AU', 'BE', 'BR', 'CA', 'DE', 'EG', 'ES', 'FR', 'IN', 'IT', 'JP', 'MX',
+  'NL', 'PL', 'SA', 'SE', 'SG', 'TR', 'UK', 'US',
+]);
+const SAFE_CONTRACT_ENUMS: Record<string, ReadonlySet<string>> = {
+  marketplace: MARKETPLACES,
+  period: new Set(['daily', 'weekly', 'monthly', 'quarterly', 'yearly']),
+  granularity: new Set(['day', 'week', 'month', 'quarter', 'year']),
+  interval: new Set(['day', 'week', 'month', 'quarter', 'year']),
+  frequency: new Set(['daily', 'weekly', 'monthly', 'quarterly', 'yearly']),
+  sortOrder: new Set(['asc', 'ascending', 'desc', 'descending']),
+  order: new Set(['asc', 'ascending', 'desc', 'descending']),
+  direction: new Set(['asc', 'ascending', 'desc', 'descending']),
+};
+
+interface SchemaFingerprintContext {
+  keyword?: string;
+  propertyName?: string;
+}
+
+function safeSchemaFingerprint(value: unknown, context: SchemaFingerprintContext = {}): unknown {
+  if ((context.keyword && isSensitiveSchemaPath(context.keyword))
+    || (context.propertyName && isSensitiveSchemaPath(context.propertyName))) {
+    return REDACTED_SCHEMA_VALUE;
+  }
+  if (context.keyword && SCHEMA_VALUE_KEY.test(context.keyword)) {
+    return safeContractSchemaValue(context.propertyName, value) ?? REDACTED_SCHEMA_VALUE;
+  }
+  if (context.keyword && SCHEMA_TEXT_KEY.test(context.keyword)) return REDACTED_SCHEMA_VALUE;
+  if (context.keyword && !SCHEMA_STRUCTURE_KEYS.has(context.keyword)) return REDACTED_SCHEMA_VALUE;
+  if (Array.isArray(value)) {
+    const entries = value.map((entry) => safeSchemaFingerprint(entry, context));
+    return context.keyword === 'required'
+      ? entries.sort((left, right) => canonicalJson(left).localeCompare(canonicalJson(right)))
+      : entries;
+  }
+  if (value && typeof value === 'object') {
+    const entries = Object.entries(value as Record<string, unknown>)
+      .filter(([, item]) => item !== undefined);
+    if (context.keyword === 'properties') {
+      return entries.map(([propertyName, item]) => [
+        safeSchemaPath(propertyName),
+        safeSchemaFingerprint(item, { propertyName }),
+      ]).sort((left, right) => canonicalJson(left).localeCompare(canonicalJson(right)));
+    }
+    return Object.fromEntries(entries.map(([key, item]) => [
+      safeSchemaPath(key),
+      safeSchemaFingerprint(item, { keyword: key, propertyName: context.propertyName }),
+    ]));
+  }
+  if (typeof value === 'string') {
+    if (context.keyword === 'required') return safeSchemaPath(value);
+    if (context.keyword === 'type' && JSON_SCHEMA_TYPES.has(value)) return value;
+    if (context.keyword === 'format' && JSON_SCHEMA_FORMATS.has(value)) return value;
+    return REDACTED_SCHEMA_VALUE;
+  }
+  return context.keyword === 'additionalProperties' && typeof value === 'boolean'
+    ? value : REDACTED_SCHEMA_VALUE;
+}
+
+function safeContractSchemaValue(propertyName: string | undefined, value: unknown): unknown | null {
+  if (!propertyName) return null;
+  const allowlist = SAFE_CONTRACT_ENUMS[propertyName];
+  if (!allowlist) return null;
+  const normalize = (item: unknown): string | null => {
+    if (typeof item !== 'string') return null;
+    const candidate = propertyName === 'marketplace' ? item.toUpperCase() : item.toLowerCase();
+    return allowlist.has(candidate) ? candidate : null;
+  };
+  if (Array.isArray(value)) {
+    const normalized = value.map(normalize);
+    return normalized.every((item): item is string => item !== null)
+      ? [...new Set(normalized)].sort((left, right) => left.localeCompare(right))
+      : null;
+  }
+  return normalize(value);
+}
+
+function safeSchemaPath(value: string): string {
+  if (isCredentialFieldName(value)) return '[CREDENTIAL_PATH]';
+  if (PII_PATH.test(value)) return '[PII_PATH]';
+  return safeMetadataText(value);
+}
+
+function isSensitiveSchemaPath(value: string): boolean {
+  return isCredentialFieldName(value) || PII_PATH.test(value);
+}
+
+function canonicalJson(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(',')}]`;
+  if (value && typeof value === 'object') {
+    const entries = Object.entries(value as Record<string, unknown>)
+      .filter(([, item]) => item !== undefined)
+      .sort(([left], [right]) => left.localeCompare(right));
+    return `{${entries.map(([key, item]) => `${JSON.stringify(key)}:${canonicalJson(item)}`).join(',')}}`;
+  }
+  return JSON.stringify(value) ?? 'null';
+}
+
 function supportsSchema(capability: SellerSpriteCapability, tool: McpToolDefinition): boolean {
   const schema = capability.startsWith('ASIN_')
     ? tool.inputSchema : marketRequestSchema(tool.inputSchema);
@@ -142,7 +268,8 @@ function scoreTool(capability: SellerSpriteCapability, tool: McpToolDefinition):
 }
 
 function safeMetadataText(value: string): string {
-  return /https?:\/\/|authorization|bearer|secret|token|api[_-]?key|password/i.test(value)
+  return /https?:\/\//i.test(value) || isCredentialFieldName(value)
+    || redactCredentialAssignments(value) !== value
     ? '[REDACTED]' : value;
 }
 
@@ -153,18 +280,28 @@ function safeInputSchema(schema: McpToolDefinition['inputSchema']): McpToolDefin
 function safeSchemaProperty(value: unknown): Record<string, unknown> {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return {};
   return Object.fromEntries(Object.entries(value as Record<string, unknown>).map(([key, item]) => {
-    const safeKey = safeMetadataText(key);
-    if (/^(?:enum|const|default|examples?)$/i.test(key)) {
-      return [safeKey, Array.isArray(item) ? item.map(() => '[REDACTED]') : '[REDACTED]'];
+    const safeKey = safeSchemaPath(key);
+    if (isSensitiveSchemaPath(key)) return [safeKey, REDACTED_SCHEMA_VALUE];
+    if (SCHEMA_VALUE_KEY.test(key) || !SCHEMA_STRUCTURE_KEYS.has(key)) return [safeKey, REDACTED_SCHEMA_VALUE];
+    if (key === 'type') return [safeKey, typeof item === 'string' && JSON_SCHEMA_TYPES.has(item)
+      ? item : REDACTED_SCHEMA_VALUE];
+    if (key === 'format') return [safeKey, typeof item === 'string' && JSON_SCHEMA_FORMATS.has(item)
+      ? item : REDACTED_SCHEMA_VALUE];
+    if (key === 'properties' || key === '$defs' || key === 'definitions') {
+      if (!item || typeof item !== 'object' || Array.isArray(item)) return [safeKey, REDACTED_SCHEMA_VALUE];
+      return [safeKey, Object.fromEntries(Object.entries(item).map(([propertyName, property]) => [
+        safeSchemaPath(propertyName), isSensitiveSchemaPath(propertyName)
+          ? REDACTED_SCHEMA_VALUE : safeSchemaProperty(property),
+      ]))];
     }
     if (Array.isArray(item)) return [safeKey, item.map((entry) => {
-      if (typeof entry === 'string') return safeMetadataText(entry);
+      if (typeof entry === 'string') return key === 'required' ? safeSchemaPath(entry) : REDACTED_SCHEMA_VALUE;
       if (entry && typeof entry === 'object') return safeSchemaProperty(entry);
-      return entry;
+      return REDACTED_SCHEMA_VALUE;
     })];
     if (item && typeof item === 'object') return [safeKey, safeSchemaProperty(item)];
-    if (typeof item === 'string') return [safeKey, safeMetadataText(item)];
-    return [safeKey, item];
+    return [safeKey, key === 'additionalProperties' && typeof item === 'boolean'
+      ? item : REDACTED_SCHEMA_VALUE];
   }));
 }
 

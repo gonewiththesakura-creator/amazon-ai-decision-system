@@ -1892,6 +1892,26 @@ const migrations = [
         ON data_tasks(sync_run_id, task_type, status);
     `,
   },
+  {
+    version: 26,
+    apply(database: DatabaseSync) {
+      const table = database.prepare(`SELECT 1 AS found FROM sqlite_master
+        WHERE type = 'table' AND name = 'mcp_call_logs'`).get() as { found: number } | undefined;
+      if (!table) return;
+      const columns = database.prepare('PRAGMA table_info(mcp_call_logs)').all()
+        .map((column) => String(column.name));
+      if (!columns.includes('observation_month')) {
+        database.exec(`ALTER TABLE mcp_call_logs
+          ADD COLUMN observation_month TEXT CHECK (observation_month IS NULL
+            OR (observation_month GLOB '[0-9][0-9][0-9][0-9][0-9][0-9]'
+              AND substr(observation_month, 5, 2) BETWEEN '01' AND '12'))`);
+      }
+      if (columns.includes('sync_run_id')) {
+        database.exec(`CREATE INDEX IF NOT EXISTS idx_mcp_call_logs_run_market_month
+          ON mcp_call_logs(sync_run_id, capability, entity_id, observation_month)`);
+      }
+    },
+  },
 ];
 
 export function migrate(database: DatabaseSync): void {

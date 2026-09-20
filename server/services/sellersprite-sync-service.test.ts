@@ -4,6 +4,7 @@ import { IntelligenceRepository } from '../repository/intelligence-repository.js
 import { SellerSpriteSyncService, type SellerSpriteSyncPort } from './sellersprite-sync-service.js';
 import { MetricAuthorityResolver } from './metric-authority-resolver.js';
 import { DashboardFreshnessService } from './dashboard-freshness-service.js';
+import { proveDashboardRunReadPath } from './dashboard-run-read-proof.js';
 
 let database: AppDatabase | undefined;
 
@@ -1059,6 +1060,135 @@ describe('SellerSprite real-data sync', () => {
     expect(JSON.parse(coverage.coverageJson)).toMatchObject({
       month: '202608', baselineMonth: '202607', marketMonths: ['202607', '202608'],
     });
+  });
+
+  it('captures the root and each distinct owned child market within one critical run', async () => {
+    database = fixtureDatabase();
+    database.exec(`
+      INSERT INTO market_nodes (
+        id, name, parent_id, level, marketplace, category_id, status, source_type, created_at
+      ) VALUES ('child-market', 'Child pillows', 'market-1', 2, 'US',
+        '1055398:1063252:1199122:10671043011:999', 'active', 'import', '2026-09-01');
+      INSERT INTO products (
+        id, asin, sku, brand, title, image_url, marketplace, product_type,
+        is_owned, market_node_id, source_type, created_at
+      ) VALUES ('owned-child', 'B0OWNED002', 'SKU-02', 'Owned', 'Child Pillow', '', 'US',
+        'memory_foam_pillow', 1, 'child-market', 'import', '2026-09-01');
+    `);
+    const requests: Array<{ path: string; month: string | undefined; runId: string | undefined }> = [];
+    const port = fixturePort({
+      async fetchMarketStatistics(input, context) {
+        requests.push({ path: input.nodeIdPath, month: input.month, runId: context?.runId });
+        return { data: {
+          marketplace: input.marketplace, nodeIdPath: input.nodeIdPath, month: input.month,
+          products: 20, totalUnits: input.month === '202608' ? 120 : 100,
+        }, provenance };
+      },
+      async fetchMarketConcentration(input, context) {
+        requests.push({ path: input.nodeIdPath, month: input.month, runId: context?.runId });
+        return { data: [], provenance };
+      },
+    });
+
+    const result = await new SellerSpriteSyncService(database, port)
+      .syncCriticalBatch({ marketId: 'market-1', month: '202608' });
+    const childPath = `${NODE_PATH}:999`;
+    const scopes = [NODE_PATH, childPath].flatMap((path) => ['202607', '202608']
+      .map((month) => `${path}/${month}`));
+    expect(result).toMatchObject({ marketSnapshots: 4, productSnapshots: 4 });
+    expect(requests).toHaveLength(8);
+    expect(requests.map((item) => `${item.path}/${item.month}`).sort())
+      .toEqual([...scopes, ...scopes].sort());
+    expect(requests.every((item) => item.runId === result.runId)).toBe(true);
+    expect(database.prepare(`SELECT total, success, failed FROM data_tasks WHERE id = ?`)
+      .get(result.runId)).toEqual({ total: 4, success: 4, failed: 0 });
+    expect(database.prepare(`
+      SELECT entity_id AS entityId, COUNT(*) AS count
+      FROM mcp_sync_observation_links WHERE sync_run_id = ? AND snapshot_kind = 'market'
+      GROUP BY entity_id ORDER BY entity_id
+    `).all(result.runId)).toEqual([
+      { entityId: 'child-market', count: 2 }, { entityId: 'market-1', count: 2 },
+    ]);
+    const coverage = database.prepare(`SELECT coverage_json AS coverageJson
+      FROM data_coverage_runs WHERE id = ?`).get(result.runId) as { coverageJson: string };
+    expect(JSON.parse(coverage.coverageJson)).toMatchObject({
+      marketNodes: [
+        { id: 'market-1', nodeIdPath: NODE_PATH },
+        { id: 'child-market', nodeIdPath: childPath },
+      ],
+    });
+    expect(proveDashboardRunReadPath(database, {
+      runId: result.runId,
+      marketId: 'market-1',
+      ownedProductIds: ['owned-1', 'owned-child'],
+    })).toEqual({
+      passed: true,
+      marketVerified: true,
+      verifiedOwnedProducts: 2,
+      requiredOwnedProducts: 2,
+    });
+  });
+
+  it('does not commit root observations when a required child market fails', async () => {
+    database = fixtureDatabase();
+    database.exec(`
+      INSERT INTO market_nodes (
+        id, name, parent_id, level, marketplace, category_id, status, source_type, created_at
+      ) VALUES ('child-market', 'Child pillows', 'market-1', 2, 'US',
+        '1055398:1063252:1199122:10671043011:999', 'active', 'import', '2026-09-01');
+      UPDATE products SET market_node_id = 'child-market' WHERE id = 'owned-1';
+    `);
+    const base = fixturePort();
+    const port = fixturePort({
+      async fetchMarketStatistics(input, context) {
+        if (input.nodeIdPath.endsWith(':999')) throw new Error('secret-key=child-private');
+        return base.fetchMarketStatistics(input, context);
+      },
+    });
+
+    await expect(new SellerSpriteSyncService(database, port)
+      .syncCriticalBatch({ marketId: 'market-1', month: '202608' }))
+      .rejects.not.toThrow(/child-private/);
+    expect(database.prepare(`SELECT COUNT(*) AS count FROM market_snapshots`).get())
+      .toEqual({ count: 0 });
+    expect(database.prepare(`SELECT COUNT(*) AS count FROM product_snapshots`).get())
+      .toEqual({ count: 0 });
+    expect(database.prepare(`SELECT status, total, failed FROM data_tasks
+      WHERE task_type = 'critical_sync'`).get()).toEqual({ status: 'failed', total: 3, failed: 1 });
+  });
+
+  it('rejects a child market path changed during a critical run', async () => {
+    database = fixtureDatabase();
+    database.exec(`
+      INSERT INTO market_nodes (
+        id, name, parent_id, level, marketplace, category_id, status, source_type, created_at
+      ) VALUES ('child-market', 'Child pillows', 'market-1', 2, 'US',
+        '1055398:1063252:1199122:10671043011:999', 'active', 'import', '2026-09-01');
+      UPDATE products SET market_node_id = 'child-market' WHERE id = 'owned-1';
+    `);
+    const base = fixturePort();
+    const port = fixturePort({
+      async fetchMarketStatistics(input) {
+        return { data: {
+          marketplace: input.marketplace, nodeIdPath: input.nodeIdPath,
+          month: input.month, products: 20, totalUnits: 100,
+        }, provenance };
+      },
+      async fetchMarketConcentration() { return { data: [], provenance }; },
+      async fetchAsinSalesTrend(input, context) {
+        database!.prepare(`UPDATE market_nodes SET category_id = ? WHERE id = 'child-market'`)
+          .run(`${NODE_PATH}:changed`);
+        return base.fetchAsinSalesTrend(input, context);
+      },
+    });
+
+    await expect(new SellerSpriteSyncService(database, port)
+      .syncCriticalBatch({ marketId: 'market-1', month: '202608' }))
+      .rejects.toThrow(/范围发生变化/);
+    expect(database.prepare(`SELECT COUNT(*) AS count FROM market_snapshots`).get())
+      .toEqual({ count: 0 });
+    expect(database.prepare(`SELECT status FROM data_tasks WHERE task_type = 'critical_sync'`).get())
+      .toEqual({ status: 'failed' });
   });
 
   it('keeps the critical run incomplete until both secondary coverage stages are recorded', async () => {

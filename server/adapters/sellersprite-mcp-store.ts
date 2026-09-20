@@ -8,8 +8,9 @@ export interface McpCapabilitySnapshot {
   provider: 'sellersprite';
   runId?: string | null;
   discoveredAt: string;
-  tools: Array<Pick<McpToolDefinition, 'name' | 'description' | 'inputSchema'>>;
+  tools: Array<Pick<McpToolDefinition, 'name' | 'description' | 'inputSchema'> & { schemaHash?: string }>;
   capabilities: Partial<Record<SellerSpriteCapability, string>>;
+  capabilitySchemaHashes?: Partial<Record<SellerSpriteCapability, string>>;
   missingCapabilities: SellerSpriteCapability[];
 }
 
@@ -33,6 +34,7 @@ export interface McpCallLedgerEntry {
   entityId?: string;
   researchJobId?: string;
   runId?: string;
+  observationMonth?: string;
   resultCount?: number | null;
   startedAt: string;
   completedAt: string;
@@ -67,6 +69,7 @@ export class SqliteMcpCapabilityStore implements McpCapabilityStore {
     `).run(snapshot.id, snapshot.provider, JSON.stringify({
       tools: snapshot.tools,
       capabilities: snapshot.capabilities,
+      capabilitySchemaHashes: snapshot.capabilitySchemaHashes ?? {},
       missingCapabilities: snapshot.missingCapabilities,
     }), snapshot.discoveredAt, snapshot.runId ?? null);
   }
@@ -79,7 +82,7 @@ export class SqliteMcpCapabilityStore implements McpCapabilityStore {
     `).get() as Record<string, string> | undefined;
     if (!row) return null;
     const payload = JSON.parse(row.capabilities_json) as Pick<McpCapabilitySnapshot,
-      'tools' | 'capabilities' | 'missingCapabilities'>;
+      'tools' | 'capabilities' | 'capabilitySchemaHashes' | 'missingCapabilities'>;
     return {
       id: row.id,
       provider: 'sellersprite',
@@ -98,14 +101,15 @@ export class SqliteMcpCallLedgerStore implements McpCallLedgerStore {
       INSERT INTO mcp_call_logs
         (id, provider_id, capability, request_hash, status, response_metadata_json,
          error_code, started_at, completed_at, actual_tool, parameter_hash,
-         duration_ms, cache_hit, entity_type, entity_id, research_job_id, result_count, sync_run_id)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         duration_ms, cache_hit, entity_type, entity_id, research_job_id, result_count, sync_run_id,
+         observation_month)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).run(entry.id, entry.provider, entry.capability ?? 'unspecified', entry.requestHash,
       entry.status, JSON.stringify({ operation: entry.operation, attempt: entry.attempt }),
       entry.errorCode, entry.startedAt, entry.completedAt, entry.toolName, entry.requestHash,
       Math.max(0, Date.parse(entry.completedAt) - Date.parse(entry.startedAt)), entry.cacheHit ? 1 : 0,
       entry.entityType ?? null, entry.entityId ?? null, entry.researchJobId ?? null,
-      entry.resultCount ?? null, entry.runId ?? null);
+      entry.resultCount ?? null, entry.runId ?? null, entry.observationMonth ?? null);
   }
 }
 

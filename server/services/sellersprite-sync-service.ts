@@ -486,11 +486,13 @@ export class SellerSpriteSyncService {
     const month = compactMonth(input.month);
     const baselineMonth = previousMonth(month);
     const products = this.activeOwnedProducts(market.marketplace, market.id);
+    const marketNodes = this.criticalMarketNodes(market, products);
     const runId = randomUUID();
     const startedAt = new Date().toISOString();
     const scope = {
       marketId: market.id, nodeIdPath: market.categoryId, month, baselineMonth,
       marketMonths: [baselineMonth, month],
+      marketNodes: marketNodes.map((node) => ({ id: node.id, nodeIdPath: node.categoryId })),
       ownedProducts: products.map(({ id, asin, marketNodeId }) => ({ id, asin, marketNodeId })),
     };
     this.database.prepare(`
@@ -499,23 +501,25 @@ export class SellerSpriteSyncService {
         status, started_at, total, success, failed, created_at
       ) VALUES (?, ?, 'SellerSprite 关键同步', ?, 'critical_sync', ?, 'SellerSprite MCP', ?,
         'running', ?, ?, 0, 0, ?)
-    `).run(runId, runId, SOURCE_ID, market.id, market.marketplace, startedAt, products.length + 1, startedAt);
+    `).run(runId, runId, SOURCE_ID, market.id, market.marketplace, startedAt,
+      products.length + marketNodes.length, startedAt);
 
     let primary: { runId: string; taskId: string; marketSnapshots: number; productSnapshots: number };
     try {
       if (products.length === 0) throw new Error('关键同步需要至少一个启用中的自有 SKU。');
       // Remote calls finish outside the write transaction; a failure cannot commit half a batch.
-      const preparedMarkets = await Promise.all([
-        this.prepareMarket({ ...input, month }, runId, true),
-        this.prepareMarket({ ...input, month: baselineMonth }, runId, true),
-      ]);
+      const preparedMarkets = await Promise.all(marketNodes.flatMap((node) => [
+        this.prepareMarket({ marketId: node.id, month }, runId, true),
+        this.prepareMarket({ marketId: node.id, month: baselineMonth }, runId, true),
+      ]));
       const preparedProducts: PreparedProductObservation[] = [];
       for (const product of products) preparedProducts.push(await this.prepareProduct(product, runId));
 
       primary = transaction(this.database, () => {
         const currentMarket = this.requireMarket(market.id);
         if (currentMarket.marketplace !== market.marketplace || currentMarket.categoryId !== market.categoryId
-          || JSON.stringify(this.activeOwnedProducts(market.marketplace, market.id)) !== JSON.stringify(products)) {
+          || JSON.stringify(this.activeOwnedProducts(market.marketplace, market.id)) !== JSON.stringify(products)
+          || JSON.stringify(this.criticalMarketNodes(currentMarket, products)) !== JSON.stringify(marketNodes)) {
           throw new Error('关键同步期间市场节点或自有 SKU 范围发生变化，请重新运行。');
         }
         const marketSnapshots = preparedMarkets.reduce(
@@ -1063,6 +1067,18 @@ export class SellerSpriteSyncService {
       throw new Error('关键同步前置条件失败：全部真实自有 SKU 必须映射到主市场或其启用中的真实子节点。');
     }
     return rows;
+  }
+
+  private criticalMarketNodes(root: MarketRow, products: ProductRow[]): MarketRow[] {
+    const childIds = [...new Set(products.map((product) => product.marketNodeId))]
+      .filter((id) => id !== root.id).sort();
+    return [root, ...childIds.map((id) => {
+      const node = this.requireMarket(id);
+      if (node.marketplace !== root.marketplace) {
+        throw new Error('关键同步的自有 SKU 市场节点与主市场站点不一致。');
+      }
+      return node;
+    })];
   }
 
   private isCurrentDirectCompetitor(competitorId: string, marketplace: string): boolean {

@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import {
+  sellerSpriteSchemaHash,
   SellerSpriteToolRegistry,
   type SellerSpriteCapability,
 } from './sellersprite-tool-registry.js';
@@ -107,8 +108,9 @@ describe('SellerSpriteToolRegistry', () => {
 
     expect(store.snapshots[0].tools).toEqual([{
       name: unsafeTool.name,
-      description: unsafeTool.description,
+      description: '[REDACTED]',
       inputSchema: unsafeTool.inputSchema,
+      schemaHash: expect.stringMatching(/^[a-f0-9]{64}$/),
     }]);
     expect(JSON.stringify(store.snapshots[0])).not.toMatch(/secret-value|Authorization|endpoint/i);
   });
@@ -149,6 +151,28 @@ describe('SellerSpriteToolRegistry', () => {
     expect(registry.resolve('ASIN_SALES_TREND')?.name).toBe(callableName);
   });
 
+  it('redacts auth and session values from tool names and descriptions', async () => {
+    const store = new MemoryCapabilityStore();
+    const registry = new SellerSpriteToolRegistry({ store });
+    const callableName = 'asin_sales_trend?auth=opaque987654';
+    const snapshot = await registry.refresh(async () => [mcpTool(
+      callableName, 'Sales trend session=opaque456789', ['marketplace', 'asin'],
+    )]);
+
+    expect(snapshot.capabilities.ASIN_SALES_TREND).toBe('[REDACTED]');
+    expect(JSON.stringify(store.snapshots)).not.toMatch(/opaque987654|opaque456789/);
+    expect(registry.resolve('ASIN_SALES_TREND')?.name).toBe(callableName);
+  });
+
+  it('never persists arbitrary provider description text', async () => {
+    const store = new MemoryCapabilityStore();
+    await new SellerSpriteToolRegistry({ store }).refresh(async () => [mcpTool(
+      'asin_sales_trend', 'Opaque 987654321 fixture', ['marketplace', 'asin'],
+    )]);
+
+    expect(JSON.stringify(store.snapshots)).not.toContain('Opaque 987654321 fixture');
+  });
+
   it('does not persist opaque enum values from discovered tool schemas', async () => {
     const store = new MemoryCapabilityStore();
     const registry = new SellerSpriteToolRegistry({ store });
@@ -169,6 +193,191 @@ describe('SellerSpriteToolRegistry', () => {
     expect(registry.resolve('ASIN_SALES_TREND')?.inputSchema.properties?.asin).toEqual({
       type: 'string', enum: ['B000000001', 'opaque-credential-fixture'],
     });
+  });
+
+  it('fingerprints allowlisted contract enums without making credentials or product identities an oracle', () => {
+    const schemaFor = (
+      marketplace: string, secret: string, identity: string,
+      identityPath = 'asin', credentialPath = 'secretKey',
+    ) => ({
+      type: 'object', required: ['marketplace', identityPath, credentialPath],
+      properties: {
+        marketplace: { type: 'string', enum: [marketplace] },
+        [identityPath]: { type: 'string', enum: [identity] },
+        [credentialPath]: { type: 'string', default: secret },
+      },
+    });
+
+    const baseline = sellerSpriteSchemaHash(schemaFor('US', 'secret-alpha', 'B000000001'));
+    const changedSensitiveValues = sellerSpriteSchemaHash(
+      schemaFor('US', 'secret-beta', 'B000000002'),
+    );
+    const changedSensitivePaths = sellerSpriteSchemaHash(
+      schemaFor('US', 'secret-beta', 'SKU-002', 'sku', 'accessToken'),
+    );
+    const changedContract = sellerSpriteSchemaHash(
+      schemaFor('CA', 'secret-alpha', 'B000000001'),
+    );
+
+    expect(changedSensitiveValues).toBe(baseline);
+    expect(changedSensitivePaths).toBe(baseline);
+    expect(changedContract).not.toBe(baseline);
+  });
+
+  it('does not fingerprint numeric, boolean, or nested values under credential and identity paths', () => {
+    const schemaFor = (credentialMetadata: unknown, identityMetadata: unknown) => ({
+      type: 'object',
+      properties: {
+        marketplace: { type: 'string', enum: ['US'] },
+        apiKey: { type: 'string', 'x-token-state': credentialMetadata },
+        auth: { type: 'string', 'x-auth': credentialMetadata },
+        authHeader: { type: 'string', 'x-auth-header': credentialMetadata },
+        asin: { type: 'string', 'x-account-id': identityMetadata },
+      },
+      'x-api-key': credentialMetadata,
+      'x-auth': credentialMetadata,
+      'x-customer-account': identityMetadata,
+    });
+
+    expect(sellerSpriteSchemaHash(schemaFor(123456, { enabled: true, identity: 991122 })))
+      .toBe(sellerSpriteSchemaHash(schemaFor([{ pin: 654321 }], false)));
+  });
+
+  it('does not persist low-entropy values under sensitive schema paths while keeping tools callable', async () => {
+    const store = new MemoryCapabilityStore();
+    const registry = new SellerSpriteToolRegistry({ store });
+    const tool: McpToolDefinition = {
+      name: 'asin_sales_trend',
+      inputSchema: {
+        type: 'object', required: ['marketplace', 'asin'],
+        properties: {
+          marketplace: { type: 'string' },
+          asin: { type: 'string', 'x-customer-number': 991122 },
+          apiKey: { type: 'string', 'x-pin': 123456, 'x-enabled': true },
+          auth: { type: 'string', 'x-auth': 777888 },
+          authenticationHeader: { type: 'string', 'x-auth-header': 111222 },
+        },
+        'x-api-key': { pin: 654321, enabled: false },
+        'x-auth': { pin: 888999, enabled: true },
+      },
+    };
+
+    await registry.refresh(async () => [tool]);
+
+    expect(JSON.stringify(store.snapshots)).not.toMatch(/991122|123456|654321|777888|888999|111222/);
+    expect(registry.resolve('ASIN_SALES_TREND')?.inputSchema).toEqual(tool.inputSchema);
+    expect(() => registry.validateArguments('ASIN_SALES_TREND', {
+      marketplace: 'US', asin: 'B000000001',
+    })).not.toThrow();
+  });
+
+  it('does not persist or fingerprint opaque metadata on otherwise safe schema fields', async () => {
+    const store = new MemoryCapabilityStore();
+    const registry = new SellerSpriteToolRegistry({ store });
+    const schemaFor = (opaque: unknown): McpToolDefinition => ({
+      name: 'asin_sales_trend',
+      inputSchema: {
+        type: 'object', required: ['marketplace', 'asin'],
+        properties: {
+          marketplace: { type: 'string', 'x-note': opaque },
+          asin: { type: 'string' },
+        },
+        'x-provider-metadata': opaque,
+      },
+    });
+
+    expect(sellerSpriteSchemaHash(schemaFor(123456).inputSchema))
+      .toBe(sellerSpriteSchemaHash(schemaFor({ value: 'opaque-sensitive-value-123' }).inputSchema));
+    await registry.refresh(async () => [schemaFor('opaque-sensitive-value-123')]);
+    expect(JSON.stringify(store.snapshots)).not.toContain('opaque-sensitive-value-123');
+    expect(registry.resolve('ASIN_SALES_TREND')?.inputSchema)
+      .toEqual(schemaFor('opaque-sensitive-value-123').inputSchema);
+  });
+
+  it('canonicalizes allowlisted enum order', () => {
+    const schemaFor = (marketplaces: string[]) => ({
+      type: 'object',
+      properties: { marketplace: { type: 'string', enum: marketplaces } },
+    });
+
+    expect(sellerSpriteSchemaHash(schemaFor(['US', 'CA'])))
+      .toBe(sellerSpriteSchemaHash(schemaFor(['CA', 'US'])));
+  });
+
+  it('fingerprints the safe schema contract before persistence, including marketplace enum changes', async () => {
+    const first = new SellerSpriteToolRegistry();
+    const second = new SellerSpriteToolRegistry();
+    const schemaFor = (marketplace: string): McpToolDefinition => ({
+      name: 'asin_sales_trend',
+      inputSchema: {
+        type: 'object', required: ['marketplace', 'asin'],
+        properties: {
+          marketplace: { type: 'string', enum: [marketplace] },
+          asin: { type: 'string' },
+        },
+      },
+    });
+
+    const us = await first.refresh(async () => [schemaFor('US')]);
+    const ca = await second.refresh(async () => [schemaFor('CA')]);
+
+    expect(us.tools[0]?.inputSchema).toEqual(ca.tools[0]?.inputSchema);
+    expect(us.tools[0]?.schemaHash).toMatch(/^[a-f0-9]{64}$/);
+    expect(ca.tools[0]?.schemaHash).toMatch(/^[a-f0-9]{64}$/);
+    expect(us.tools[0]?.schemaHash).not.toBe(ca.tools[0]?.schemaHash);
+    expect(JSON.stringify({ us, ca })).not.toMatch(/"US"|"CA"/);
+  });
+
+  it('binds schema hashes directly to capabilities when sanitized tool names collide', async () => {
+    const store = new MemoryCapabilityStore();
+    const registry = new SellerSpriteToolRegistry({ store });
+    const statistics = mcpTool(
+      'market_research_statistics?api_key=opaque-statistics',
+      'Monthly market statistics',
+      ['request'],
+    );
+    statistics.inputSchema.properties = {
+      request: {
+        type: 'object',
+        properties: {
+          marketplace: { type: 'string', enum: ['US'] },
+          nodeIdPath: { type: 'string' },
+        },
+        required: ['marketplace', 'nodeIdPath'],
+      },
+    };
+    const concentration = mcpTool(
+      'market_product_concentration?token=opaque-concentration',
+      'Product concentration',
+      ['request'],
+    );
+    concentration.inputSchema.properties = {
+      request: {
+        type: 'object',
+        properties: {
+          marketplace: { type: 'string', enum: ['CA'] },
+          nodeIdPath: { type: 'string' },
+        },
+        required: ['marketplace', 'nodeIdPath'],
+      },
+    };
+
+    const snapshot = await registry.refresh(async () => [statistics, concentration]);
+    const withCapabilityHashes = snapshot as McpCapabilitySnapshot & {
+      capabilitySchemaHashes?: Partial<Record<SellerSpriteCapability, string>>;
+    };
+
+    expect(snapshot.capabilities).toMatchObject({
+      MARKET_STATISTICS: '[REDACTED]',
+      PRODUCT_CONCENTRATION: '[REDACTED]',
+    });
+    expect(withCapabilityHashes.capabilitySchemaHashes).toMatchObject({
+      MARKET_STATISTICS: sellerSpriteSchemaHash(statistics.inputSchema),
+      PRODUCT_CONCENTRATION: sellerSpriteSchemaHash(concentration.inputSchema),
+    });
+    expect(withCapabilityHashes.capabilitySchemaHashes?.MARKET_STATISTICS)
+      .not.toBe(withCapabilityHashes.capabilitySchemaHashes?.PRODUCT_CONCENTRATION);
+    expect(JSON.stringify(snapshot)).not.toMatch(/opaque-statistics|opaque-concentration/);
   });
 
   it('rejects a requested month that a strict flat tool schema cannot receive', async () => {

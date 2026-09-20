@@ -162,12 +162,64 @@ describe('sellable child SKU roster', () => {
 
     const result = await new SellerSpriteSyncService(database, sellerSpritePort(asinCalls))
       .syncCriticalBatch({ marketId: 'market-1', month: '202608' });
+    const roster = (await request(createApp({ database }))
+      .get(`/api/integrations/sellersprite/sync/critical/${result.runId}/roster`)
+      .expect(200)).body.data;
 
     expect(asinCalls).toEqual(['B0CHILD001', 'B0RIVAL001']);
     expect(result).toMatchObject({ productSnapshots: 1, candidateCoverage: { total: 1 }, competitorCoverage: { total: 1 } });
+    expect(roster).toEqual({ marketId: 'market-1', ownedProductIds: ['child'] });
+    expect(JSON.stringify(roster)).not.toMatch(/B0CHILD001|101:202|Sellable child/);
     expect(JSON.parse((database.prepare(`SELECT coverage_json AS coverageJson FROM data_coverage_runs WHERE id = ?`)
       .get(result.runId) as { coverageJson: string }).coverageJson).ownedProducts)
       .toEqual([{ id: 'child', asin: 'B0CHILD001', marketNodeId: 'market-1' }]);
+  });
+
+  it('rejects a run roster while its critical task is incomplete or failed', async () => {
+    database = setupFamily();
+    const runId = '11111111-1111-4111-8111-111111111111';
+    database.prepare(`
+      INSERT INTO data_coverage_runs (
+        id, marketplace, run_type, coverage_json, is_complete, created_at
+      ) VALUES (?, 'US', 'critical_sync', ?, 0, '2026-09-21T00:00:00.000Z')
+    `).run(runId, JSON.stringify({
+      marketId: 'market-1', ownedProducts: [{ id: 'child' }],
+    }));
+    database.prepare(`
+      INSERT INTO data_tasks (
+        id, sync_run_id, name, task_type, target, source, marketplace,
+        status, total, success, failed, created_at
+      ) VALUES (?, ?, 'failed critical', 'critical_sync', 'market-1',
+        'SellerSprite MCP', 'US', 'failed', 2, 1, 1, '2026-09-21T00:00:00.000Z')
+    `).run(runId, runId);
+
+    await request(createApp({ database }))
+      .get(`/api/integrations/sellersprite/sync/critical/${runId}/roster`)
+      .expect(404);
+  });
+
+  it.each([
+    ['empty', []],
+    ['duplicate', [{ id: 'child' }, { id: 'child' }]],
+  ])('rejects %s product coverage in a completed run roster', async (_label, ownedProducts) => {
+    database = setupFamily();
+    const runId = '22222222-2222-4222-8222-222222222222';
+    database.prepare(`
+      INSERT INTO data_coverage_runs (
+        id, marketplace, run_type, coverage_json, is_complete, created_at
+      ) VALUES (?, 'US', 'critical_sync', ?, 1, '2026-09-21T00:00:00.000Z')
+    `).run(runId, JSON.stringify({ marketId: 'market-1', ownedProducts }));
+    database.prepare(`
+      INSERT INTO data_tasks (
+        id, sync_run_id, name, task_type, target, source, marketplace,
+        status, total, success, failed, created_at
+      ) VALUES (?, ?, 'complete critical', 'critical_sync', 'market-1',
+        'SellerSprite MCP', 'US', 'success', 2, 2, 0, '2026-09-21T00:00:00.000Z')
+    `).run(runId, runId);
+
+    await request(createApp({ database }))
+      .get(`/api/integrations/sellersprite/sync/critical/${runId}/roster`)
+      .expect(409);
   });
 
   it.each(['owned_sku_refresh', 'product_refresh'])(

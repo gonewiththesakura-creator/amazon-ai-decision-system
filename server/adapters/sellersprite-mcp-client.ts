@@ -13,6 +13,7 @@ import {
   type McpCallLedgerStore,
   type McpResponseCacheStore,
 } from './sellersprite-mcp-store.js';
+import { isCredentialFieldName, redactCredentialAssignments } from './sensitive-field.js';
 
 export type SellerSpriteMcpErrorCode =
   | 'AUTH_ERROR' | 'RATE_LIMIT' | 'TIMEOUT' | 'TOOL_NOT_FOUND' | 'INVALID_SCHEMA' | 'REMOTE_ERROR';
@@ -37,7 +38,7 @@ export interface SellerSpriteToolCall {
   arguments: Record<string, unknown>;
   context: { capability?: string; operation?: string;
     entityType?: 'market' | 'product' | 'competitor'; entityId?: string;
-    researchJobId?: string; runId?: string; fresh?: boolean };
+    researchJobId?: string; runId?: string; observationMonth?: string; fresh?: boolean };
 }
 
 export interface SellerSpriteMcpAcquisition {
@@ -59,11 +60,12 @@ interface SellerSpriteMcpClientOptions {
 
 export function sanitizeMcpError(error: unknown): string {
   const message = error instanceof Error ? error.message : String(error);
-  return message
+  return redactCredentialAssignments(message
     .replace(/https?:\/\/[^\s'"<>]+/gi, '[REDACTED]')
     .replace(/Authorization\s*[:=]\s*(?:Bearer\s+)?[^\s;,}]+/gi, '[REDACTED]')
+    .replace(/\bBearer\s+[^\s"';,}]+/gi, '[REDACTED]')
     .replace(/(?:secret[-_]?key|api[_-]?key|access[_-]?token|token|password|secret)\s*[=:]\s*["']?[^\s&,;}"']+["']?/gi, '[REDACTED]')
-    .replace(/(["'])(?:secret[-_]?key|api[_-]?key|access[_-]?token|token|password|secret)\1\s*:\s*["'][^"']+["']/gi, '[REDACTED]');
+    .replace(/(["'])(?:secret[-_]?key|api[_-]?key|access[_-]?token|token|password|secret)\1\s*:\s*["'][^"']+["']/gi, '[REDACTED]'));
 }
 
 export function sellerSpriteEndpoint(configured: string, secret?: string): URL {
@@ -82,9 +84,7 @@ export function sellerSpriteEndpoint(configured: string, secret?: string): URL {
       'SellerSprite MCP 密钥仅允许通过 HTTPS 或本机回环地址传输。',
     );
   }
-  const credentialParameter = [...endpoint.searchParams.keys()].find((key) => (
-    /secret[-_]?key|api[-_]?key|access[-_]?token|token|password|secret/i.test(key)
-  ));
+  const credentialParameter = [...endpoint.searchParams.keys()].find(isCredentialFieldName);
   if (endpoint.username || endpoint.password || credentialParameter) {
     throw new SellerSpriteMcpError(
       'AUTH_ERROR',
@@ -277,6 +277,7 @@ export class SellerSpriteMcpClient {
         ? request.context.researchJobId : undefined,
       runId: request.context.runId && /^[0-9a-f]{8}-[0-9a-f-]{27,36}$/i.test(request.context.runId)
         ? request.context.runId : undefined,
+      observationMonth: safeObservationMonth(request.context.observationMonth),
       resultCount,
       completedAt: new Date(this.now()).toISOString(),
     }));
@@ -353,6 +354,12 @@ export class SellerSpriteMcpClient {
   }
 }
 
+function safeObservationMonth(value: string | undefined): string | undefined {
+  if (!value || !/^\d{6}$/.test(value)) return undefined;
+  const month = Number(value.slice(4));
+  return month >= 1 && month <= 12 ? value : undefined;
+}
+
 function normalizedTimestamp(value: string): string {
   const milliseconds = Date.parse(value);
   if (!Number.isFinite(milliseconds)) throw new Error('Invalid cached acquisition timestamp');
@@ -378,11 +385,18 @@ function ordered(value: unknown): unknown {
 }
 
 function scrubSecrets(value: unknown): unknown {
-  if (typeof value === 'string') return sanitizeMcpError(value);
+  if (typeof value === 'string') {
+    const trimmed = value.trim();
+    if (trimmed.startsWith('{') || trimmed.startsWith('[')) {
+      try { return JSON.stringify(scrubSecrets(JSON.parse(value))); }
+      catch { /* Fall through to plain-text sanitization. */ }
+    }
+    return sanitizeMcpError(value);
+  }
   if (Array.isArray(value)) return value.map(scrubSecrets);
   if (value && typeof value === 'object') {
     return Object.fromEntries(Object.entries(value).map(([key, item]) => [key,
-      /authorization|token|secret|api[_-]?key|password|endpoint|headers/i.test(key)
+      isCredentialFieldName(key) || /endpoint|headers/i.test(key)
         ? '[REDACTED]' : scrubSecrets(item)]));
   }
   return value;

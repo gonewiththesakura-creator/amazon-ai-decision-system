@@ -67,6 +67,32 @@ function coveragePartition(
   return { covered, failed };
 }
 
+function hasExactCriticalMarketMonths(
+  baselineMonth: unknown, month: string, marketMonths: unknown,
+): marketMonths is [string, string] {
+  if (typeof baselineMonth !== 'string' || !Array.isArray(marketMonths)
+    || marketMonths.length !== 2 || marketMonths[0] !== baselineMonth || marketMonths[1] !== month
+    || !isCalendarMonth(baselineMonth) || !isCalendarMonth(month)) return false;
+  return baselineMonth === previousCalendarMonth(month);
+}
+
+function isCalendarMonth(value: string): boolean {
+  return /^\d{6}$/.test(value) && Number(value.slice(4)) >= 1 && Number(value.slice(4)) <= 12;
+}
+
+function previousCalendarMonth(value: string): string {
+  const year = Number(value.slice(0, 4));
+  const month = Number(value.slice(4));
+  const date = new Date(Date.UTC(year, month - 2, 1));
+  return `${date.getUTCFullYear()}${String(date.getUTCMonth() + 1).padStart(2, '0')}`;
+}
+
+function marketDateForMonth(value: string): string {
+  const year = Number(value.slice(0, 4));
+  const month = Number(value.slice(4));
+  return new Date(Date.UTC(year, month, 0)).toISOString().slice(0, 10);
+}
+
 const MARKET_METRICS = `(
   snapshot.product_count IS NOT NULL OR snapshot.seller_count IS NOT NULL
   OR snapshot.brand_count IS NOT NULL OR snapshot.monthly_sales IS NOT NULL
@@ -382,6 +408,15 @@ export class GoLiveMigrationService {
     const requiredEvidenceEntities = owned.length + 1;
     const incomplete = { runId: null, verifiedEvidenceEntities: 0, requiredEvidenceEntities };
     if (owned.length === 0 || owned.some((product) => product.inScope !== 1)) return incomplete;
+    const marketNodes = [{ id: marketId, nodeIdPath }];
+    for (const id of [...new Set(owned.map((product) => product.marketNodeId))]
+      .filter((id) => id !== marketId).sort()) {
+      const child = this.database.prepare(`SELECT category_id AS nodeIdPath FROM market_nodes
+        WHERE id = ? AND marketplace = ? AND status = 'active' AND source_type <> 'mock'`)
+        .get(id, marketplace) as { nodeIdPath: string | null } | undefined;
+      if (!child?.nodeIdPath) return incomplete;
+      marketNodes.push({ id, nodeIdPath: child.nodeIdPath });
+    }
     const directCompetitorRoster = this.currentDirectCompetitorRoster(marketplace);
     let latestEvidenceCount: number | null = null;
 
@@ -398,7 +433,7 @@ export class GoLiveMigrationService {
         AND julianday(task.completed_at) BETWEEN julianday('now', '-1 day')
           AND julianday('now', '+5 minutes')
       ORDER BY run.created_at DESC, run.id DESC
-    `).all(marketplace, marketplace, marketId, owned.length + 1) as Array<{
+    `).all(marketplace, marketplace, marketId, owned.length + marketNodes.length) as Array<{
       id: string; coverageJson: string;
     }>;
     for (const run of runs) {
@@ -410,8 +445,19 @@ export class GoLiveMigrationService {
       } catch { continue; }
       const roster = coverage.ownedProducts;
       const month = coverage.month;
+      const baselineMonth = coverage.baselineMonth;
+      const marketMonths = coverage.marketMonths;
+      const coveredMarketNodes = coverage.marketNodes;
       if (coverage.marketId !== marketId || coverage.nodeIdPath !== nodeIdPath
         || typeof month !== 'string' || !/^\d{6}$/.test(month)
+        || !hasExactCriticalMarketMonths(baselineMonth, month, marketMonths)
+        || !Array.isArray(coveredMarketNodes) || coveredMarketNodes.length !== marketNodes.length
+        || !coveredMarketNodes.every((item, index) => {
+          if (!item || typeof item !== 'object' || Array.isArray(item)) return false;
+          const entry = item as Record<string, unknown>;
+          return entry.id === marketNodes[index]!.id
+            && entry.nodeIdPath === marketNodes[index]!.nodeIdPath;
+        })
         || !Array.isArray(roster) || roster.length !== owned.length
         || !roster.every((item, index) => {
           if (!item || typeof item !== 'object') return false;
@@ -433,10 +479,7 @@ export class GoLiveMigrationService {
         || !candidatePartition || !competitorPartition
         || !this.candidateLinksMatchRun(candidateSummary, owned, run.id)
         || (directCompetitorRoster.length > 0 && competitorSummary.success === 0)) continue;
-      const year = Number(month.slice(0, 4));
-      const monthNumber = Number(month.slice(4));
-      if (monthNumber < 1 || monthNumber > 12) continue;
-      const marketDate = new Date(Date.UTC(year, monthNumber, 0)).toISOString().slice(0, 10);
+      const marketDates = marketMonths.map(marketDateForMonth);
       const runCapabilitiesAvailable = this.count(`
         SELECT CASE WHEN
           json_extract(capabilities_json, '$.capabilities.MARKET_RESEARCH') IS NOT NULL
@@ -455,6 +498,7 @@ export class GoLiveMigrationService {
       const calls = this.database.prepare(`
         SELECT provider_id AS providerId, capability, entity_type AS entityType, entity_id AS entityId,
           status, result_count AS resultCount, cache_hit AS cacheHit,
+          observation_month AS observationMonth,
           CASE WHEN julianday(started_at) BETWEEN julianday('now', '-1 day')
             AND julianday('now', '+5 minutes')
             AND julianday(COALESCE(completed_at, started_at)) BETWEEN julianday('now', '-1 day')
@@ -468,12 +512,16 @@ export class GoLiveMigrationService {
         status: string;
         resultCount: number | null;
         cacheHit: number;
+        observationMonth: string | null;
         isFresh: number;
       }>;
       if (calls.length === 0 || calls.some((call) => call.cacheHit !== 0 || call.isFresh !== 1)) continue;
-      const hasCall = (capability: string, type: string, id: string, allowEmpty = false): boolean => calls.some((call) => (
+      const hasCall = (
+        capability: string, type: string, id: string, allowEmpty = false, observationMonth?: string,
+      ): boolean => calls.some((call) => (
         call.providerId === 'sellersprite' && call.capability === capability
           && call.entityType === type && call.entityId === id
+          && (observationMonth === undefined || call.observationMonth === observationMonth)
           && call.status === 'success' && call.resultCount !== null
           && (allowEmpty ? call.resultCount >= 0 : call.resultCount > 0)
       ));
@@ -483,8 +531,12 @@ export class GoLiveMigrationService {
           && call.resultCount !== null && call.resultCount > 0
       ));
       if (!hasToolDiscovery
-        || !hasCall('MARKET_STATISTICS', 'market', nodeIdPath)
-        || !hasCall('PRODUCT_CONCENTRATION', 'market', nodeIdPath)
+        || !marketNodes.every((marketNode) => marketMonths.every((observationMonth) => hasCall(
+          'MARKET_STATISTICS', 'market', marketNode.nodeIdPath, false, observationMonth,
+        )))
+        || !marketNodes.every((marketNode) => marketMonths.every((observationMonth) => hasCall(
+          'PRODUCT_CONCENTRATION', 'market', marketNode.nodeIdPath, false, observationMonth,
+        )))
         || !owned.every((product) => hasCall('ASIN_SALES_TREND', 'product', product.asin.toUpperCase()))
         || !owned.every((product) => hasCall(
           'ASIN_COMPETITOR_DISCOVERY', 'product', product.asin.toUpperCase(), true,
@@ -492,7 +544,7 @@ export class GoLiveMigrationService {
         || !competitorPartition.covered.every((product) => hasCall(
           'ASIN_SALES_TREND', 'product', product.asin.toUpperCase(),
         ))) continue;
-      const marketLinks = this.count(`
+      const hasMarketLink = (marketNodeId: string, marketDate: string): boolean => this.count(`
         SELECT COUNT(*) AS count FROM mcp_sync_observation_links link
         JOIN market_snapshots snapshot ON snapshot.id = link.snapshot_id
         WHERE link.sync_run_id = ? AND link.snapshot_kind = 'market'
@@ -501,9 +553,8 @@ export class GoLiveMigrationService {
           AND COALESCE(snapshot.observation_date, snapshot.date) = ?
           AND (link.disposition = 'reused' OR snapshot.sync_run_id = link.sync_run_id)
           AND ${MARKET_METRICS}
-      `, false, run.id, marketId, marketDate);
-      if (marketLinks === 0) continue;
-      const marketFacts = this.count(`
+      `, false, run.id, marketNodeId, marketDate) > 0;
+      const hasMarketFact = (marketNodeId: string, marketDate: string): boolean => this.count(`
         SELECT COUNT(*) AS count FROM mcp_sync_observation_links link
         JOIN metric_facts fact ON fact.id = link.snapshot_id
         WHERE link.sync_run_id = ? AND link.snapshot_kind = 'fact'
@@ -512,8 +563,10 @@ export class GoLiveMigrationService {
           AND fact.source_type = 'mcp' AND fact.source_id = 'source-sellersprite-mcp'
           AND fact.observation_date = ? AND fact.numeric_value IS NOT NULL
           AND (link.disposition = 'reused' OR fact.sync_run_id = link.sync_run_id)
-      `, false, run.id, marketId, marketplace, marketDate);
-      if (marketFacts === 0) continue;
+      `, false, run.id, marketNodeId, marketplace, marketDate) > 0;
+      if (!marketNodes.every((marketNode) => marketDates.every((marketDate) => (
+        hasMarketLink(marketNode.id, marketDate) && hasMarketFact(marketNode.id, marketDate)
+      )))) continue;
       const hasProductLink = (productId: string): boolean => this.count(`
         SELECT COUNT(*) AS count FROM mcp_sync_observation_links link
         JOIN product_snapshots snapshot ON snapshot.id = link.snapshot_id
@@ -580,6 +633,20 @@ export class GoLiveMigrationService {
         AND job.is_demo = 0 AND job.marketplace = ?
         AND job.entity_type IN (?, ?) AND job.entity_id = ?
         AND job.job_type = ? AND job.status = 'monitoring' AND job.error IS NULL
+        AND EXISTS (
+          SELECT 1 FROM data_tasks workflow_task
+          WHERE workflow_task.research_job_id = job.id
+        )
+        AND NOT EXISTS (
+          SELECT 1 FROM data_tasks workflow_task
+          WHERE workflow_task.research_job_id = job.id
+            AND (
+              workflow_task.sync_run_id IS NULL OR workflow_task.sync_run_id <> ?
+              OR workflow_task.status <> 'success' OR workflow_task.completed_at IS NULL
+              OR workflow_task.total <= 0 OR workflow_task.success <> workflow_task.total
+              OR workflow_task.failed <> 0
+            )
+        )
         AND evidence.data_version = job.data_version
         AND evidence.insight_id IS NOT NULL
         AND EXISTS (
@@ -601,6 +668,7 @@ export class GoLiveMigrationService {
               WHERE component.id IS NULL
                 OR component.research_job_id <> job.id
                 OR component.data_version <> job.data_version
+                OR component.source_type = 'mock'
                 OR (component.source_type = 'mcp'
                   AND (component.sync_run_id IS NULL OR component.sync_run_id <> ?))
             )
@@ -635,7 +703,7 @@ export class GoLiveMigrationService {
         )
       LIMIT 1
     `).get(runId, marketplace, ...jobEntityTypes, entityId,
-      expectedJobType, expectedInsightType, runId, snapshotKind, factEntityType, marketplace));
+      expectedJobType, runId, expectedInsightType, runId, snapshotKind, factEntityType, marketplace));
   }
 
   private candidateLinksMatchRun(

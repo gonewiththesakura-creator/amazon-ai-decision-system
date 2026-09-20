@@ -16,6 +16,7 @@ function fixture(): { db: AppDatabase; repository: WorkflowRepository; jobId: st
   const job = repository.createResearchJob({
     name: 'Trace selected metric', type: 'new_opportunity', createdBy: 'Evidence test',
   });
+  repository.createDataTask(job, 'evidence_collection', 'market-us', 'Trace Evidence source');
   const insertTask = db.prepare(`
     INSERT INTO data_tasks (
       id, sync_run_id, name, source_id, task_type, target, source, status, marketplace,
@@ -73,9 +74,11 @@ describe('Evidence source-run lineage', () => {
     })]);
     expect(db.prepare('SELECT sync_run_id FROM evidence_records WHERE id = ?').get(saved.id))
       .toMatchObject({ sync_run_id: 'mcp-run-a' });
+    expect(db.prepare(`SELECT sync_run_id FROM data_tasks WHERE research_job_id = ?`).get(jobId))
+      .toMatchObject({ sync_run_id: 'mcp-run-a' });
   });
 
-  it('resolves tracked MCP snapshot runs, rejects runless MCP, and leaves imports unlinked', () => {
+  it('binds one workflow to one MCP run, rejects runless or cross-run MCP, and leaves imports unlinked', () => {
     const { db, repository, jobId, dataVersion } = fixture();
     const insertMarket = db.prepare(`
       INSERT INTO market_snapshots (
@@ -97,15 +100,18 @@ describe('Evidence source-run lineage', () => {
     `).run();
 
     const market = repository.createEvidence(jobId, evidence(dataVersion, 'mcp-market-snapshot'));
-    const product = repository.createEvidence(jobId, evidence(dataVersion, 'mcp-product-snapshot'));
+    expect(() => repository.createEvidence(jobId, evidence(dataVersion, 'mcp-product-snapshot')))
+      .toThrow(/同一.*运行|sync run/i);
     expect(() => repository.createEvidence(jobId, evidence(dataVersion, 'legacy-mcp-snapshot')))
       .toThrow(/同步运行|关联成功/);
     const imported = repository.createEvidence(jobId, evidence(dataVersion, 'import-market-snapshot', 'import'));
 
-    expect([market.syncRunId, product.syncRunId, imported.syncRunId])
-      .toEqual(['mcp-run-a', 'mcp-run-b', null]);
+    expect([market.syncRunId, imported.syncRunId])
+      .toEqual(['mcp-run-a', null]);
     expect(repository.getEvidence(jobId).map((item) => item.syncRunId))
-      .toEqual(['mcp-run-a', 'mcp-run-b', null]);
+      .toEqual(['mcp-run-a', null]);
+    expect(db.prepare(`SELECT sync_run_id FROM data_tasks WHERE research_job_id = ?`).get(jobId))
+      .toMatchObject({ sync_run_id: 'mcp-run-a' });
   });
 
   it('rejects a caller-supplied run that differs from the immutable source row, including idempotent writes', () => {

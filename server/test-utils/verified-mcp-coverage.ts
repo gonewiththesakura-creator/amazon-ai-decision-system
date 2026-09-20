@@ -47,6 +47,16 @@ export function addVerifiedMcpCoverage(
   `).all(marketId, settings.marketplace, settings.marketplace, settings.marketplace) as Array<{
     id: string; asin: string; marketNodeId: string;
   }>;
+  const rootNodeIdPath = '1055398:1063252';
+  const marketNodes = [{ id: marketId, nodeIdPath: rootNodeIdPath }];
+  for (const id of [...new Set(owned.map((product) => product.marketNodeId))]
+    .filter((id) => id !== marketId).sort()) {
+    const child = database.prepare(`SELECT category_id AS nodeIdPath FROM market_nodes
+      WHERE id = ? AND marketplace = ? AND status = 'active' AND source_type <> 'mock'`)
+      .get(id, settings.marketplace) as { nodeIdPath: string | null } | undefined;
+    if (!child?.nodeIdPath) throw new Error('Synthetic child market requires a mapped category path.');
+    marketNodes.push({ id, nodeIdPath: child.nodeIdPath });
+  }
   const directCompetitors = database.prepare(`
     SELECT DISTINCT competitor.id, competitor.asin
     FROM competitor_relations relation
@@ -65,7 +75,8 @@ export function addVerifiedMcpCoverage(
     status, started_at, completed_at, total, success, failed, created_at
   ) VALUES (?, ?, 'Synthetic critical proof', 'source-sellersprite-mcp',
     'critical_sync', ?, 'SellerSprite MCP', ?, 'success', ?, ?, ?, ?, 0, ?)`)
-    .run(runId, runId, marketId, settings.marketplace, now, now, owned.length + 1, owned.length + 1, now);
+    .run(runId, runId, marketId, settings.marketplace, now, now,
+      owned.length + marketNodes.length, owned.length + marketNodes.length, now);
   database.prepare(`INSERT INTO data_tasks (
     id, sync_run_id, name, source_id, task_type, target, source, marketplace,
     status, started_at, completed_at, total, success, failed, created_at
@@ -81,27 +92,41 @@ export function addVerifiedMcpCoverage(
     ?, ?, ?, ?, 0, ?)`)
     .run(competitorTaskId, runId, settings.marketplace, now, now,
       directCompetitors.length, directCompetitors.length, now);
-  const marketSnapshotId = randomUUID();
-  database.prepare(`INSERT INTO market_snapshots (
+  const marketMonths = [
+    { month: '202608', date: '2026-08-31' },
+    { month: '202609', date: '2026-09-30' },
+  ];
+  let marketSnapshotId = '';
+  const insertMarketSnapshot = database.prepare(`INSERT INTO market_snapshots (
     id, market_node_id, date, product_count, source, source_type, collected_at,
     period, is_estimated, confidence, observation_date, dedup_key, sync_run_id
-  ) VALUES (?, ?, '2026-09-30', 10, 'SellerSprite MCP',
-    'mcp', ?, '1M', 1, 0.8, '2026-09-30', ?, ?)`)
-    .run(marketSnapshotId, marketId, now, `verified-market-${runId}`, runId);
-  database.prepare(`INSERT INTO mcp_sync_observation_links (
+  ) VALUES (?, ?, ?, 10, 'SellerSprite MCP',
+    'mcp', ?, '1M', 1, 0.8, ?, ?, ?)`);
+  const insertMarketLink = database.prepare(`INSERT INTO mcp_sync_observation_links (
     sync_run_id, snapshot_kind, snapshot_id, entity_id, disposition
-  ) VALUES (?, 'market', ?, ?, 'inserted')`).run(runId, marketSnapshotId, marketId);
-  const marketFactId = randomUUID();
-  database.prepare(`INSERT INTO metric_facts (
+  ) VALUES (?, 'market', ?, ?, 'inserted')`);
+  const insertMarketFact = database.prepare(`INSERT INTO metric_facts (
     id, entity_type, entity_id, marketplace, metric_name, numeric_value,
     source, source_id, source_type, is_estimated, confidence, observation_date,
     collected_at, dedup_key, sync_run_id
   ) VALUES (?, 'market', ?, ?, 'product_count', 10, 'SellerSprite MCP',
-    'source-sellersprite-mcp', 'mcp', 1, 0.8, '2026-09-30', ?, ?, ?)`)
-    .run(marketFactId, marketId, settings.marketplace, now, `verified-market-fact-${runId}`, runId);
-  database.prepare(`INSERT INTO mcp_sync_observation_links (
+    'source-sellersprite-mcp', 'mcp', 1, 0.8, ?, ?, ?, ?)`);
+  const insertFactLink = database.prepare(`INSERT INTO mcp_sync_observation_links (
     sync_run_id, snapshot_kind, snapshot_id, entity_id, disposition
-  ) VALUES (?, 'fact', ?, ?, 'inserted')`).run(runId, marketFactId, marketId);
+  ) VALUES (?, 'fact', ?, ?, 'inserted')`);
+  for (const marketNode of marketNodes) {
+    for (const marketMonth of marketMonths) {
+      const snapshotId = randomUUID();
+      insertMarketSnapshot.run(snapshotId, marketNode.id, marketMonth.date, now, marketMonth.date,
+        `verified-market-${marketNode.id}-${marketMonth.month}-${runId}`, runId);
+      insertMarketLink.run(runId, snapshotId, marketNode.id);
+      const factId = randomUUID();
+      insertMarketFact.run(factId, marketNode.id, settings.marketplace, marketMonth.date, now,
+        `verified-market-fact-${marketNode.id}-${marketMonth.month}-${runId}`, runId);
+      insertFactLink.run(runId, factId, marketNode.id);
+      if (marketNode.id === marketId && marketMonth.month === '202609') marketSnapshotId = snapshotId;
+    }
+  }
   addWorkflowEvidence(database, runId, settings.marketplace, 'market', marketId, marketSnapshotId, now);
   for (const product of owned) {
     const snapshotId = randomUUID();
@@ -141,26 +166,35 @@ export function addVerifiedMcpCoverage(
     } }), now, runId);
   const addCall = database.prepare(`INSERT INTO mcp_call_logs (
     id, provider_id, capability, request_hash, status, entity_type,
-    entity_id, result_count, started_at, sync_run_id
-  ) VALUES (?, 'sellersprite', ?, ?, 'success', ?, ?, 1, ?, ?)`);
+    entity_id, result_count, started_at, sync_run_id, observation_month
+  ) VALUES (?, 'sellersprite', ?, ?, 'success', ?, ?, 1, ?, ?, ?)`);
   addCall.run(randomUUID(), 'LIST_TOOLS', `list-tools-${runId}`,
-    null, null, now, runId);
-  addCall.run(randomUUID(), 'MARKET_STATISTICS', `market-${runId}`,
-    'market', '1055398:1063252', now, runId);
-  addCall.run(randomUUID(), 'PRODUCT_CONCENTRATION', `concentration-${runId}`,
-    'market', '1055398:1063252', now, runId);
+    null, null, now, runId, null);
+  for (const marketNode of marketNodes) {
+    for (const marketMonth of marketMonths) {
+      addCall.run(randomUUID(), 'MARKET_STATISTICS',
+        `market-${marketNode.id}-${marketMonth.month}-${runId}`,
+        'market', marketNode.nodeIdPath, now, runId, marketMonth.month);
+      addCall.run(randomUUID(), 'PRODUCT_CONCENTRATION',
+        `concentration-${marketNode.id}-${marketMonth.month}-${runId}`,
+        'market', marketNode.nodeIdPath, now, runId, marketMonth.month);
+    }
+  }
   for (const product of owned) {
     addCall.run(randomUUID(), 'ASIN_SALES_TREND', `asin-${product.id}-${runId}`,
-      'product', product.asin.toUpperCase(), now, runId);
+      'product', product.asin.toUpperCase(), now, runId, null);
     addCall.run(randomUUID(), 'ASIN_COMPETITOR_DISCOVERY', `candidates-${product.id}-${runId}`,
-      'product', product.asin.toUpperCase(), now, runId);
+      'product', product.asin.toUpperCase(), now, runId, null);
   }
   database.prepare(`INSERT INTO data_coverage_runs (
     id, marketplace, run_type, coverage_json, is_complete, created_at
   ) VALUES (?, ?, 'critical_sync', ?, 1, ?)`).run(runId, settings.marketplace,
-    JSON.stringify({ marketId, nodeIdPath: '1055398:1063252', month: '202609',
+    JSON.stringify({ marketId, nodeIdPath: '1055398:1063252', month: '202609', baselineMonth: '202608',
+      marketMonths: marketMonths.map(({ month }) => month),
+      marketNodes,
       ownedProducts: owned.map(({ id, asin, marketNodeId }) => ({ id, asin, marketNodeId })),
-      marketSnapshots: 1, productSnapshots: owned.length, activeOwnedProducts: owned.length,
+      marketSnapshots: marketNodes.length * marketMonths.length,
+      productSnapshots: owned.length, activeOwnedProducts: owned.length,
       candidateDiscovery: {
         taskId: candidateTaskId, status: 'success', total: owned.length,
         success: owned.length, failed: 0, candidates: 0,
@@ -199,6 +233,14 @@ function addWorkflowEvidence(
     ?, ?, '{}', 0, 'test', ?, 'test-prompt-v1', ?, ?)`)
     .run(jobId, jobType, marketplace, jobEntityType, entityId,
       profile.id, profile.version, dataVersion, now, now);
+  database.prepare(`INSERT INTO data_tasks (
+    id, sync_run_id, name, source_id, task_type, target, source, marketplace,
+    status, started_at, completed_at, total, success, failed, created_at,
+    research_job_id
+  ) VALUES (?, ?, 'Synthetic workflow collection', 'source-sellersprite-mcp',
+    'workflow_collection', ?, 'Persisted SellerSprite Snapshot', ?, 'success',
+    ?, ?, 1, 1, 0, ?, ?)`)
+    .run(randomUUID(), runId, entityId, marketplace, now, now, now, jobId);
   const evidenceId = randomUUID();
   database.prepare(`INSERT INTO evidence_records (
     id, research_job_id, claim, metric_name, metric_value_json, source,
