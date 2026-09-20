@@ -12,7 +12,7 @@ Copy-Item .env.example .env
 npm run dev
 ```
 
-在本机或服务器的 `.env` 中填写 `SELLERSPRITE_MCP_URL`（不含密钥查询参数的 MCP 地址）和 `SELLERSPRITE_MCP_SECRET`。两者只能供服务端读取；不要放入 `VITE_*`、命令行历史、截图、工单、日志或公开 Git 仓库。`.env`、本地数据库、备份和原始业务文件已被 Git 忽略。公开仓库不应包含真实 SKU 报表或凭据；向外部署前还需另行配置正式身份认证，当前 Admin/Viewer 只是本地权限预览。
+在本机或服务器的 `.env` 中填写 `SELLERSPRITE_MCP_URL`（不含用户名、密码或任何密钥查询参数的 MCP 地址）和 `SELLERSPRITE_MCP_SECRET`。端点解析器会拒绝 URL 内嵌凭据；带 Secret 的远程地址必须使用 HTTPS，本机回环地址才允许 HTTP。两者只能供服务端读取。不要放入 `VITE_*`、命令行历史、截图、工单、日志或公开 Git 仓库。`.env`、本地数据库、备份和原始业务文件已被 Git 忽略。公开仓库不应包含真实 SKU 报表或凭据；向外部署前还需另行配置正式身份认证，当前 Admin/Viewer 只是本地权限预览。
 
 默认前端为 `http://127.0.0.1:5173`，API 为 `http://127.0.0.1:8787`。首次打开数据库会执行向前迁移。不要对有业务数据的数据库运行 `npm run db:reset`，该命令会删除本地内容。
 
@@ -21,9 +21,9 @@ npm run dev
 1. 保留现有 Demo。打开“设置 -> 数据源”，执行“连接测试”。检查认证、工具数量、必需能力及延迟；能力列表来自实际 `listTools`。诊断不应显示密钥。
 2. 确认当前 Marketplace 和“默认市场节点”属于目标站点。在“设置 -> 数据源”输入并核对 SellerSprite 数字节点路径，勾选站点/类目范围确认后保存为 `market_nodes.category_id`；未映射的市场会拒绝同步，不退用本地节点 ID。不能因为名称包含 pillow 就把宽泛 Bed Pillows 类目当成已验证的 Memory Foam Pillow 细分市场。
 3. 打开“数据任务 -> 审核文件导入”，选取 `examples/owned-product-master-template.csv` 结构的真实产品主数据文件。预览识别类型、新增/更新/重复/错误计数、字段映射、样例行和拒绝原因；未知类型先人工选择，再用新预览确认。模板列为 `marketplace,asin,sku,internalName,brand,title,productType,parentAsin,variationTheme,marketNode,monitoringEnabled,status`。按真实父子 ASIN 填写 `parentAsin`/`variationTheme`，不要把父体销量与子 SKU 销量相加；被拒绝的行需明确确认只导入有效行。
-4. 在“设置 -> 数据源”选观察月份后执行“同步关键数据”。该批次抓主市场统计/集中度和当前站点全部 active 自有 ASIN 趋势；远端调用全部成功后，市场与自有产品 Snapshot 才原子落库。任一关键调用失败时保留已有合法快照，按接口错误和 MCP 调用账本排查，不会回退 Mock；当前关键同步不保证单独生成 DataTask。`observationDate` 采用业务月份或趋势点日期，`collectedAt` 是抓取时间；重复的同来源、实体、业务日期和周期观察不会叠加为销量。
-5. 到自有产品详情的“竞品”页执行“发现候选”。按价格、形态、功能、人群及相似度人工核对，填写纳入理由并选择关联类型后确认，或拒绝。MCP 发现的候选不会自动成为直接竞品。确认后从该竞品行点击同步图标，才会单独抓取并写入其历史快照；关系被撤销或远端 ASIN/站点不一致时会拒绝落库。
-6. 查看“数据任务”的真实数据覆盖，以及市场、自有产品和驾驶舱上的来源、日期与缺失值。页面读取数据库 Snapshot，刷新页面不会触发 MCP。历史不足时继续通过已验证的 MCP 趋势和文件补数；至少核对一个真实市场、一个**自有** ASIN 与一组已审核竞品，再检查 Rule/Evidence 是否指向真实数据版本。
+4. 在“设置 -> 数据源”选观察月份后执行“同步关键数据”。服务端先创建唯一 `runId` 和运行中的 `critical_sync` DataTask；本次 `listTools`/能力快照、主市场当前月与上月的统计/集中度、当前站点全部 active 且非 Mock 的自有 ASIN 趋势、候选发现、已确认直接竞品刷新、Snapshot、metric fact、coverage 和后续 Evidence 都用该 `runId` 关联。市场两个月份须由本次运行分别请求、校验和链接，不能拼接两次历史运行；关键市场工具必须在本次发现的 schema 中声明 `month` 参数，统计和集中度响应也必须回显与请求一致的月份，否则本次运行按契约失败处理，不能把无月份响应认证为对应历史月份。主市场双月与全部真实自有 SKU 是原子关键批次：任一关键调用失败时不写本批业务观察，只留下脱敏失败任务和不完整 coverage，并继续展示上一次合法真实 Snapshot，不回退 Mock。相同周期只有在标准化结果完全一致时才可通过 run-to-observation 链接复用；Snapshot 和 fact 的首次来源不被改写，Evidence 继承最近一次完整复核运行，值发生修订则拒绝认证。
+5. 关键批次成功后，候选发现和已确认 `direct` 竞品作为非阻断 secondary 阶段继续运行并分别记录 coverage；单个竞品失败会形成 `partial`，不会推翻关键批次。候选只写入待审核池，不会自动成为直接竞品。到自有产品详情的“竞品”页按价格、形态、功能、人群及相似度人工核对，填写纳入理由并确认或拒绝；也可从该页再次发现候选或单独刷新已确认竞品。关系被撤销或远端 ASIN/站点不一致时拒绝落库。`observationDate` 采用业务月份或趋势点日期，`collectedAt` 是抓取时间。
+6. 查看“数据任务”的真实数据覆盖，以及市场、自有产品和驾驶舱上的来源、日期与缺失值。页面读取数据库 Snapshot，刷新页面不会触发 MCP。历史不足时继续通过已验证的 MCP 趋势和文件补数；为主市场及每个当前 active 自有 SKU 分别运行非 Demo Research Job，检查 Rule/Evidence 是否指向本次 `runId` 的真实来源记录，并确认工作流进入 monitoring、最终 Insight 引用了 Evidence、分析和报告步骤均完成。Go Live 面板中的“运行 Evidence”必须达到“主市场 + 当前全部自有 SKU”的覆盖数。竞品关系仍需人工审核。
 
 市场统计返回的 `products`/价格等指标可能只覆盖工具返回的商品 cohort；集中度列表或 TOP100 的销量不能自动当成整个类目总销量。接口未给出可信全类目总量时保留 `null`，界面显示“—/数据不足”，不填 `0`。SellerSprite 的自有 ASIN 销量是估算，不能替代 Amazon 真实销量；导入/接口的原始事实分别保留，展示时按来源权威规则选择。
 
@@ -38,13 +38,13 @@ npm run dev
 只有真实链路和产品身份已核对后，才在“设置 -> 数据源 -> Go Live 迁移”操作。不要先清 Demo 再尝试证明真实链路：
 
 1. 查看 Dry Run 的预计删除、归档、保留和引用阻断项；先处理真实工作流对 Demo 记录的引用。清理只针对明确登记或可识别的 Demo 观察及相关演示实体，不是数据库重置；产品主数据、规则和真实历史应保留，未知或混合来源的 Mock 记录会阻断清理。
-2. **备份和清理之前**，先验证当前站点的主市场节点有带有效业务指标的真实 MCP 市场 Snapshot，且 MCP 调用账本记录了匹配当前节点的成功调用；至少一个该市场节点或子节点中 active **自有** ASIN 有非 Mock 主档、MCP 历史 Snapshot 和匹配该 ASIN 的成功趋势调用。核对站点、节点路径、ASIN、来源及采集日期；公开竞品 ASIN 或 Demo Snapshot 不可替代。刷新迁移状态，只有 `/api/go-live/verify` 的 `readyForDemoCleanup` 为 `true`，才继续备份和清理。这只是清理前证明，**不代表**已满足 Live 切换条件。
+2. **备份和清理之前**，先验证 `/api/go-live/verify` 返回非空 `sellerSpriteCriticalRunId`。验证器只接受同一个完整 `critical_sync` 运行中的 fresh `listTools`、能力快照、双月市场统计/集中度、当前真实自有 ASIN 趋势调用、候选/竞品 coverage、对应 run-to-Snapshot 链接，以及主市场和每个当前自有 SKU 的同运行非 Demo 已完成工作流 Evidence；不会把不同时间或不同运行的成功片段拼接。运行后新增 SKU、站点/数字节点路径变化、范围外 SKU、失败调用、缺少链接或不完整 roster 都会让 `readyForDemoCleanup` 保持 `false`。公开竞品 ASIN 或 Demo Snapshot 不可替代自有 ASIN。该状态只是清理前证明，**不代表**已满足 Live 切换条件。
 3. 点击“备份数据库”，确认备份创建。备份目录默认为 `data/backups/`，位于本机且不进 Git；另行按业务要求保护和保留备份。备份后若数据库又发生写入（包括重新同步或导入），原备份会过期，清理前必须重新备份。
-4. 输入精确确认文本 `CLEAR DEMO DATA`，再清除演示数据。缺少清理前证明、备份或有引用阻断项时按钮不可用，服务端也会拒绝清理。没有真实快照/引用的 4 个种子自有 SKU 和 8 个种子竞品会归档为 inactive，主档仍保留；已有真实引用的种子产品不会被盲目归档。清理后重新检查预览和数据覆盖。
-5. 在“数据任务”查看主市场、active 自有产品、核心竞品、90 天历史及 Amazon 实际值的覆盖。Go Live 校验还要求 Mock 观察为零、当前主市场有有意义的真实与 MCP 快照、自有产品均有真实快照、至少一个自有 ASIN 有 MCP 快照、必需 MCP 能力、近 24 小时内已连接验证/同步以及匹配当前节点/自有 ASIN 的成功调用账本。覆盖不足时保持非 Live，不绕过校验。
+4. 输入精确确认文本 `CLEAR DEMO DATA`，再清除演示数据。缺少清理前证明、备份或有引用阻断项时按钮不可用，服务端也会拒绝清理。Dry Run 会单独列出规则生成的 Demo 分数 Evidence 和旧 Demo 人工拒绝记录的脱敏引用，供人工确认；它们不会因为出现于清单而自动删除。没有真实快照/引用的种子产品只在后续明确批准的清理动作中归档，已有真实引用的记录不会被盲目处理。
+5. 在“数据任务”查看主市场、active 自有产品、核心竞品、90 天历史及 Amazon 实际值的覆盖。Go Live 校验还要求 Mock 观察为零、没有 active Mock 自有主档、当前真实自有产品均有真实快照、必需 MCP 能力、近 24 小时内连接验证，以及上述单次完整关键运行证明。secondary 竞品 coverage 可以部分成功，但不能替代或修复失败的关键运行。覆盖不足时保持非 Live，不绕过校验。
 6. 只有 `/api/go-live/verify` 的 `hasMinimumRealCoverage` 为 `true`，才输入 `ACTIVATE LIVE` 切换。切换后刷新驾驶舱，核对真实来源、趋势、缺失提示及 Evidence。Live 同步失败应保留上一版真实快照并显示未更新，不得使用 Mock 兜底。
 
-服务端对应的诊断和操作接口为 `/api/integrations/sellersprite/test`、`/api/integrations/sellersprite/capabilities`、`/api/integrations/sellersprite/sync/critical`、`/api/integrations/sellersprite/sync/competitor`、`/api/data-coverage` 与 `/api/go-live/{preview,backup,cleanup,verify,activate}`。写操作仅用于当前本地 Admin 角色；备份后同一服务进程内才允许清理。MCP 调用账本记录工具、范围实体、结果数量、参数哈希、状态、耗时和缓存命中，不记录 Secret。
+服务端对应的诊断和操作接口为 `/api/integrations/sellersprite/test`、`/api/integrations/sellersprite/capabilities`、`/api/integrations/sellersprite/sync/critical`、`/api/integrations/sellersprite/sync/competitor`、候选审核接口、`/api/data-coverage` 与 `/api/go-live/{preview,backup,cleanup,verify,activate}`。写操作仅用于当前本地 Admin 角色；备份后同一服务进程内才允许清理。MCP 调用账本记录 `runId`、工具、范围实体、结果数量、参数哈希、状态、耗时和缓存命中，不记录 Secret；`runId` 只由服务端创建，不作为 provider 参数发送。
 
 ## 当前验收边界与检查
 

@@ -13,10 +13,12 @@ describe('SellerSpriteToolRegistry', () => {
   it('maps all stable capabilities from explicit aliases and required schema signals', async () => {
     const store = new MemoryCapabilityStore();
     const registry = new SellerSpriteToolRegistry({ store });
+    const runId = '123e4567-e89b-42d3-a456-426614174000';
 
-    const snapshot = await registry.refresh(async () => discoveredTools);
+    const snapshot = await registry.refresh(async () => discoveredTools, runId);
 
     expect(snapshot.missingCapabilities).toEqual([]);
+    expect(snapshot.runId).toBe(runId);
     expect(registry.resolve('ASIN_SALES_TREND')?.inputSchema.required).toContain('asin');
     expect(registry.resolve('MARKET_RESEARCH')?.name).toBe('market_research');
     expect(registry.resolve('MARKET_STATISTICS')?.inputSchema.required).toContain('request');
@@ -63,6 +65,33 @@ describe('SellerSpriteToolRegistry', () => {
     expect(registry.resolve('ASIN_SALES_TREND')).toBeUndefined();
     expect(registry.missing()).toContain('ASIN_SALES_TREND');
   });
+
+  it('does not certify an ASIN capability when marketplace is absent from its required schema', async () => {
+    const registry = new SellerSpriteToolRegistry();
+
+    await registry.refresh(async () => [mcpTool(
+      'asin_sales_trend', 'Historical sales trend for an ASIN', ['asin'],
+    )]);
+
+    expect(registry.resolve('ASIN_SALES_TREND')).toBeUndefined();
+    expect(registry.missing()).toContain('ASIN_SALES_TREND');
+  });
+
+  it.each(['MARKET_STATISTICS', 'PRODUCT_CONCENTRATION'] as const)(
+    'does not certify %s without required nodeIdPath scope',
+    async (capability) => {
+      const registry = new SellerSpriteToolRegistry();
+      const name = capability === 'MARKET_STATISTICS'
+        ? 'market_research_statistics' : 'market_product_concentration';
+
+      await registry.refresh(async () => [mcpTool(
+        name, 'Scoped market data', ['marketplace'],
+      )]);
+
+      expect(registry.resolve(capability)).toBeUndefined();
+      expect(registry.missing()).toContain(capability);
+    },
+  );
 
   it('retains only safe tool metadata in persisted capability snapshots', async () => {
     const store = new MemoryCapabilityStore();
@@ -127,8 +156,9 @@ describe('SellerSpriteToolRegistry', () => {
     await registry.refresh(async () => [{
       name: 'asin_sales_trend',
       inputSchema: {
-        type: 'object', required: ['asin'],
+        type: 'object', required: ['marketplace', 'asin'],
         properties: {
+          marketplace: { type: 'string' },
           asin: { type: 'string', enum: ['B000000001', 'opaque-credential-fixture'] },
           filter: { type: 'object', enum: [{ value: 'opaque-nested-fixture' }] },
         },
@@ -172,6 +202,17 @@ describe('SellerSpriteToolRegistry', () => {
     expect(() => registry.argumentsFor('MARKET_STATISTICS', {
       request: { marketplace: 'US', nodeIdPath: 'bed-pillows', month: '202608' },
     })).toThrow(/month/);
+  });
+
+  it('reports whether a discovered market capability explicitly declares an argument', async () => {
+    const registry = new SellerSpriteToolRegistry();
+    await registry.refresh(async () => [mcpTool(
+      'market_research_statistics', 'Monthly market statistics',
+      ['request'],
+    )]);
+
+    expect(registry.supportsArgument('MARKET_STATISTICS', 'marketplace')).toBe(true);
+    expect(registry.supportsArgument('MARKET_STATISTICS', 'month')).toBe(false);
   });
 });
 

@@ -37,7 +37,12 @@ export interface SellerSpriteToolCall {
   arguments: Record<string, unknown>;
   context: { capability?: string; operation?: string;
     entityType?: 'market' | 'product' | 'competitor'; entityId?: string;
-    researchJobId?: string };
+    researchJobId?: string; runId?: string; fresh?: boolean };
+}
+
+export interface SellerSpriteMcpAcquisition {
+  source: 'remote' | 'cache';
+  acquiredAt: string;
 }
 
 interface SellerSpriteMcpClientOptions {
@@ -68,9 +73,25 @@ export function sellerSpriteEndpoint(configured: string, secret?: string): URL {
   if (!['https:', 'http:'].includes(endpoint.protocol)) {
     throw new SellerSpriteMcpError('AUTH_ERROR', 'SellerSprite MCP endpoint protocol is invalid');
   }
-  const legacySecret = endpoint.searchParams.get('secretKey');
-  endpoint.searchParams.delete('secretKey');
-  if (secret || legacySecret) endpoint.searchParams.set('secret-key', secret || legacySecret!);
+  const loopbackHost = endpoint.hostname === 'localhost'
+    || endpoint.hostname === '127.0.0.1'
+    || endpoint.hostname === '[::1]';
+  if (secret && endpoint.protocol === 'http:' && !loopbackHost) {
+    throw new SellerSpriteMcpError(
+      'AUTH_ERROR',
+      'SellerSprite MCP 密钥仅允许通过 HTTPS 或本机回环地址传输。',
+    );
+  }
+  const credentialParameter = [...endpoint.searchParams.keys()].find((key) => (
+    /secret[-_]?key|api[-_]?key|access[-_]?token|token|password|secret/i.test(key)
+  ));
+  if (endpoint.username || endpoint.password || credentialParameter) {
+    throw new SellerSpriteMcpError(
+      'AUTH_ERROR',
+      'SellerSprite MCP URL 不得包含凭据；请使用 SELLERSPRITE_MCP_SECRET。',
+    );
+  }
+  if (secret) endpoint.searchParams.set('secret-key', secret);
   return endpoint;
 }
 
@@ -120,7 +141,7 @@ export class SellerSpriteMcpClient {
     try {
       const transport = await this.ensureTransport();
       await this.withTimeout((signal) => transport.ping({ signal }));
-      const tools = await this.listTools();
+      const tools = await this.listTools({ fresh: true });
       return { connected: true, authenticated: true, toolCount: tools.length };
     } catch (error) {
       const mapped = mapMcpError(error);
@@ -128,45 +149,61 @@ export class SellerSpriteMcpClient {
     }
   }
 
-  async listTools(): Promise<McpToolDefinition[]> {
-    if (this.catalog) return this.catalog;
-    const transport = await this.ensureTransport();
-    const tools: McpToolDefinition[] = [];
-    const cursors = new Set<string>();
-    let cursor: string | undefined;
-    do {
-      const response = await this.runWithRetry(async () => {
-        await this.acquireToken();
-        return this.withTimeout((signal) => transport.listTools({ cursor }, { signal }));
-      });
-      const page = mcpListToolsResultSchema.safeParse(response);
-      if (!page.success) throw new SellerSpriteMcpError('INVALID_SCHEMA', 'Invalid SellerSprite MCP tool list');
-      tools.push(...page.data.tools);
-      cursor = page.data.nextCursor;
-      if (cursor && cursors.has(cursor)) throw new SellerSpriteMcpError('INVALID_SCHEMA', 'Repeated SellerSprite MCP page cursor');
-      if (cursor) cursors.add(cursor);
-    } while (cursor);
-    this.catalog = tools;
-    return tools;
+  async listTools(options: { fresh?: boolean; runId?: string } = {}): Promise<McpToolDefinition[]> {
+    if (this.catalog && !options.fresh) return this.catalog;
+    const startedAt = new Date(this.now()).toISOString();
+    try {
+      const transport = await this.ensureTransport();
+      const tools: McpToolDefinition[] = [];
+      const cursors = new Set<string>();
+      let cursor: string | undefined;
+      do {
+        const response = await this.runWithRetry(async () => {
+          await this.acquireToken();
+          return this.withTimeout((signal) => transport.listTools({ cursor }, { signal }));
+        });
+        const page = mcpListToolsResultSchema.safeParse(response);
+        if (!page.success) throw new SellerSpriteMcpError('INVALID_SCHEMA', 'Invalid SellerSprite MCP tool list');
+        tools.push(...page.data.tools);
+        cursor = page.data.nextCursor;
+        if (cursor && cursors.has(cursor)) {
+          throw new SellerSpriteMcpError('INVALID_SCHEMA', 'Repeated SellerSprite MCP page cursor');
+        }
+        if (cursor) cursors.add(cursor);
+      } while (cursor);
+      this.catalog = tools;
+      this.recordDiscovery(options.runId, 'success', null, startedAt, tools.length);
+      return tools;
+    } catch (error) {
+      const mapped = mapMcpError(error);
+      this.recordDiscovery(options.runId, 'failed', mapped.code, startedAt, null);
+      throw mapped;
+    }
   }
 
   async callTool(request: SellerSpriteToolCall): Promise<McpCallToolResult>;
-  async callTool<T>(request: SellerSpriteToolCall, validate: (result: McpCallToolResult) => T): Promise<T>;
+  async callTool<T>(request: SellerSpriteToolCall, validate: (
+    result: McpCallToolResult, acquisition: SellerSpriteMcpAcquisition,
+  ) => T): Promise<T>;
   async callTool<T>(
-    request: SellerSpriteToolCall, validate?: (result: McpCallToolResult) => T,
+    request: SellerSpriteToolCall, validate?: (
+      result: McpCallToolResult, acquisition: SellerSpriteMcpAcquisition,
+    ) => T,
   ): Promise<T | McpCallToolResult> {
     const key = createHash('sha256').update(JSON.stringify([
       request.tool, ordered(request.arguments), request.context.capability ?? '',
     ])).digest('hex');
     const now = new Date(this.now()).toISOString();
-    const cached = this.options.cacheStore?.get(key, now);
+    const cached = request.context.fresh ? null : this.options.cacheStore?.get(key, now);
     if (cached) {
       let accepted: { raw: McpCallToolResult; value: T | McpCallToolResult } | null = null;
       try {
         const result = mcpCallToolResultSchema.safeParse(JSON.parse(cached.responseJson) as unknown);
         if (result.success) {
           assertToolSuccess(result.data);
-          accepted = { raw: result.data, value: validate ? validate(result.data) : result.data };
+          const acquiredAt = normalizedTimestamp(cached.createdAt);
+          accepted = { raw: result.data, value: validate
+            ? validate(result.data, { source: 'cache', acquiredAt }) : result.data };
         }
       } catch {
         // A stale or malformed cache entry cannot certify a capability call.
@@ -189,16 +226,17 @@ export class SellerSpriteMcpClient {
         const parsed = mcpCallToolResultSchema.safeParse(raw);
         if (!parsed.success) throw new SellerSpriteMcpError('INVALID_SCHEMA', 'Invalid SellerSprite MCP tool response');
         assertToolSuccess(parsed.data);
-        const accepted = validate ? validate(parsed.data) : parsed.data;
+        const acquiredAt = new Date(this.now()).toISOString();
+        const accepted = validate
+          ? validate(parsed.data, { source: 'remote', acquiredAt }) : parsed.data;
         this.record(request, key, 'success', null, false, attempt, startedAt, countResult(parsed.data));
         if (this.options.cacheStore && (this.options.cacheTtlMs ?? 300_000) > 0) {
-          const createdAt = new Date(this.now()).toISOString();
           this.options.cacheStore.set({
             cacheKey: key,
             provider: 'sellersprite',
             toolName: request.tool,
             responseJson: JSON.stringify(scrubSecrets(parsed.data)),
-            createdAt,
+            createdAt: acquiredAt,
             expiresAt: new Date(this.now() + (this.options.cacheTtlMs ?? 300_000)).toISOString(),
           });
         }
@@ -237,7 +275,33 @@ export class SellerSpriteMcpClient {
       researchJobId: request.context.researchJobId
         && /^[0-9a-f]{8}-[0-9a-f-]{27,36}$/i.test(request.context.researchJobId)
         ? request.context.researchJobId : undefined,
+      runId: request.context.runId && /^[0-9a-f]{8}-[0-9a-f-]{27,36}$/i.test(request.context.runId)
+        ? request.context.runId : undefined,
       resultCount,
+      completedAt: new Date(this.now()).toISOString(),
+    }));
+  }
+
+  private recordDiscovery(
+    runId: string | undefined,
+    status: 'success' | 'failed',
+    errorCode: SellerSpriteMcpErrorCode | null,
+    startedAt: string,
+    resultCount: number | null,
+  ): void {
+    this.options.ledgerStore?.record(newLedgerEntry({
+      provider: 'sellersprite',
+      toolName: 'list_tools',
+      capability: 'LIST_TOOLS',
+      operation: 'tool_discovery',
+      status,
+      errorCode,
+      requestHash: createHash('sha256').update('list_tools').digest('hex'),
+      cacheHit: false,
+      attempt: 1,
+      runId: runId && /^[0-9a-f]{8}-[0-9a-f-]{27,36}$/i.test(runId) ? runId : undefined,
+      resultCount,
+      startedAt,
       completedAt: new Date(this.now()).toISOString(),
     }));
   }
@@ -287,6 +351,12 @@ export class SellerSpriteMcpClient {
     }
     throw new SellerSpriteMcpError('REMOTE_ERROR', 'SellerSprite MCP request failed');
   }
+}
+
+function normalizedTimestamp(value: string): string {
+  const milliseconds = Date.parse(value);
+  if (!Number.isFinite(milliseconds)) throw new Error('Invalid cached acquisition timestamp');
+  return new Date(milliseconds).toISOString();
 }
 
 function assertToolSuccess(result: McpCallToolResult): void {

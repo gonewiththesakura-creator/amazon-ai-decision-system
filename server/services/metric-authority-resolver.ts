@@ -1,4 +1,5 @@
 import type { AppDatabase } from '../database/database.js';
+import { isLiveObservationReadable } from './live-observation-readability.js';
 
 export interface ResolveMetricInput {
   entityId: string;
@@ -58,8 +59,9 @@ export class MetricAuthorityResolver {
         AND observation_date = ? AND numeric_value IS NOT NULL
         AND (? IS NULL OR source_id = ?)
     `).all(entityType, input.entityId, input.metric, legacyMetric, input.observationDate, input.sourceId ?? null, input.sourceId ?? null) as unknown as SnapshotRow[];
+    const readableFacts = factRows.filter((row) => this.isReadable('fact', row.id, row.source_type));
     const candidates: Candidate[] = [
-      ...factRows.map((row) => ({ fact: toFact(row, 'metric_fact'), store: 'fact' as const })),
+      ...readableFacts.map((row) => ({ fact: toFact(row, 'metric_fact'), store: 'fact' as const })),
       ...this.legacySnapshotFacts(input, entityType)
         .map((row) => ({ fact: toFact(row), store: 'snapshot' as const })),
     ];
@@ -92,10 +94,26 @@ export class MetricAuthorityResolver {
       FROM ${table}
       WHERE ${entityColumn} = ? AND observation_date = ? AND ${input.metric} IS NOT NULL
     `).all(input.entityId, input.observationDate) as unknown as SnapshotRow[];
-    return rows.filter((row) => (
+    return rows.filter((row) => this.isReadable(
+      entityType === 'market' ? 'market-snapshot' : 'snapshot', row.id, row.source_type,
+    )).filter((row) => (
       input.sourceId === undefined
       || providerId(toFact(row)) === normalizeProviderId(input.sourceId)
     ));
+  }
+
+  private isReadable(kind: 'fact' | 'snapshot' | 'market-snapshot', id: string, sourceType: string): boolean {
+    const live = (this.database.prepare(`SELECT mode FROM app_settings WHERE id = 1`).get() as {
+      mode?: string;
+    } | undefined)?.mode === 'live';
+    if (!live) return true;
+    if (sourceType === 'mock') return false;
+    const table = kind === 'fact'
+      ? 'metric_facts' : kind === 'market-snapshot' ? 'market_snapshots' : 'product_snapshots';
+    const row = this.database.prepare(`SELECT sync_run_id AS syncRunId FROM ${table} WHERE id = ?`)
+      .get(id) as { syncRunId: string | null } | undefined;
+    const observationKind = kind === 'market-snapshot' ? 'market' : kind === 'snapshot' ? 'product' : kind;
+    return isLiveObservationReadable(this.database, observationKind, id, sourceType, row?.syncRunId ?? null);
   }
 }
 

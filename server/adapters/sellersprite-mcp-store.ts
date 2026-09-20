@@ -6,6 +6,7 @@ import type { SellerSpriteCapability } from './sellersprite-tool-registry.js';
 export interface McpCapabilitySnapshot {
   id: string;
   provider: 'sellersprite';
+  runId?: string | null;
   discoveredAt: string;
   tools: Array<Pick<McpToolDefinition, 'name' | 'description' | 'inputSchema'>>;
   capabilities: Partial<Record<SellerSpriteCapability, string>>;
@@ -31,6 +32,7 @@ export interface McpCallLedgerEntry {
   entityType?: 'market' | 'product' | 'competitor';
   entityId?: string;
   researchJobId?: string;
+  runId?: string;
   resultCount?: number | null;
   startedAt: string;
   completedAt: string;
@@ -60,25 +62,31 @@ export class SqliteMcpCapabilityStore implements McpCapabilityStore {
   save(snapshot: McpCapabilitySnapshot): void {
     this.database.prepare(`
       INSERT INTO provider_capability_snapshots
-        (id, provider_id, capabilities_json, collected_at, expires_at)
-      VALUES (?, ?, ?, ?, NULL)
+        (id, provider_id, capabilities_json, collected_at, expires_at, sync_run_id)
+      VALUES (?, ?, ?, ?, NULL, ?)
     `).run(snapshot.id, snapshot.provider, JSON.stringify({
       tools: snapshot.tools,
       capabilities: snapshot.capabilities,
       missingCapabilities: snapshot.missingCapabilities,
-    }), snapshot.discoveredAt);
+    }), snapshot.discoveredAt, snapshot.runId ?? null);
   }
 
   latest(): McpCapabilitySnapshot | null {
     const row = this.database.prepare(`
-      SELECT id, provider_id, collected_at, capabilities_json
+      SELECT id, provider_id, collected_at, capabilities_json, sync_run_id
       FROM provider_capability_snapshots WHERE provider_id = 'sellersprite'
       ORDER BY collected_at DESC, rowid DESC LIMIT 1
     `).get() as Record<string, string> | undefined;
     if (!row) return null;
     const payload = JSON.parse(row.capabilities_json) as Pick<McpCapabilitySnapshot,
       'tools' | 'capabilities' | 'missingCapabilities'>;
-    return { id: row.id, provider: 'sellersprite', discoveredAt: row.collected_at, ...payload };
+    return {
+      id: row.id,
+      provider: 'sellersprite',
+      runId: row.sync_run_id ?? null,
+      discoveredAt: row.collected_at,
+      ...payload,
+    };
   }
 }
 
@@ -90,14 +98,14 @@ export class SqliteMcpCallLedgerStore implements McpCallLedgerStore {
       INSERT INTO mcp_call_logs
         (id, provider_id, capability, request_hash, status, response_metadata_json,
          error_code, started_at, completed_at, actual_tool, parameter_hash,
-         duration_ms, cache_hit, entity_type, entity_id, research_job_id, result_count)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         duration_ms, cache_hit, entity_type, entity_id, research_job_id, result_count, sync_run_id)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).run(entry.id, entry.provider, entry.capability ?? 'unspecified', entry.requestHash,
       entry.status, JSON.stringify({ operation: entry.operation, attempt: entry.attempt }),
       entry.errorCode, entry.startedAt, entry.completedAt, entry.toolName, entry.requestHash,
       Math.max(0, Date.parse(entry.completedAt) - Date.parse(entry.startedAt)), entry.cacheHit ? 1 : 0,
       entry.entityType ?? null, entry.entityId ?? null, entry.researchJobId ?? null,
-      entry.resultCount ?? null);
+      entry.resultCount ?? null, entry.runId ?? null);
   }
 }
 

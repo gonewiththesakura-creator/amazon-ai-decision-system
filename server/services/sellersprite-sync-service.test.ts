@@ -3,6 +3,7 @@ import { openDatabase, type AppDatabase } from '../database/database.js';
 import { IntelligenceRepository } from '../repository/intelligence-repository.js';
 import { SellerSpriteSyncService, type SellerSpriteSyncPort } from './sellersprite-sync-service.js';
 import { MetricAuthorityResolver } from './metric-authority-resolver.js';
+import { DashboardFreshnessService } from './dashboard-freshness-service.js';
 
 let database: AppDatabase | undefined;
 
@@ -112,6 +113,7 @@ describe('SellerSprite real-data sync', () => {
     const result = await service.syncMarket({ marketId: 'market-1', month: '202608' });
 
     expect(result.inserted).toBe(1);
+    expect(result.runId).toMatch(/^[a-f0-9-]{36}$/i);
     expect(database.prepare(`
       SELECT observation_date, date, collected_at, source_type, monthly_sales,
         monthly_revenue, median_reviews
@@ -121,6 +123,37 @@ describe('SellerSprite real-data sync', () => {
       collected_at: provenance.collectedAt, source_type: 'mcp',
       monthly_sales: null, monthly_revenue: null, median_reviews: null,
     });
+    expect(database.prepare(`
+      SELECT id, sync_run_id AS syncRunId, status, success, failed
+      FROM data_tasks WHERE id = ?
+    `).get(result.runId)).toEqual({
+      id: result.runId, syncRunId: result.runId, status: 'success', success: 1, failed: 0,
+    });
+    expect(database.prepare(`SELECT DISTINCT sync_run_id AS runId FROM market_snapshots`).all())
+      .toEqual([{ runId: result.runId }]);
+    expect(database.prepare(`SELECT DISTINCT sync_run_id AS runId FROM metric_facts`).all())
+      .toEqual([{ runId: result.runId }]);
+  });
+
+  it('records a sanitized failed standalone run without writing observations', async () => {
+    database = fixtureDatabase();
+    const port = fixturePort({
+      async fetchAsinSalesTrend() { throw new Error('token=standalone-secret'); },
+    });
+
+    const exposed = await new SellerSpriteSyncService(database, port)
+      .syncOwnedProduct({ productId: 'owned-1' })
+      .then(() => '', (error: unknown) => error instanceof Error ? error.message : String(error));
+
+    expect(exposed).not.toContain('standalone-secret');
+    expect(exposed).toContain('[REDACTED]');
+    expect(count('product_snapshots')).toBe(0);
+    const task = database.prepare(`
+      SELECT id, sync_run_id AS syncRunId, status, failed, error_log AS errorLog
+      FROM data_tasks WHERE task_type = 'owned_sku_refresh'
+    `).get() as { id: string; syncRunId: string; status: string; failed: number; errorLog: string };
+    expect(task).toMatchObject({ syncRunId: task.id, status: 'failed', failed: 1 });
+    expect(task.errorLog).not.toContain('standalone-secret');
   });
 
   it('does not turn an incomplete concentration cohort into total market sales', async () => {
@@ -260,7 +293,7 @@ describe('SellerSprite real-data sync', () => {
     ]);
   });
 
-  it('does not append another MCP observation over a legacy key for the same source and period', async () => {
+  it('does not certify or append over conflicting legacy MCP observations', async () => {
     database = fixtureDatabase();
     database.prepare(`INSERT INTO market_snapshots (
       id, market_node_id, date, product_count, source, source_type, collected_at,
@@ -274,10 +307,12 @@ describe('SellerSprite real-data sync', () => {
       '2026-09-01', '1M', 1, 0.8, '2026-08-31', 'legacy-product-key')`).run();
     const service = new SellerSpriteSyncService(database, fixturePort());
 
-    expect((await service.syncMarket({ marketId: 'market-1', month: '202608' })).inserted).toBe(0);
-    expect((await service.syncOwnedProduct({ productId: 'owned-1' })).inserted).toBe(1);
+    await expect(service.syncMarket({ marketId: 'market-1', month: '202608' }))
+      .rejects.toThrow(/不可变观察|不一致/);
+    await expect(service.syncOwnedProduct({ productId: 'owned-1' }))
+      .rejects.toThrow(/不可变观察|不一致/);
     expect(count('market_snapshots')).toBe(1);
-    expect(count('product_snapshots')).toBe(2);
+    expect(count('product_snapshots')).toBe(1);
     expect(database.prepare(`SELECT product_count FROM market_snapshots WHERE id = 'legacy-market'`).get())
       .toEqual({ product_count: 88 });
     expect(database.prepare(`SELECT estimated_sales FROM product_snapshots WHERE id = 'legacy-product'`).get())
@@ -285,6 +320,8 @@ describe('SellerSprite real-data sync', () => {
     expect(database.prepare(`SELECT COUNT(*) AS count FROM metric_facts
       WHERE entity_type = 'market' AND observation_date = '2026-08-31'`).get())
       .toEqual({ count: 0 });
+    expect(database.prepare(`SELECT status FROM data_tasks ORDER BY created_at, id`).all())
+      .toEqual([{ status: 'failed' }, { status: 'failed' }]);
   });
 
   it('preserves explicit historical day and rejects an all-null trend point', async () => {
@@ -353,6 +390,152 @@ describe('SellerSprite real-data sync', () => {
     expect((database.prepare(`
       SELECT COUNT(*) AS count FROM competitor_relations WHERE owned_product_id = 'owned-1'
     `).get() as { count: number }).count).toBe(1);
+  });
+
+  it('tracks standalone candidate discovery and preserves the same candidate across runs', async () => {
+    database = fixtureDatabase();
+    const observedRunIds: Array<string | undefined> = [];
+    const base = fixturePort();
+    const port = fixturePort({
+      async discoverAsinCompetitors(input, context) {
+        observedRunIds.push(context?.runId);
+        return base.discoverAsinCompetitors(input, context);
+      },
+    });
+    const service = new SellerSpriteSyncService(database, port);
+
+    const first = await service.discoverCompetitors({ ownedProductId: 'owned-1' });
+    const second = await service.discoverCompetitors({ ownedProductId: 'owned-1' });
+
+    expect(first).toMatchObject({ runId: expect.any(String), taskId: first.runId, candidates: 1 });
+    expect(second).toMatchObject({ runId: expect.any(String), taskId: second.runId, candidates: 1 });
+    expect(second.runId).not.toBe(first.runId);
+    expect(observedRunIds).toEqual([first.runId, second.runId]);
+    expect(database.prepare(`
+      SELECT id, sync_run_id AS syncRunId, status, total, success, failed
+      FROM data_tasks WHERE task_type = 'competitor_discovery' ORDER BY created_at, id
+    `).all()).toEqual(expect.arrayContaining([
+      { id: first.runId, syncRunId: first.runId, status: 'success', total: 1, success: 1, failed: 0 },
+      { id: second.runId, syncRunId: second.runId, status: 'success', total: 1, success: 1, failed: 0 },
+    ]));
+    const candidate = database.prepare(`
+      SELECT id, sync_run_id AS originRunId FROM competitor_candidates
+      WHERE source_product_id = 'owned-1'
+    `).get() as { id: string; originRunId: string };
+    expect(candidate.originRunId).toBe(first.runId);
+    expect(database.prepare(`
+      SELECT sync_run_id AS runId, disposition FROM competitor_candidate_run_links
+      WHERE candidate_id = ? ORDER BY created_at, sync_run_id
+    `).all(candidate.id)).toEqual(expect.arrayContaining([
+      { runId: first.runId, disposition: 'inserted' },
+      { runId: second.runId, disposition: 'reused' },
+    ]));
+  });
+
+  it('rejects a same-key Mock candidate instead of certifying its old payload as MCP', async () => {
+    database = fixtureDatabase();
+    database.prepare(`
+      INSERT INTO competitor_candidates (
+        id, marketplace, asin, source_product_id, source, source_type,
+        payload_json, status, created_at
+      ) VALUES ('mock-candidate', 'US', 'B0PUBLIC03', 'owned-1', 'Demo', 'mock',
+        '{"asin":"B0PUBLIC03","title":"Demo Pillow"}', 'pending_review', ?)
+    `).run('2026-09-01T00:00:00Z');
+
+    await expect(new SellerSpriteSyncService(database, fixturePort())
+      .discoverCompetitors({ ownedProductId: 'owned-1' }))
+      .rejects.toThrow(/候选.*(来源|冲突|不一致)/);
+
+    expect(database.prepare(`
+      SELECT source_type AS sourceType, payload_json AS payload, sync_run_id AS runId
+      FROM competitor_candidates WHERE id = 'mock-candidate'
+    `).get()).toEqual({
+      sourceType: 'mock', payload: '{"asin":"B0PUBLIC03","title":"Demo Pillow"}', runId: null,
+    });
+    expect(database.prepare(`SELECT COUNT(*) AS count FROM competitor_candidate_run_links`).get())
+      .toEqual({ count: 0 });
+    expect(database.prepare(`SELECT status FROM data_tasks WHERE task_type = 'competitor_discovery'`).get())
+      .toEqual({ status: 'failed' });
+  });
+
+  it('fails candidate secondary coverage when a repeated MCP payload conflicts', async () => {
+    database = fixtureDatabase();
+    const service = new SellerSpriteSyncService(database, fixturePort());
+    const first = await service.discoverCompetitors({ ownedProductId: 'owned-1' });
+    const candidate = database.prepare(`
+      SELECT id, payload_json AS payload FROM competitor_candidates WHERE source_product_id = 'owned-1'
+    `).get() as { id: string; payload: string };
+    const base = fixturePort();
+    const changed = fixturePort({
+      async discoverAsinCompetitors(input, context) {
+        const response = await base.discoverAsinCompetitors(input, context);
+        return { ...response, data: response.data.map((item) => ({ ...item, price: 41 })) };
+      },
+    });
+
+    const result = await new SellerSpriteSyncService(database, changed)
+      .syncCriticalBatch({ marketId: 'market-1', month: '202608' });
+
+    expect(result.candidateCoverage).toMatchObject({ status: 'failed', total: 1, success: 0, failed: 1 });
+    expect(database.prepare(`
+      SELECT status, sync_run_id AS runId FROM data_tasks WHERE task_type = 'competitor_discovery'
+        AND sync_run_id = ?
+    `).get(result.runId)).toEqual({ status: 'failed', runId: result.runId });
+    expect(database.prepare(`SELECT payload_json AS payload FROM competitor_candidates WHERE id = ?`)
+      .get(candidate.id)).toEqual({ payload: candidate.payload });
+    expect(database.prepare(`SELECT sync_run_id AS runId FROM competitor_candidate_run_links
+      WHERE candidate_id = ?`).all(candidate.id)).toEqual([{ runId: first.runId }]);
+  });
+
+  it('rejects a Mock owned master before creating a candidate run or calling MCP', async () => {
+    database = fixtureDatabase();
+    database.prepare(`UPDATE products SET source_type = 'mock' WHERE id = 'owned-1'`).run();
+    let calls = 0;
+    const port = fixturePort({
+      async discoverAsinCompetitors() {
+        calls += 1;
+        return { data: [], provenance };
+      },
+    });
+
+    await expect(new SellerSpriteSyncService(database, port)
+      .discoverCompetitors({ ownedProductId: 'owned-1' })).rejects.toThrow(/自有产品/);
+
+    expect(calls).toBe(0);
+    expect(database.prepare(`SELECT COUNT(*) AS count FROM data_tasks
+      WHERE task_type = 'competitor_discovery'`).get()).toEqual({ count: 0 });
+  });
+
+  it('records a sanitized failed standalone candidate run without retaining candidates', async () => {
+    database = fixtureDatabase();
+    let observedRunId: string | undefined;
+    const port = fixturePort({
+      async discoverAsinCompetitors(_input, context) {
+        observedRunId = context?.runId;
+        throw new Error('secret-key=candidate-private-value');
+      },
+    });
+
+    const exposed = await new SellerSpriteSyncService(database, port)
+      .discoverCompetitors({ ownedProductId: 'owned-1' })
+      .then(() => '', (error: unknown) => error instanceof Error ? error.message : String(error));
+
+    expect(exposed).not.toContain('candidate-private-value');
+    expect(exposed).toContain('[REDACTED]');
+    expect(observedRunId).toMatch(/^[a-f0-9-]{36}$/i);
+    expect(database.prepare(`
+      SELECT id, sync_run_id AS syncRunId, status, failed, error_log AS errorLog
+      FROM data_tasks WHERE task_type = 'competitor_discovery'
+    `).get()).toEqual({
+      id: observedRunId,
+      syncRunId: observedRunId,
+      status: 'failed',
+      failed: 1,
+      errorLog: 'SellerSprite 竞品候选发现失败；本次未更新候选，请检查连接和数据范围。',
+    });
+    expect(count('competitor_candidates')).toBe(0);
+    expect(database.prepare(`SELECT COUNT(*) AS count FROM competitor_candidate_run_links`).get())
+      .toEqual({ count: 0 });
   });
 
   it('syncs only a confirmed competitor into immutable MCP history and facts', async () => {
@@ -684,6 +867,60 @@ describe('SellerSprite real-data sync', () => {
     `).get()).toEqual({ estimated_sales: 600, estimated_revenue: 24_000 });
   });
 
+  it('rejects standalone owned sync when its market node is Mock or unmapped', async () => {
+    database = fixtureDatabase();
+    let calls = 0;
+    const base = fixturePort();
+    const port = fixturePort({
+      async fetchAsinSalesTrend(input, context) {
+        calls += 1;
+        return base.fetchAsinSalesTrend(input, context);
+      },
+    });
+    database.prepare(`UPDATE market_nodes SET source_type = 'mock' WHERE id = 'market-1'`).run();
+
+    await expect(new SellerSpriteSyncService(database, port)
+      .syncOwnedProduct({ productId: 'owned-1' })).rejects.toThrow(/自有产品|市场节点/);
+
+    database.prepare(`UPDATE market_nodes SET source_type = 'import' WHERE id = 'market-1'`).run();
+    database.exec('PRAGMA foreign_keys = OFF');
+    database.prepare(`UPDATE products SET market_node_id = 'missing-market' WHERE id = 'owned-1'`).run();
+    database.exec('PRAGMA foreign_keys = ON');
+    await expect(new SellerSpriteSyncService(database, port)
+      .syncOwnedProduct({ productId: 'owned-1' })).rejects.toThrow(/自有产品|市场节点/);
+
+    expect(calls).toBe(0);
+    expect(database.prepare(`SELECT COUNT(*) AS count FROM data_tasks`).get()).toEqual({ count: 0 });
+  });
+
+  it('rejects a critical run when an active real owned SKU is outside the main-market tree', async () => {
+    database = fixtureDatabase();
+    database.exec(`
+      INSERT INTO market_nodes (
+        id, name, parent_id, level, marketplace, category_id, keywords_json, status,
+        source_type, created_at
+      ) VALUES ('other-market', 'Other', NULL, 1, 'US', '999', '[]', 'active',
+        'import', '2026-09-01T00:00:00Z');
+      UPDATE products SET market_node_id = 'other-market' WHERE id = 'owned-1';
+    `);
+    let calls = 0;
+    const base = fixturePort();
+    const port = fixturePort({
+      async fetchMarketStatistics(input, context) {
+        calls += 1;
+        return base.fetchMarketStatistics(input, context);
+      },
+    });
+
+    await expect(new SellerSpriteSyncService(database, port)
+      .syncCriticalBatch({ marketId: 'market-1', month: '202608' }))
+      .rejects.toThrow(/前置条件|主市场|范围/);
+
+    expect(calls).toBe(0);
+    expect(database.prepare(`SELECT COUNT(*) AS count FROM data_tasks
+      WHERE task_type = 'critical_sync'`).get()).toEqual({ count: 0 });
+  });
+
   it('does not commit any critical observation when one owned ASIN fails', async () => {
     database = fixtureDatabase();
     const port = fixturePort({
@@ -696,5 +933,454 @@ describe('SellerSprite real-data sync', () => {
 
     expect(count('market_snapshots')).toBe(0);
     expect(count('product_snapshots')).toBe(0);
+    expect(database.prepare(`SELECT COUNT(*) AS count FROM metric_facts`).get()).toEqual({ count: 0 });
+    const task = database.prepare(`
+      SELECT id, sync_run_id, status, total, success, failed, error_log
+      FROM data_tasks WHERE task_type = 'critical_sync'
+    `).get() as Record<string, unknown>;
+    expect(task).toMatchObject({ sync_run_id: task.id, status: 'failed', total: 2, failed: 1 });
+    expect(String(task.error_log)).not.toContain('remote trend unavailable');
+    expect(database.prepare(`
+      SELECT id, is_complete FROM data_coverage_runs WHERE run_type = 'critical_sync'
+    `).get()).toEqual({ id: task.id, is_complete: 0 });
+  });
+
+  it('records one successful run through scoped market and all active owned product observations', async () => {
+    database = fixtureDatabase();
+    const contexts: Array<string | undefined> = [];
+    const base = fixturePort();
+    const port = fixturePort({
+      async fetchMarketStatistics(input, context) {
+        contexts.push(context?.runId);
+        return base.fetchMarketStatistics(input);
+      },
+      async fetchMarketConcentration(input, context) {
+        contexts.push(context?.runId);
+        return base.fetchMarketConcentration(input);
+      },
+      async fetchAsinSalesTrend(input, context) {
+        contexts.push(context?.runId);
+        return base.fetchAsinSalesTrend(input);
+      },
+    });
+
+    const result = await new SellerSpriteSyncService(database, port)
+      .syncCriticalBatch({ marketId: 'market-1', month: '202608' });
+
+    expect(result).toMatchObject({ taskId: result.runId, marketSnapshots: 2, productSnapshots: 2 });
+    expect(result.runId).toMatch(/^[a-f0-9-]{36}$/i);
+    expect(contexts).toEqual([
+      result.runId, result.runId, result.runId, result.runId, result.runId,
+    ]);
+    expect(database.prepare(`
+      SELECT id, sync_run_id, status, total, success, failed FROM data_tasks WHERE id = ?
+    `).get(result.runId)).toEqual({
+      id: result.runId, sync_run_id: result.runId, status: 'success', total: 2, success: 2, failed: 0,
+    });
+    expect(new IntelligenceRepository(database).getDataTask(result.runId))
+      .toMatchObject({ id: result.runId, syncRunId: result.runId });
+    const coverage = database.prepare(`
+      SELECT coverage_json AS coverageJson, is_complete AS isComplete
+      FROM data_coverage_runs WHERE id = ?
+    `).get(result.runId) as { coverageJson: string; isComplete: number };
+    expect(coverage.isComplete).toBe(1);
+    expect(JSON.parse(coverage.coverageJson)).toMatchObject({
+      marketId: 'market-1', nodeIdPath: NODE_PATH, month: '202608',
+      ownedProducts: [{ id: 'owned-1', asin: 'B0OWNED001', marketNodeId: 'market-1' }],
+    });
+    for (const table of ['market_snapshots', 'product_snapshots', 'metric_facts'] as const) {
+      const rows = database.prepare(`SELECT DISTINCT sync_run_id AS runId FROM ${table}`).all();
+      expect(rows).toEqual([{ runId: result.runId }]);
+    }
+    expect(database.prepare(`
+      SELECT snapshot_kind AS kind, entity_id AS entityId, disposition
+      FROM mcp_sync_observation_links WHERE sync_run_id = ? AND snapshot_kind <> 'fact'
+      ORDER BY kind, entityId
+    `).all(result.runId)).toEqual([
+      { kind: 'market', entityId: 'market-1', disposition: 'inserted' },
+      { kind: 'market', entityId: 'market-1', disposition: 'inserted' },
+      { kind: 'product', entityId: 'owned-1', disposition: 'inserted' },
+      { kind: 'product', entityId: 'owned-1', disposition: 'inserted' },
+    ]);
+  });
+
+  it('captures the current and comparable baseline market months in one critical run', async () => {
+    database = fixtureDatabase();
+    const requests: Array<{ capability: string; month: string | undefined; runId: string | undefined }> = [];
+    const base = fixturePort();
+    const port = fixturePort({
+      async fetchMarketStatistics(input, context) {
+        requests.push({ capability: 'statistics', month: input.month, runId: context?.runId });
+        const current = input.month === '202608';
+        return {
+          data: {
+            marketplace: input.marketplace, nodeIdPath: input.nodeIdPath, month: input.month,
+            products: current ? 120 : 100, brands: 20, sellers: 30,
+            totalUnits: current ? 1_200 : 1_000,
+            totalRevenue: current ? 48_000 : 40_000,
+            avgPrice: 40, medianPrice: 39, avgRating: 4.4, medianReviews: 100,
+            top10Share: 25, top20Share: 40, newProductShare: 10,
+          },
+          provenance,
+        };
+      },
+      async fetchMarketConcentration(input, context) {
+        requests.push({ capability: 'concentration', month: input.month, runId: context?.runId });
+        return base.fetchMarketConcentration(input, context);
+      },
+    });
+
+    const result = await new SellerSpriteSyncService(database, port)
+      .syncCriticalBatch({ marketId: 'market-1', month: '202608' });
+
+    expect(result.marketSnapshots).toBe(2);
+    expect(requests.map(({ capability, month }) => ({ capability, month }))).toEqual([
+      { capability: 'statistics', month: '202608' },
+      { capability: 'concentration', month: '202608' },
+      { capability: 'statistics', month: '202607' },
+      { capability: 'concentration', month: '202607' },
+    ]);
+    expect(requests.every((request) => request.runId === result.runId)).toBe(true);
+    expect(database.prepare(`
+      SELECT observation_date AS observationDate, monthly_sales AS monthlySales,
+        sync_run_id AS runId
+      FROM market_snapshots ORDER BY observation_date
+    `).all()).toEqual([
+      { observationDate: '2026-07-31', monthlySales: 1_000, runId: result.runId },
+      { observationDate: '2026-08-31', monthlySales: 1_200, runId: result.runId },
+    ]);
+    expect(database.prepare(`
+      SELECT COUNT(*) AS count FROM mcp_sync_observation_links
+      WHERE sync_run_id = ? AND snapshot_kind = 'market' AND entity_id = 'market-1'
+    `).get(result.runId)).toEqual({ count: 2 });
+    const coverage = database.prepare(`
+      SELECT coverage_json AS coverageJson FROM data_coverage_runs WHERE id = ?
+    `).get(result.runId) as { coverageJson: string };
+    expect(JSON.parse(coverage.coverageJson)).toMatchObject({
+      month: '202608', baselineMonth: '202607', marketMonths: ['202607', '202608'],
+    });
+  });
+
+  it('keeps the critical run incomplete until both secondary coverage stages are recorded', async () => {
+    database = fixtureDatabase();
+    const base = fixturePort();
+    const states: Array<{ status: string; isComplete: number }> = [];
+    const port = fixturePort({
+      async discoverAsinCompetitors(input, context) {
+        states.push(database!.prepare(`
+          SELECT task.status, coverage.is_complete AS isComplete
+          FROM data_tasks task
+          JOIN data_coverage_runs coverage ON coverage.id = task.id
+          WHERE task.id = ? AND task.sync_run_id = task.id
+        `).get(context?.runId ?? null) as { status: string; isComplete: number });
+        return base.discoverAsinCompetitors(input, context);
+      },
+    });
+
+    const result = await new SellerSpriteSyncService(database, port)
+      .syncCriticalBatch({ marketId: 'market-1', month: '202608' });
+
+    expect(states).toEqual([{ status: 'running', isComplete: 0 }]);
+    expect(database.prepare(`
+      SELECT task.status, coverage.is_complete AS isComplete
+      FROM data_tasks task JOIN data_coverage_runs coverage ON coverage.id = task.id
+      WHERE task.id = ?
+    `).get(result.runId)).toEqual({ status: 'success', isComplete: 1 });
+  });
+
+  it('does not send retained Demo-owned masters to the real critical MCP run', async () => {
+    database = fixtureDatabase();
+    database.prepare(`
+      INSERT INTO products (id, asin, sku, brand, title, image_url, marketplace,
+        product_type, is_owned, market_node_id, source_type, created_at)
+      VALUES ('demo-owned', 'B0DEMO0001', 'DEMO-01', 'Demo', 'Demo Pillow', '', 'US',
+        'memory_foam_pillow', 1, 'market-1', 'mock', '2026-09-01T00:00:00Z')
+    `).run();
+    const called: string[] = [];
+    const base = fixturePort();
+    const port = fixturePort({
+      async fetchAsinSalesTrend(input) {
+        called.push(input.asin);
+        return base.fetchAsinSalesTrend(input);
+      },
+    });
+
+    const result = await new SellerSpriteSyncService(database, port)
+      .syncCriticalBatch({ marketId: 'market-1', month: '202608' });
+
+    expect(called).toEqual(['B0OWNED001']);
+    expect(result.productSnapshots).toBe(2);
+    expect(database.prepare(`SELECT coverage_json AS coverage FROM data_coverage_runs WHERE id = ?`)
+      .get(result.runId)).toEqual({ coverage: expect.not.stringContaining('demo-owned') });
+  });
+
+  it('does not certify a roster changed during an in-flight critical run', async () => {
+    database = fixtureDatabase();
+    const base = fixturePort();
+    const port = fixturePort({
+      async fetchAsinSalesTrend(input) {
+        database!.prepare(`
+          INSERT INTO products (id, asin, sku, brand, title, image_url, marketplace,
+            product_type, is_owned, market_node_id, source_type, created_at)
+          VALUES ('owned-2', 'B0OWNED002', 'SKU-02', 'Owned', 'New owned', '', 'US',
+            'memory_foam_pillow', 1, 'market-1', 'import', '2026-09-01T00:00:00Z')
+        `).run();
+        return base.fetchAsinSalesTrend(input);
+      },
+    });
+
+    await expect(new SellerSpriteSyncService(database, port)
+      .syncCriticalBatch({ marketId: 'market-1', month: '202608' }))
+      .rejects.toThrow(/自有|范围|变化/);
+    expect(count('market_snapshots')).toBe(0);
+    expect(count('product_snapshots')).toBe(0);
+    expect(database.prepare(`SELECT status FROM data_tasks WHERE task_type = 'critical_sync'`).get())
+      .toEqual({ status: 'failed' });
+  });
+
+  it('links identical immutable observations to a new run without rewriting their origin', async () => {
+    database = fixtureDatabase();
+    const service = new SellerSpriteSyncService(database, fixturePort());
+    const first = await service.syncCriticalBatch({ marketId: 'market-1', month: '202608' });
+    const second = await service.syncCriticalBatch({ marketId: 'market-1', month: '202608' });
+
+    expect(second.runId).not.toBe(first.runId);
+    expect(second).toMatchObject({ marketSnapshots: 0, productSnapshots: 0 });
+    expect(database.prepare(`SELECT COUNT(*) AS count FROM market_snapshots`).get()).toEqual({ count: 2 });
+    expect(database.prepare(`SELECT COUNT(*) AS count FROM product_snapshots`).get()).toEqual({ count: 2 });
+    expect(database.prepare(`
+      SELECT DISTINCT sync_run_id AS runId FROM product_snapshots
+    `).all()).toEqual([{ runId: first.runId }]);
+    expect(database.prepare(`
+      SELECT snapshot_kind AS kind, disposition FROM mcp_sync_observation_links
+      WHERE sync_run_id = ? AND snapshot_kind <> 'fact' ORDER BY kind, snapshot_id
+    `).all(second.runId)).toEqual([
+      { kind: 'market', disposition: 'reused' },
+      { kind: 'market', disposition: 'reused' },
+      { kind: 'product', disposition: 'reused' },
+      { kind: 'product', disposition: 'reused' },
+    ]);
+    expect(database.prepare(`
+      SELECT COUNT(*) AS count FROM mcp_sync_observation_links
+      WHERE sync_run_id = ? AND snapshot_kind = 'fact'
+    `).get(second.runId)).toEqual({ count: 38 });
+    expect(database.prepare(`SELECT status FROM data_tasks WHERE id = ?`).get(second.runId))
+      .toEqual({ status: 'success' });
+  });
+
+  it('rejects revised same-period values rather than certifying a reused observation', async () => {
+    database = fixtureDatabase();
+    await new SellerSpriteSyncService(database, fixturePort())
+      .syncCriticalBatch({ marketId: 'market-1', month: '202608' });
+    const changed = fixturePort({
+      async fetchMarketStatistics() {
+        return { data: { marketplace: 'US', nodeIdPath: NODE_PATH, products: 3,
+          brands: 2, sellers: 2, avgPrice: 40, avgRating: 4.4 }, provenance };
+      },
+    });
+
+    await expect(new SellerSpriteSyncService(database, changed)
+      .syncCriticalBatch({ marketId: 'market-1', month: '202608' }))
+      .rejects.toThrow(/不可变观察|不一致/);
+    expect(database.prepare(`SELECT COUNT(*) AS count FROM market_snapshots`).get()).toEqual({ count: 2 });
+    expect(database.prepare(`SELECT COUNT(*) AS count FROM product_snapshots`).get()).toEqual({ count: 2 });
+    expect(database.prepare(`
+      SELECT status, sync_run_id AS runId FROM data_tasks WHERE task_type = 'critical_sync'
+      ORDER BY created_at DESC
+    `).all()).toEqual(expect.arrayContaining([
+      expect.objectContaining({ status: 'failed' }), expect.objectContaining({ status: 'success' }),
+    ]));
+    expect(database.prepare(`SELECT COUNT(*) AS count FROM mcp_sync_observation_links
+      WHERE snapshot_kind <> 'fact'`).get())
+      .toEqual({ count: 4 });
+  });
+
+  it('keeps the last legal real observations and marks Live partially unrefreshed after failure', async () => {
+    database = fixtureDatabase();
+    const base = fixturePort();
+    const healthy = fixturePort({
+      async fetchMarketStatistics(input) {
+        const result = await base.fetchMarketStatistics(input);
+        return { ...result, data: { ...result.data, totalUnits: 450 } };
+      },
+    });
+    await new SellerSpriteSyncService(database, healthy)
+      .syncCriticalBatch({ marketId: 'market-1', month: '202608' });
+    const before = database.prepare(`
+      SELECT id, monthly_sales AS sales FROM market_snapshots WHERE market_node_id = 'market-1'
+    `).get();
+    const productBefore = database.prepare(`
+      SELECT id, estimated_sales AS sales FROM product_snapshots
+      WHERE product_id = 'owned-1' AND date = '2026-08-31'
+    `).get();
+    const failed = fixturePort({
+      async fetchAsinSalesTrend() { throw new Error('secret-key=never-store-this'); },
+    });
+
+    const exposedFailure = await new SellerSpriteSyncService(database, failed)
+      .syncCriticalBatch({ marketId: 'market-1', month: '202609' })
+      .then(() => '', (error: unknown) => error instanceof Error ? error.message : String(error));
+    expect(exposedFailure).not.toContain('never-store-this');
+    expect(exposedFailure).toContain('[REDACTED]');
+
+    expect(database.prepare(`
+      SELECT id, monthly_sales AS sales FROM market_snapshots WHERE market_node_id = 'market-1'
+    `).get()).toEqual(before);
+    expect(database.prepare(`
+      SELECT id, estimated_sales AS sales FROM product_snapshots
+      WHERE product_id = 'owned-1' AND date = '2026-08-31'
+    `).get()).toEqual(productBefore);
+    expect(database.prepare(`SELECT error_log FROM data_tasks WHERE status = 'failed'`).get())
+      .not.toEqual(expect.objectContaining({ error_log: expect.stringContaining('never-store-this') }));
+    const freshness = new DashboardFreshnessService(database).getStatus({
+      marketplace: 'US', mode: 'live', marketId: 'market-1',
+      ownedProductIds: ['owned-1'], competitorProductIds: [],
+    });
+    expect(freshness.coreBusinessFreshness).toMatchObject({
+      status: 'partial', label: '部分未更新',
+      message: expect.stringContaining('上一次合法快照'),
+    });
+    expect(freshness.systemSyncStatus.status).toBe('failed');
+  });
+
+  it('records partial secondary direct-competitor coverage without failing the critical run', async () => {
+    database = fixtureDatabase();
+    database.exec(`
+      INSERT INTO products (id, asin, brand, title, image_url, marketplace, product_type,
+        is_owned, market_node_id, status, source_type, created_at) VALUES
+        ('competitor-1', 'B0DIRECT01', 'One', 'Direct One', '', 'US', 'competitor',
+          0, 'market-1', 'active', 'import', '2026-09-01T00:00:00Z'),
+        ('competitor-2', 'B0DIRECT02', 'Two', 'Direct Two', '', 'US', 'competitor',
+          0, 'market-1', 'active', 'import', '2026-09-01T00:00:00Z');
+      INSERT INTO competitor_relations (id, owned_product_id, competitor_product_id,
+        relation_type, similarity_score, reason, ai_tags_json) VALUES
+        ('direct-1', 'owned-1', 'competitor-1', 'direct', 90, '人工确认', '[]'),
+        ('direct-2', 'owned-1', 'competitor-2', 'direct', 85, '人工确认', '[]');
+    `);
+    const base = fixturePort();
+    const port = fixturePort({
+      async fetchAsinSalesTrend(input, context) {
+        if (input.asin === 'B0DIRECT02') throw new Error('remote competitor failure token=private');
+        return base.fetchAsinSalesTrend(input, context);
+      },
+    });
+
+    const result = await new SellerSpriteSyncService(database, port)
+      .syncCriticalBatch({ marketId: 'market-1', month: '202608' });
+
+    expect(result.competitorCoverage).toMatchObject({
+      status: 'partial', total: 2, success: 1, failed: 1,
+    });
+    expect(database.prepare(`SELECT status FROM data_tasks WHERE id = ?`).get(result.runId))
+      .toEqual({ status: 'success' });
+    expect(database.prepare(`
+      SELECT sync_run_id AS runId, status, total, success, failed, error_log AS errorLog
+      FROM data_tasks WHERE task_type = 'competitor_refresh'
+    `).get()).toMatchObject({
+      runId: result.runId, status: 'partial', total: 2, success: 1, failed: 1,
+      errorLog: expect.not.stringContaining('private'),
+    });
+    expect(database.prepare(`
+      SELECT product_id AS productId, sync_run_id AS runId FROM product_snapshots
+      WHERE product_id LIKE 'competitor-%' ORDER BY product_id
+    `).all()).toEqual([
+      { productId: 'competitor-1', runId: result.runId },
+      { productId: 'competitor-1', runId: result.runId },
+    ]);
+    expect(JSON.parse((database.prepare(`
+      SELECT coverage_json AS coverage FROM data_coverage_runs WHERE id = ?
+    `).get(result.runId) as { coverage: string }).coverage).secondaryCompetitors).toMatchObject({
+      status: 'partial', total: 2, success: 1, failed: 1,
+    });
+  });
+
+  it('rejects a direct competitor whose identity changes during its remote refresh', async () => {
+    database = fixtureDatabase();
+    database.exec(`
+      INSERT INTO products (id, asin, brand, title, image_url, marketplace, product_type,
+        is_owned, market_node_id, status, source_type, created_at)
+      VALUES ('competitor-1', 'B0DIRECT01', 'One', 'Direct One', '', 'US', 'competitor',
+        0, 'market-1', 'active', 'import', '2026-09-01T00:00:00Z');
+      INSERT INTO competitor_relations (id, owned_product_id, competitor_product_id,
+        relation_type, similarity_score, reason, ai_tags_json)
+      VALUES ('direct-1', 'owned-1', 'competitor-1', 'direct', 90, '人工确认', '[]');
+    `);
+    const base = fixturePort();
+    const port = fixturePort({
+      async fetchAsinSalesTrend(input, context) {
+        if (input.asin === 'B0DIRECT01') {
+          database!.prepare(`UPDATE products SET asin = 'B0DIRECT99' WHERE id = 'competitor-1'`).run();
+        }
+        return base.fetchAsinSalesTrend(input, context);
+      },
+    });
+
+    const result = await new SellerSpriteSyncService(database, port)
+      .syncCriticalBatch({ marketId: 'market-1', month: '202608' });
+
+    expect(result.competitorCoverage).toMatchObject({ status: 'failed', total: 1, failed: 1 });
+    expect(database.prepare(`
+      SELECT COUNT(*) AS count FROM product_snapshots WHERE product_id = 'competitor-1'
+    `).get()).toEqual({ count: 0 });
+  });
+
+  it('records an empty successful secondary batch when no core competitor is confirmed', async () => {
+    database = fixtureDatabase();
+
+    const result = await new SellerSpriteSyncService(database, fixturePort())
+      .syncCriticalBatch({ marketId: 'market-1', month: '202608' });
+
+    expect(result.competitorCoverage).toMatchObject({
+      status: 'success', total: 0, success: 0, failed: 0,
+    });
+    expect(database.prepare(`
+      SELECT sync_run_id AS runId, status, total FROM data_tasks WHERE task_type = 'competitor_refresh'
+    `).get()).toEqual({ runId: result.runId, status: 'success', total: 0 });
+  });
+
+  it('discovers review-only competitor candidates under the same run without blocking critical success', async () => {
+    database = fixtureDatabase();
+    let discoveryRunId: string | undefined;
+    const base = fixturePort();
+    const port = fixturePort({
+      async discoverAsinCompetitors(input, context) {
+        discoveryRunId = context?.runId;
+        return base.discoverAsinCompetitors(input);
+      },
+    });
+
+    const service = new SellerSpriteSyncService(database, port);
+    const result = await service
+      .syncCriticalBatch({ marketId: 'market-1', month: '202608' });
+
+    expect(discoveryRunId).toBe(result.runId);
+    expect(result.candidateCoverage).toMatchObject({
+      status: 'success', total: 1, success: 1, failed: 0, candidates: 1,
+    });
+    expect(database.prepare(`
+      SELECT sync_run_id AS runId, status, total, success, failed
+      FROM data_tasks WHERE task_type = 'competitor_discovery'
+    `).get()).toEqual({
+      runId: result.runId, status: 'success', total: 1, success: 1, failed: 0,
+    });
+    const candidate = database.prepare(`
+      SELECT id, status, sync_run_id AS originRunId FROM competitor_candidates
+    `).get() as { id: string; status: string; originRunId: string };
+    expect(candidate).toMatchObject({ status: 'pending_review', originRunId: result.runId });
+    expect(database.prepare(`
+      SELECT sync_run_id AS runId, disposition FROM competitor_candidate_run_links
+      WHERE candidate_id = ?
+    `).all(candidate.id)).toEqual([{ runId: result.runId, disposition: 'inserted' }]);
+
+    const repeated = await service.syncCriticalBatch({ marketId: 'market-1', month: '202608' });
+
+    expect(repeated.candidateCoverage.candidates).toBe(1);
+    expect(database.prepare(`
+      SELECT sync_run_id AS runId, disposition FROM competitor_candidate_run_links
+      WHERE candidate_id = ? ORDER BY sync_run_id
+    `).all(candidate.id)).toEqual(expect.arrayContaining([
+      { runId: result.runId, disposition: 'inserted' },
+      { runId: repeated.runId, disposition: 'reused' },
+    ]));
   });
 });

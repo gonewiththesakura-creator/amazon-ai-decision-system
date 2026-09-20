@@ -28,6 +28,61 @@ const fiveTools = [
 ];
 
 describe('SellerSpriteMcpClient', () => {
+  it('records fresh tool discovery against the current critical run', async () => {
+    const ledger = new MemoryLedgerStore();
+    const runId = '123e4567-e89b-42d3-a456-426614174000';
+    const client = new SellerSpriteMcpClient({
+      transport: new FakeTransport({ pages: [listResult(fiveTools)] }),
+      ledgerStore: ledger,
+    });
+
+    await client.listTools({ fresh: true, runId });
+
+    expect(ledger.entries).toHaveLength(1);
+    expect(ledger.entries[0]).toMatchObject({
+      capability: 'LIST_TOOLS',
+      operation: 'tool_discovery',
+      status: 'success',
+      cacheHit: false,
+      runId,
+      resultCount: fiveTools.length,
+    });
+  });
+
+  it('records the current critical run on both remote and cached attempts', async () => {
+    const database = openDatabase(':memory:');
+    try {
+      const runId = '123e4567-e89b-42d3-a456-426614174000';
+      database.prepare(`INSERT INTO data_tasks (
+        id, name, task_type, target, source, marketplace, status, created_at
+      ) VALUES (?, 'Critical sync', 'critical_sync', 'market-1',
+        'SellerSprite MCP', 'US', 'running', '2026-09-20T00:00:00.000Z')`).run(runId);
+      const transport = new FakeTransport({
+        callOutcomes: [callResult({ code: 'OK', data: { products: 100 } })],
+      });
+      const client = new SellerSpriteMcpClient({
+        transport,
+        ledgerStore: new SqliteMcpCallLedgerStore(database),
+        cacheStore: new SqliteMcpResponseCacheStore(database),
+      });
+      const request = {
+        tool: 'market_research_statistics',
+        arguments: { request: { marketplace: 'US', nodeIdPath: '1055398:1063252' } },
+        context: { capability: 'MARKET_STATISTICS', runId },
+      };
+
+      await client.callTool(request);
+      await client.callTool(request);
+
+      expect(transport.callCount).toBe(1);
+      expect(database.prepare(`SELECT sync_run_id, cache_hit, status FROM mcp_call_logs ORDER BY rowid`).all())
+        .toEqual([
+          { sync_run_id: runId, cache_hit: 0, status: 'success' },
+          { sync_run_id: runId, cache_hit: 1, status: 'success' },
+        ]);
+    } finally { database.close(); }
+  });
+
   it('persists sanitized capabilities, attempts, and cache entries in the migrated SQLite schema', async () => {
     const database = openDatabase(':memory:');
     try {
@@ -78,6 +133,8 @@ describe('SellerSpriteMcpClient', () => {
       pages: [
         listResult(fiveTools.slice(0, 2), 'page-2'),
         listResult(fiveTools.slice(2)),
+        listResult(fiveTools.slice(0, 2), 'page-2'),
+        listResult(fiveTools.slice(2)),
       ],
     });
     const client = new SellerSpriteMcpClient({ transport });
@@ -87,7 +144,23 @@ describe('SellerSpriteMcpClient', () => {
 
     expect(tools.map((entry) => entry.name)).toEqual(fiveTools.map((entry) => entry.name));
     expect(diagnostic).toMatchObject({ connected: true, authenticated: true, toolCount: 5 });
-    expect(transport.listCursors).toEqual([undefined, 'page-2']);
+    expect(transport.listCursors).toEqual([undefined, 'page-2', undefined, 'page-2']);
+  });
+
+  it('bypasses the in-memory tool catalog during connection certification', async () => {
+    const transport = new FakeTransport({
+      listOutcomes: [
+        listResult(fiveTools),
+        listResult(fiveTools.slice(0, 4)),
+      ],
+    });
+    const client = new SellerSpriteMcpClient({ transport });
+    await client.listTools();
+
+    const diagnostic = await client.connectionTest();
+
+    expect(diagnostic).toMatchObject({ connected: true, authenticated: true, toolCount: 4 });
+    expect(transport.listCursors).toEqual([undefined, undefined]);
   });
 
   it('retries transient tool discovery failures with the same bounded backoff', async () => {
@@ -280,11 +353,34 @@ describe('SellerSpriteMcpClient', () => {
     expect(diagnostic).toContain('[REDACTED]');
   });
 
-  it('uses the SellerSprite secret-key query parameter without duplicating credentials', () => {
-    const endpoint = sellerSpriteEndpoint('https://mcp.sellersprite.com/mcp?secretKey=old', 'test-secret');
+  it('uses only the separate SellerSprite secret and rejects credentials embedded in the URL', () => {
+    const endpoint = sellerSpriteEndpoint('https://mcp.sellersprite.com/mcp', 'test-secret');
     expect(endpoint.searchParams.get('secret-key')).toBe('test-secret');
     expect(endpoint.searchParams.has('secretKey')).toBe(false);
+    expect(() => sellerSpriteEndpoint('https://mcp.sellersprite.com/mcp?secretKey=old', 'test-secret'))
+      .toThrow(/URL.*凭据|credential/i);
+    expect(() => sellerSpriteEndpoint('https://mcp.sellersprite.com/mcp?secret-key=old'))
+      .toThrow(/URL.*凭据|credential/i);
+    expect(() => sellerSpriteEndpoint('https://user:password@mcp.sellersprite.com/mcp', 'test-secret'))
+      .toThrow(/URL.*凭据|credential/i);
   });
+
+  it('rejects a secret-bearing remote HTTP endpoint without exposing the secret', () => {
+    expect(() => sellerSpriteEndpoint('http://mcp.sellersprite.com/mcp', 'test-secret'))
+      .toThrow(/HTTPS|安全连接/i);
+    try {
+      sellerSpriteEndpoint('http://mcp.sellersprite.com/mcp', 'test-secret');
+    } catch (error) {
+      expect(String(error)).not.toContain('test-secret');
+    }
+  });
+
+  it.each(['http://localhost:8787/mcp', 'http://127.0.0.1:8787/mcp', 'http://[::1]:8787/mcp'])(
+    'permits a secret-bearing loopback endpoint at %s', (address) => {
+      expect(sellerSpriteEndpoint(address, 'test-secret').searchParams.get('secret-key'))
+        .toBe('test-secret');
+    },
+  );
 });
 
 function tool(name: string, description: string, required: string[]) {

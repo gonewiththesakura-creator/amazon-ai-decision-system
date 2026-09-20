@@ -3030,6 +3030,7 @@ button.metric {
 
 .real-data-capabilities li { display: flex; align-items: center; gap: 8px; }
 .real-data-verification { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+.real-data-run-id { overflow-wrap: anywhere; }
 
 @media (max-width: 620px) {
   .real-data-preview { grid-template-columns: 1fr; gap: 8px; }

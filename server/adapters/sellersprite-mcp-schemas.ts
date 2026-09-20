@@ -32,6 +32,29 @@ export const mcpCallToolResultSchema = z.object({
 export type McpToolDefinition = z.infer<typeof mcpToolSchema>;
 export type McpCallToolResult = z.infer<typeof mcpCallToolResultSchema>;
 
+export const sellerSpriteObjectSchema = z.record(z.string(), z.unknown());
+
+export const sellerSpriteMarketStatisticsSchema = z.object({
+  marketplace: z.string().trim().min(1),
+  nodeIdPath: z.string().trim().min(1),
+}).passthrough();
+
+export const sellerSpriteAsinTrendSchema = z.object({
+  asin: z.object({
+    asin: z.string().trim().min(1),
+    marketplace: z.string().trim().min(1),
+  }).passthrough(),
+  salesTrendPoints: z.array(sellerSpriteObjectSchema),
+}).passthrough();
+
+export const sellerSpriteMarketResearchSchema = z.object({
+  items: z.array(z.object({
+    marketplace: z.string().trim().min(1),
+    nodeIdPath: z.string().trim().min(1),
+  }).passthrough()),
+  total: z.number().optional(),
+}).passthrough();
+
 export function mcpJsonPayload(result: McpCallToolResult): unknown {
   if (result.structuredContent) return result.structuredContent;
   const text = result.content.find((item) => item.type === 'text');

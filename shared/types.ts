@@ -369,6 +369,7 @@ export interface WorkflowEvidence {
   source: string;
   sourceType: 'mock' | 'import' | 'mcp' | 'amazon' | 'manual';
   sourceRecordId?: string;
+  syncRunId?: string | null;
   collectedAt: string;
   period: string;
   isEstimated: boolean;
@@ -542,6 +543,7 @@ export interface WatchlistItem {
 
 export interface DataTask {
   id: string;
+  syncRunId: string | null;
   name: string;
   taskType: string;
   target: string;

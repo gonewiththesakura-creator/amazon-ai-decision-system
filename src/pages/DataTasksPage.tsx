@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { useLocation, useSearchParams } from 'react-router-dom';
+import { Link, useLocation, useSearchParams } from 'react-router-dom';
 import {
   AlertCircle,
   CheckCircle2,
@@ -74,6 +74,16 @@ function duration(task: DataTask): string {
   if (seconds < 60) return `${seconds} 秒`;
   const minutes = Math.floor(seconds / 60);
   return minutes < 60 ? `${minutes} 分 ${seconds % 60} 秒` : `${Math.floor(minutes / 60)} 小时 ${minutes % 60} 分`;
+}
+
+function isRunManagedTask(task: DataTask): boolean {
+  return task.syncRunId !== null || task.taskType === 'critical_sync' || task.taskType === 'competitor_discovery';
+}
+
+function canRetryTask(task: DataTask): boolean {
+  return (task.status === 'failed' || task.status === 'partial')
+    && !task.researchJobId
+    && !isRunManagedTask(task);
 }
 
 export default function DataTasksPage() {
@@ -361,7 +371,7 @@ export default function DataTasksPage() {
                     <td><div className="task-progress"><div className="progress-track"><i style={{ width: `${progress}%` }} /></div><span>{processed}/{task.total}</span></div><small className={task.failed ? 'negative' : ''}>{task.success} 成功 · {task.failed} 失败</small></td>
                     <td><span>{formatDate(task.startedAt)}</span><small>{formatDate(task.completedAt)}</small></td>
                     <td>{duration(task)}</td>
-                    <td>{task.errorLog ? <button className="icon-button" type="button" aria-label={`查看 ${task.name} 错误详情`} onClick={() => setDetailTask(task)}><ChevronRight size={18} /></button> : (task.status === 'failed' || task.status === 'partial') ? <button className="button button-small" type="button" disabled={!canEdit || retryingId !== null} onClick={() => void retryTask(task)}>{retryingId === task.id ? <Loader2 className="spin" size={14} /> : <RotateCcw size={14} />}重试</button> : null}</td>
+                    <td>{task.errorLog ? <button className="icon-button" type="button" aria-label={`查看 ${task.name} 错误详情`} onClick={() => setDetailTask(task)}><ChevronRight size={18} /></button> : canRetryTask(task) ? <button className="button button-small" type="button" disabled={!canEdit || retryingId !== null} onClick={() => void retryTask(task)}>{retryingId === task.id ? <Loader2 className="spin" size={14} /> : <RotateCcw size={14} />}重试</button> : null}</td>
                   </tr>
                 );
               })}</tbody>
@@ -376,8 +386,12 @@ export default function DataTasksPage() {
             <div className="modal-header"><div><span className="eyebrow">任务错误详情</span><h2 id="task-error-title">{detailTask.name}</h2></div><button className="icon-button" type="button" aria-label="关闭" onClick={() => setDetailTask(null)}><X size={18} /></button></div>
             <div className="task-error-summary"><span className={`status-badge ${statusTone(detailTask.status)}`}><StatusIcon status={detailTask.status} />{statusLabels[detailTask.status]}</span><span>{detailTask.success} 成功</span><span className="negative">{detailTask.failed} 失败</span></div>
             <pre className="error-log">{detailTask.errorLog ?? '没有记录具体错误日志。'}</pre>
-            <p className="muted">重试会创建一个新任务，原任务及错误日志将继续保留。</p>
-            <div className="modal-actions"><button className="button button-secondary" type="button" onClick={() => setDetailTask(null)}>关闭</button><button className="button button-primary" type="button" disabled={!canEdit || retryingId !== null} onClick={() => void retryTask(detailTask)}>{retryingId === detailTask.id ? <Loader2 className="spin" size={16} /> : <RotateCcw size={16} />}创建重试任务</button></div>
+            {detailTask.researchJobId
+              ? <p className="muted">该任务由 Research Job 工作流管理，请在对应 Research Job 中补充缺失数据或执行重试。</p>
+              : isRunManagedTask(detailTask)
+                ? <p className="muted">该任务属于运行级追溯链，请在设置 → 数据源重新运行 SellerSprite 关键同步。</p>
+                : <p className="muted">重试会创建一个新任务，原任务及错误日志将继续保留。</p>}
+            <div className="modal-actions"><button className="button button-secondary" type="button" onClick={() => setDetailTask(null)}>关闭</button>{detailTask.researchJobId ? <Link className="button button-primary" to={`/research-jobs/${encodeURIComponent(detailTask.researchJobId)}`}>打开 Research Job</Link> : canRetryTask(detailTask) && <button className="button button-primary" type="button" disabled={!canEdit || retryingId !== null} onClick={() => void retryTask(detailTask)}>{retryingId === detailTask.id ? <Loader2 className="spin" size={16} /> : <RotateCcw size={16} />}创建重试任务</button>}</div>
           </section>
         </div>
       )}

@@ -3,7 +3,13 @@ import { z } from 'zod';
 import type { Product, ProductSnapshot, Provenance } from '../../shared/types.js';
 import type { AppDatabase } from '../database/database.js';
 import { SellerSpriteMcpClient, SellerSpriteMcpError } from './sellersprite-mcp-client.js';
-import { sellerSpriteEnvelope } from './sellersprite-mcp-schemas.js';
+import {
+  sellerSpriteAsinTrendSchema,
+  sellerSpriteEnvelope,
+  sellerSpriteMarketResearchSchema,
+  sellerSpriteMarketStatisticsSchema,
+  sellerSpriteObjectSchema,
+} from './sellersprite-mcp-schemas.js';
 import {
   SqliteMcpCallLedgerStore, SqliteMcpCapabilityStore, SqliteMcpResponseCacheStore,
 } from './sellersprite-mcp-store.js';
@@ -18,9 +24,7 @@ import type {
 } from './types.js';
 import { AdapterUnavailableError } from './types.js';
 
-const object = z.record(z.string(), z.unknown());
-const trendSchema = z.object({ asin: object, salesTrendPoints: z.array(object) }).passthrough();
-const researchSchema = z.object({ items: z.array(object), total: z.number().optional() }).passthrough();
+const object = sellerSpriteObjectSchema;
 
 export interface SellerSpriteMarketRequest {
   marketplace: string;
@@ -29,6 +33,10 @@ export interface SellerSpriteMarketRequest {
 }
 
 export interface SellerSpriteAsinRequest { marketplace: string; asin: string }
+export interface SellerSpriteSyncContext {
+  runId?: string;
+  requireObservationMonth?: boolean;
+}
 export type SellerSpriteData<T> = { data: T; provenance: Provenance };
 export type SellerSpriteStatistics = Record<string, unknown>;
 export type SellerSpriteConcentration = Array<Record<string, unknown>>;
@@ -58,6 +66,7 @@ export class SellerSpriteMCPAdapter implements MarketDataAdapter {
   private readonly registry: SellerSpriteToolRegistry;
   private readonly injectedClient: boolean;
   private discovered = false;
+  private discoveredRunId: string | null = null;
 
   constructor(options: {
     client?: SellerSpriteMcpClient;
@@ -81,6 +90,7 @@ export class SellerSpriteMCPAdapter implements MarketDataAdapter {
       await this.registry.refresh(() => this.client.listTools());
       missingCapabilities = this.registry.missing();
       this.discovered = true;
+      this.discoveredRunId = null;
     }
     return {
       ...status,
@@ -91,26 +101,35 @@ export class SellerSpriteMCPAdapter implements MarketDataAdapter {
     };
   }
 
-  async fetchMarketStatistics(input: SellerSpriteMarketRequest): Promise<SellerSpriteData<SellerSpriteStatistics>> {
+  async fetchMarketStatistics(
+    input: SellerSpriteMarketRequest, context?: SellerSpriteSyncContext,
+  ): Promise<SellerSpriteData<SellerSpriteStatistics>> {
     return this.fetchCapability('MARKET_STATISTICS', {
       request: { marketplace: input.marketplace, nodeIdPath: input.nodeIdPath, ...optionalMonth(input.month) },
-    }, object, 'market_refresh');
+    }, sellerSpriteMarketStatisticsSchema, 'market_refresh', context);
   }
 
-  async fetchMarketConcentration(input: SellerSpriteMarketRequest): Promise<SellerSpriteData<SellerSpriteConcentration>> {
+  async fetchMarketConcentration(
+    input: SellerSpriteMarketRequest, context?: SellerSpriteSyncContext,
+  ): Promise<SellerSpriteData<SellerSpriteConcentration>> {
     return this.fetchCapability('PRODUCT_CONCENTRATION', {
       request: { marketplace: input.marketplace, nodeIdPath: input.nodeIdPath, ...optionalMonth(input.month) },
-    }, z.array(object), 'market_refresh');
+    }, z.array(object), 'market_refresh', context);
   }
 
-  async fetchAsinSalesTrend(input: SellerSpriteAsinRequest): Promise<SellerSpriteData<SellerSpriteAsinTrend>> {
-    return this.fetchCapability('ASIN_SALES_TREND', { ...input }, trendSchema, 'owned_sku_refresh');
+  async fetchAsinSalesTrend(
+    input: SellerSpriteAsinRequest, context?: SellerSpriteSyncContext,
+  ): Promise<SellerSpriteData<SellerSpriteAsinTrend>> {
+    return this.fetchCapability(
+      'ASIN_SALES_TREND', { ...input }, sellerSpriteAsinTrendSchema, 'owned_sku_refresh', context,
+    );
   }
 
   async discoverAsinCompetitors(
     input: SellerSpriteAsinRequest & { size?: number },
+    context?: SellerSpriteSyncContext,
   ): Promise<SellerSpriteData<SellerSpriteCompetitorCandidates>> {
-    return this.fetchCapability('ASIN_COMPETITOR_DISCOVERY', { ...input }, z.array(object), 'competitor_refresh');
+    return this.fetchCapability('ASIN_COMPETITOR_DISCOVERY', { ...input }, z.array(object), 'competitor_refresh', context);
   }
 
   async fetchMarketOverview(input: MarketInput): Promise<MarketOverviewRecord> {
@@ -149,7 +168,9 @@ export class SellerSpriteMCPAdapter implements MarketDataAdapter {
       ...(input.marketId ? { nodeIdPath: input.marketId } : {}),
       ...(input.keywords[0] ? { departmentKeyword: input.keywords[0] } : {}),
     };
-    const { data, provenance } = await this.fetchCapability('MARKET_RESEARCH', { request }, researchSchema, 'market_refresh');
+    const { data, provenance } = await this.fetchCapability(
+      'MARKET_RESEARCH', { request }, sellerSpriteMarketResearchSchema, 'market_refresh',
+    );
     return data.items.map((item) => productFromItem(item, input.marketplace, input.marketId ?? '', provenance));
   }
 
@@ -189,44 +210,65 @@ export class SellerSpriteMCPAdapter implements MarketDataAdapter {
     throw new AdapterUnavailableError('SellerSprite keyword capability is not mapped from discovered tools');
   }
 
-  async close(): Promise<void> { await this.client.close(); }
+  async close(): Promise<void> {
+    await this.client.close();
+    this.discovered = false;
+    this.discoveredRunId = null;
+  }
 
   private async fetchCapability<T>(
     capability: SellerSpriteCapability, args: Record<string, unknown>, schema: z.ZodType<T>, operation: string,
+    context?: SellerSpriteSyncContext,
   ): Promise<SellerSpriteData<T>> {
     if (!this.injectedClient && !process.env.SELLERSPRITE_MCP_URL) {
       throw new AdapterUnavailableError('未配置 SELLERSPRITE_MCP_URL，请在服务端环境变量中设置。');
     }
-    if (!this.discovered) {
-      await this.registry.refresh(() => this.client.listTools());
+    if (!this.discovered || (context?.runId !== undefined && this.discoveredRunId !== context.runId)) {
+      await this.registry.refresh(
+        () => this.client.listTools({ fresh: true, runId: context?.runId }),
+        context?.runId ?? null,
+      );
       this.discovered = true;
+      this.discoveredRunId = context?.runId ?? null;
     }
     const tool = this.registry.resolve(capability);
     if (!tool) throw new SellerSpriteMcpError('TOOL_NOT_FOUND', `SellerSprite capability unavailable: ${capability}`);
+    const request = args.request && typeof args.request === 'object'
+      ? args.request as Record<string, unknown> : args;
+    if (context?.requireObservationMonth
+      && (capability === 'MARKET_STATISTICS' || capability === 'PRODUCT_CONCENTRATION')
+      && (!this.registry.supportsArgument(capability, 'month') || request.month === undefined)) {
+      throw new SellerSpriteMcpError(
+        'INVALID_SCHEMA',
+        `SellerSprite ${capability} cannot certify a requested observation month`,
+      );
+    }
     let toolArgs: Record<string, unknown>;
     try { toolArgs = this.registry.argumentsFor(capability, args); }
     catch { throw new SellerSpriteMcpError('INVALID_SCHEMA', 'SellerSprite tool arguments do not match discovered schema'); }
-    const request = args.request && typeof args.request === 'object'
-      ? args.request as Record<string, unknown> : args;
     const entityType = capability === 'ASIN_SALES_TREND' || capability === 'ASIN_COMPETITOR_DISCOVERY'
       ? 'product' as const : 'market' as const;
     const entityId = entityType === 'product' ? request.asin : request.nodeIdPath;
-    const data = await this.client.callTool({ tool: tool.name, arguments: toolArgs, context: {
+    const accepted = await this.client.callTool({ tool: tool.name, arguments: toolArgs, context: {
       capability, operation, entityType,
       ...(typeof entityId === 'string' ? { entityId: entityId.toUpperCase() } : {}),
-    } }, (result) => {
+      ...(context?.runId ? { runId: context.runId } : {}),
+      ...(context?.runId ? { fresh: true } : {}),
+    } }, (result, acquisition) => {
       let payload: unknown;
       try { payload = sellerSpriteEnvelope(result); }
       catch { throw new SellerSpriteMcpError('INVALID_SCHEMA', 'Invalid SellerSprite response envelope'); }
       const parsed = schema.safeParse(payload);
       if (!parsed.success) throw new SellerSpriteMcpError('INVALID_SCHEMA', 'SellerSprite response does not match discovered capability');
-      validateCapabilityScope(capability, parsed.data, request);
-      return parsed.data;
+      validateCapabilityScope(
+        capability, parsed.data, request, context?.requireObservationMonth === true,
+      );
+      return { data: parsed.data, acquisition };
     });
     return {
-      data,
+      data: accepted.data,
       provenance: {
-        source: 'SellerSprite MCP', sourceType: 'mcp', collectedAt: new Date().toISOString(),
+        source: 'SellerSprite MCP', sourceType: 'mcp', collectedAt: accepted.acquisition.acquiredAt,
         period: 'monthly', isEstimated: true, confidence: 0.75,
       },
     };
@@ -234,12 +276,27 @@ export class SellerSpriteMCPAdapter implements MarketDataAdapter {
 }
 
 function validateCapabilityScope(
-  capability: SellerSpriteCapability, data: unknown, request: Record<string, unknown>,
+  capability: SellerSpriteCapability,
+  data: unknown,
+  request: Record<string, unknown>,
+  requireObservationMonth = false,
 ): void {
   if (capability === 'MARKET_STATISTICS') {
     assertRequestedScope(data as Record<string, unknown>, request);
+    if (requireObservationMonth) {
+      assertCertifiedObservationMonth(data as Record<string, unknown>, request);
+    }
   } else if (capability === 'PRODUCT_CONCENTRATION' || capability === 'ASIN_COMPETITOR_DISCOVERY') {
-    for (const item of data as Array<Record<string, unknown>>) assertRequestedScope(item, request);
+    const items = data as Array<Record<string, unknown>>;
+    if (requireObservationMonth && capability === 'PRODUCT_CONCENTRATION' && items.length === 0) {
+      throw new SellerSpriteMcpError('INVALID_SCHEMA', 'SellerSprite concentration month cannot be certified');
+    }
+    for (const item of items) {
+      assertRequestedScope(item, request);
+      if (requireObservationMonth && capability === 'PRODUCT_CONCENTRATION') {
+        assertCertifiedObservationMonth(item, request);
+      }
+    }
   } else if (capability === 'MARKET_RESEARCH') {
     const research = data as { items: Array<Record<string, unknown>> } & Record<string, unknown>;
     assertRequestedScope(research, request);
@@ -253,6 +310,17 @@ function validateCapabilityScope(
       assertRequestedScope(point, request);
       assertRequestedAsin(point, request);
     }
+  }
+}
+
+function assertCertifiedObservationMonth(
+  data: Record<string, unknown>, request: Record<string, unknown>,
+): void {
+  if (request.month === undefined || data.month === undefined || data.month === null) {
+    throw new SellerSpriteMcpError('INVALID_SCHEMA', 'SellerSprite response does not certify its observation month');
+  }
+  if (normalizedMonth(data.month) !== normalizedMonth(request.month)) {
+    throw new SellerSpriteMcpError('INVALID_SCHEMA', 'SellerSprite response month does not match request');
   }
 }
 

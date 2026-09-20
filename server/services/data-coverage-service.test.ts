@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it } from 'vitest';
 import { openDatabase, type AppDatabase } from '../database/database.js';
 import { DataCoverageService } from './data-coverage-service.js';
+import { DashboardFreshnessService } from './dashboard-freshness-service.js';
 
 let database: AppDatabase | undefined;
 
@@ -56,7 +57,150 @@ function insertNullOnlyProductSnapshot(
   );
 }
 
+function insertLiveCoverageFixture(): void {
+  database!.prepare(`
+    INSERT INTO market_nodes (
+      id, name, parent_id, level, marketplace, keywords_json, status, source_type, created_at
+    ) VALUES ('coverage-market', 'Coverage Market', NULL, 1, 'US', '[]', 'active', 'import',
+      '2026-09-19T00:00:00.000Z')
+  `).run();
+  database!.prepare(`UPDATE app_settings SET mode = 'live', marketplace = 'US',
+    default_market_id = 'coverage-market' WHERE id = 1`).run();
+  insertProduct('owned-live', true);
+  insertProduct('competitor-live', false);
+  database!.prepare(`INSERT INTO competitor_relations (
+    id, owned_product_id, competitor_product_id, relation_type, similarity_score,
+    reason, ai_tags_json, created_at, last_verified_at
+  ) VALUES ('live-relation', 'owned-live', 'competitor-live', 'direct', 90,
+    'fixture', '[]', '2026-09-19T00:00:00.000Z', '2026-09-19T00:00:00.000Z')`).run();
+}
+
+function insertCriticalRun(id: string, status: 'success' | 'failed' | 'running'): void {
+  database!.prepare(`INSERT INTO data_tasks (
+    id, sync_run_id, name, source_id, task_type, target, source, marketplace,
+    status, started_at, completed_at, total, success, failed, created_at
+  ) VALUES (?, ?, 'Coverage critical run', 'source-sellersprite-mcp', 'critical_sync',
+    'coverage-market', 'SellerSprite MCP', 'US', ?, '2026-09-19T08:00:00.000Z',
+    ?, 2, ?, ?, '2026-09-19T08:00:00.000Z')`).run(
+    id, id, status, status === 'running' ? null : '2026-09-19T08:01:00.000Z',
+    status === 'success' ? 2 : 0, status === 'failed' ? 2 : 0,
+  );
+  database!.prepare(`INSERT INTO data_coverage_runs (
+    id, marketplace, run_type, coverage_json, is_complete, created_at
+  ) VALUES (?, 'US', 'critical_sync', '{}', ?, '2026-09-19T08:00:00.000Z')`)
+    .run(id, status === 'success' ? 1 : 0);
+}
+
+function insertRunMarketSnapshot(id: string, runId: string, collectedAt: string): void {
+  database!.prepare(`INSERT INTO market_snapshots (
+    id, market_node_id, date, monthly_sales, source, source_type, collected_at,
+    period, is_estimated, confidence, observation_date, dedup_key, sync_run_id
+  ) VALUES (?, 'coverage-market', '2026-09-19', 10000, 'SellerSprite MCP', 'mcp',
+    ?, '30D', 1, 0.9, '2026-09-19', ?, ?)`)
+    .run(id, collectedAt, id, runId);
+}
+
+function insertRunProductSnapshot(
+  id: string, productId: string, date: string, runId: string, collectedAt: string,
+): void {
+  database!.prepare(`INSERT INTO product_snapshots (
+    id, product_id, date, estimated_sales, source, source_type, collected_at,
+    period, is_estimated, confidence, observation_date, dedup_key, sync_run_id
+  ) VALUES (?, ?, ?, 1000, 'SellerSprite MCP', 'mcp', ?, '30D', 1, 0.9, ?, ?, ?)`)
+    .run(id, productId, date, collectedAt, date, id, runId);
+}
+
 describe('DataCoverageService', () => {
+  it('excludes failed and running critical MCP observations from every Live coverage counter', () => {
+    database = openDatabase(':memory:');
+    insertLiveCoverageFixture();
+    insertCriticalRun('run-failed', 'failed');
+    insertCriticalRun('run-running', 'running');
+    insertRunMarketSnapshot('failed-market', 'run-failed', '2026-09-19T08:05:00.000Z');
+    insertRunProductSnapshot('failed-owned', 'owned-live', '2026-06-19',
+      'run-failed', '2026-09-19T08:05:00.000Z');
+    insertRunProductSnapshot('running-owned', 'owned-live', '2026-09-19',
+      'run-running', '2026-09-19T08:06:00.000Z');
+    database.prepare(`INSERT INTO metric_facts (
+      id, entity_type, entity_id, marketplace, metric_name, numeric_value,
+      source, source_id, source_type, is_estimated, confidence, observation_date,
+      collected_at, dedup_key, sync_run_id
+    ) VALUES ('failed-competitor-fact', 'product', 'competitor-live', 'US',
+      'estimated_sales', 1000, 'SellerSprite MCP', 'source-sellersprite-mcp',
+      'mcp', 1, 0.9, '2026-09-19', '2026-09-19T08:05:00.000Z',
+      'failed-competitor-fact', 'run-failed')`).run();
+
+    const coverage = new DataCoverageService(database).getCoverage('US');
+
+    expect(coverage.primaryMarket).toMatchObject({ covered: 0, status: 'missing' });
+    expect(coverage.activeOwnedProducts).toMatchObject({ covered: 0, total: 1, status: 'missing' });
+    expect(coverage.coreCompetitors).toMatchObject({ covered: 0, total: 1, status: 'missing' });
+    expect(coverage.history90d).toMatchObject({ covered: 0, total: 1, status: 'missing' });
+  });
+
+  it('retains old completed critical observations after a newer failed run and reports partial update', () => {
+    database = openDatabase(':memory:');
+    insertLiveCoverageFixture();
+    insertCriticalRun('run-complete', 'success');
+    insertRunMarketSnapshot('old-market', 'run-complete', '2026-09-19T08:00:00.000Z');
+    insertRunProductSnapshot('old-owned', 'owned-live', '2026-09-19',
+      'run-complete', '2026-09-19T08:00:00.000Z');
+    insertRunProductSnapshot('old-competitor', 'competitor-live', '2026-09-19',
+      'run-complete', '2026-09-19T08:00:00.000Z');
+    insertCriticalRun('run-failed', 'failed');
+    insertRunMarketSnapshot('failed-market', 'run-failed', '2026-09-19T09:00:00.000Z');
+    insertRunProductSnapshot('failed-owned', 'owned-live', '2026-06-19',
+      'run-failed', '2026-09-19T09:00:00.000Z');
+
+    const coverage = new DataCoverageService(database).getCoverage('US');
+    const freshness = new DashboardFreshnessService(database).getStatus({
+      marketplace: 'US', mode: 'live', marketId: 'coverage-market',
+      ownedProductIds: ['owned-live'], competitorProductIds: ['competitor-live'],
+    });
+
+    expect(coverage.primaryMarket).toMatchObject({ covered: 1, status: 'complete' });
+    expect(coverage.activeOwnedProducts).toMatchObject({ covered: 1, status: 'complete' });
+    expect(coverage.coreCompetitors).toMatchObject({ covered: 1, status: 'complete' });
+    expect(coverage.history90d).toMatchObject({ covered: 0, status: 'missing' });
+    expect(freshness.coreBusinessFreshness).toMatchObject({ status: 'partial', label: '部分未更新' });
+  });
+
+  it('counts active real owned products outside the primary market tree as missing Live coverage', () => {
+    database = openDatabase(':memory:');
+    insertLiveCoverageFixture();
+    insertProductSnapshot('owned-live', '2026-09-19', 'import');
+    insertProductSnapshot('competitor-live', '2026-09-19', 'import');
+    database.prepare(`INSERT INTO market_nodes (
+      id, name, parent_id, level, marketplace, keywords_json, status, source_type, created_at
+    ) VALUES ('outside-market', 'Outside', NULL, 1, 'US', '[]', 'active', 'import',
+      '2026-09-19T00:00:00.000Z')`).run();
+    for (const [id, ownerId, sourceType, status, marketNodeId] of [
+      ['mock-competitor', 'owned-live', 'mock', 'active', 'coverage-market'],
+      ['inactive-competitor', 'owned-live', 'import', 'inactive', 'coverage-market'],
+      ['outside-owned', null, 'import', 'active', 'outside-market'],
+      ['outside-competitor', 'outside-owned', 'import', 'active', 'outside-market'],
+      ['mock-owned', null, 'mock', 'active', 'coverage-market'],
+      ['mock-owned-competitor', 'mock-owned', 'import', 'active', 'coverage-market'],
+    ] as const) {
+      insertProduct(id, ownerId === null);
+      database.prepare(`UPDATE products SET source_type = ?, status = ?, market_node_id = ? WHERE id = ?`)
+        .run(sourceType, status, marketNodeId, id);
+      insertProductSnapshot(id, '2026-09-19', 'import');
+      if (ownerId) {
+        database.prepare(`INSERT INTO competitor_relations (
+          id, owned_product_id, competitor_product_id, relation_type, similarity_score,
+          reason, ai_tags_json, created_at, last_verified_at
+        ) VALUES (?, ?, ?, 'direct', 90, 'fixture', '[]',
+          '2026-09-19T00:00:00.000Z', '2026-09-19T00:00:00.000Z')`)
+          .run(`relation-${id}`, ownerId, id);
+      }
+    }
+
+    const coverage = new DataCoverageService(database).getCoverage('US');
+
+    expect(coverage.activeOwnedProducts).toMatchObject({ covered: 1, total: 2, status: 'partial' });
+    expect(coverage.coreCompetitors).toMatchObject({ covered: 1, total: 1, status: 'complete' });
+  });
   it('reports missing and not-applicable states without manufacturing zero coverage', () => {
     database = openDatabase(':memory:');
 

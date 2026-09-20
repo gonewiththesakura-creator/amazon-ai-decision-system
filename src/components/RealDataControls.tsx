@@ -24,6 +24,13 @@ interface GoLivePreview {
   delete: Record<string, number>;
   preserve: Record<string, number>;
   blockers: string[];
+  retainedDemoHistory: Array<{
+    kind: 'demo_rule_score_evidence' | 'legacy_demo_rejection';
+    ref: string;
+    detail: string;
+    status: string;
+    linkedMockInsights: number;
+  }>;
 }
 
 interface GoLiveVerification {
@@ -37,6 +44,9 @@ interface GoLiveVerification {
   sellerSpriteCapabilitiesAvailable: boolean;
   sellerSpriteMarketCalls: number;
   sellerSpriteAsinCalls: number;
+  sellerSpriteCriticalRunId: string | null;
+  verifiedEvidenceEntities: number;
+  requiredEvidenceEntities: number;
   readyForDemoCleanup: boolean;
   hasMinimumRealCoverage: boolean;
 }
@@ -242,10 +252,20 @@ export default function RealDataControls({
             <div><strong>保留</strong>
               <ul>{Object.entries(preview.preserve).map(([key, count]) => <li key={key}>{key}: {count}</li>)}</ul>
             </div>
+            {preview.retainedDemoHistory?.length ? (
+              <div><strong>Demo 历史保留核对</strong>
+                <ul aria-label="Demo 历史保留核对">{preview.retainedDemoHistory.map((item) => (
+                  <li key={item.ref}>{item.detail} ·
+                    {' '}{item.status === 'waiting_approval' ? '待人工审批' : item.status === 'rejected' ? '已拒绝' : '历史记录'} ·
+                    {' '}<code>{item.ref}</code>
+                  </li>
+                ))}</ul>
+              </div>
+            ) : null}
           </div>
         )}
         {preview?.blockers?.length ? (
-          <p className="alert alert-error" role="alert">真实工作流引用了待清理的 Demo 记录：{preview.blockers.join('；')}</p>
+          <p className="alert alert-error" role="alert">待清理的 Demo 记录仍有引用或未归属的 Mock 结论：{preview.blockers.join('；')}</p>
         ) : null}
         {verification && (
           <div className="real-data-verification" role="status">
@@ -254,7 +274,9 @@ export default function RealDataControls({
               {' '}{verification.hasMinimumRealCoverage ? 'Live 切换条件已满足' : 'Live 切换条件未满足'} ·
               {' '}主市场 {verification.realMarketSnapshots} · 自有 SKU {verification.realOwnedProductSnapshots} / {verification.activeOwnedProducts} · Mock {verification.mockObservations}
               <br />SellerSprite 连接 {verification.sellerSpriteConnectionVerified ? '已验证' : '未验证'} · 市场 {verification.sellerSpriteMarketSnapshots} · 自有 SKU {verification.sellerSpriteOwnedProductSnapshots} ·
-              {' '}能力 {verification.sellerSpriteCapabilitiesAvailable ? '已发现' : '未验证'} · 市场调用 {verification.sellerSpriteMarketCalls} · ASIN 调用 {verification.sellerSpriteAsinCalls}</span>
+              {' '}能力 {verification.sellerSpriteCapabilitiesAvailable ? '已发现' : '未验证'} · 市场调用 {verification.sellerSpriteMarketCalls} · ASIN 调用 {verification.sellerSpriteAsinCalls}
+              <br />运行 Evidence {verification.verifiedEvidenceEntities} / {verification.requiredEvidenceEntities} ·
+              {' '}<span className="real-data-run-id">关键运行 {verification.sellerSpriteCriticalRunId ?? '尚无完整运行'}</span></span>
           </div>
         )}
         <div className="real-data-actions">

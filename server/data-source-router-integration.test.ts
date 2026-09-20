@@ -103,7 +103,94 @@ function testAdapter(overrides: Partial<MarketDataAdapter> = {}): MarketDataAdap
   };
 }
 
+function testImportAdapter(overrides: Partial<MarketDataAdapter> = {}): MarketDataAdapter {
+  const provenance = testProvenance({
+    source: 'SellerSprite fixture import ss-42',
+    sourceType: 'import',
+  });
+  return testAdapter({
+    id: 'source-sellersprite-import',
+    name: 'Fixture import connector',
+    sourceType: 'import',
+    async fetchMarketOverview() { return testMarketOverview(provenance); },
+    async fetchProductDetail(input) { return testProductDetail(input, provenance); },
+    ...overrides,
+  });
+}
+
 describe('data refresh routing', () => {
+  it('fails a generic Live SellerSprite task before a runless MCP call or snapshot write', async () => {
+    database = openDatabase(':memory:');
+    seedDemoData(database);
+    database.prepare("UPDATE app_settings SET mode = 'live' WHERE id = 1").run();
+    let remoteCalls = 0;
+    const adapter = testAdapter({
+      async fetchProductDetail(input) {
+        remoteCalls += 1;
+        return testProductDetail(input);
+      },
+    });
+    const service = new IntelligenceService(
+      database, new DataSourceRouter(new AdapterRegistry([adapter])),
+    );
+    const productId = service.repository.getOwnedProducts()[0].id;
+    const before = database.prepare(`
+      SELECT COUNT(*) AS count FROM product_snapshots WHERE product_id = ?
+    `).get(productId);
+
+    const task = await service.runDataTask({
+      taskType: 'owned_sku_refresh', target: productId,
+    });
+
+    expect(task).toMatchObject({
+      status: 'failed', sourceId: 'source-sellersprite-mcp', success: 0, failed: 1,
+    });
+    expect(task.errorLog).toMatch(/SellerSprite.*(?:关键同步|专用同步)/);
+    expect(remoteCalls).toBe(0);
+    expect(database.prepare(`
+      SELECT COUNT(*) AS count FROM product_snapshots WHERE product_id = ?
+    `).get(productId)).toEqual(before);
+  });
+
+  it('fails a legacy generic Live SellerSprite retry before any MCP call', async () => {
+    database = openDatabase(':memory:');
+    seedDemoData(database);
+    database.prepare("UPDATE app_settings SET mode = 'live' WHERE id = 1").run();
+    let remoteCalls = 0;
+    const adapter = testAdapter({
+      async fetchProductDetail(input) {
+        remoteCalls += 1;
+        return testProductDetail(input);
+      },
+    });
+    const service = new IntelligenceService(
+      database, new DataSourceRouter(new AdapterRegistry([adapter])),
+    );
+    const productId = service.repository.getOwnedProducts()[0].id;
+    const before = database.prepare(`
+      SELECT COUNT(*) AS count FROM product_snapshots WHERE product_id = ?
+    `).get(productId);
+    database.prepare(`
+      INSERT INTO data_tasks (
+        id, name, source_id, task_type, target, source, marketplace, status,
+        started_at, completed_at, total, success, failed, error_log, created_at
+      ) VALUES ('legacy-generic-mcp', 'Legacy refresh', 'source-sellersprite-mcp',
+        'owned_sku_refresh', ?, 'SellerSprite MCP', 'US', 'failed', ?, ?, 1, 0, 1,
+        'prior failure', ?)
+    `).run(productId, '2026-09-19T00:00:00Z', '2026-09-19T00:01:00Z', '2026-09-19T00:00:00Z');
+
+    const task = await service.runDataTask({ retryTaskId: 'legacy-generic-mcp' });
+
+    expect(task).toMatchObject({
+      status: 'failed', sourceId: 'source-sellersprite-mcp', success: 0, failed: 1,
+    });
+    expect(task.errorLog).toMatch(/SellerSprite.*(?:关键同步|专用同步)/);
+    expect(remoteCalls).toBe(0);
+    expect(database.prepare(`
+      SELECT COUNT(*) AS count FROM product_snapshots WHERE product_id = ?
+    `).get(productId)).toEqual(before);
+  });
+
   it('records the resolved real adapter and appends no snapshot when live SellerSprite is unavailable', async () => {
     database = openDatabase(':memory:');
     const app = createApp({ database });
@@ -161,16 +248,16 @@ describe('data refresh routing', () => {
     `);
     const provenance = {
       source: 'SellerSprite fixture record ss-42',
-      sourceType: 'mcp' as const,
+      sourceType: 'import' as const,
       collectedAt: '2026-09-12T02:00:00.000Z',
       period: '30D',
       isEstimated: true,
       confidence: 0.88,
     };
     const adapter: MarketDataAdapter = {
-      id: 'source-sellersprite-mcp',
-      name: 'SellerSprite MCP fixture',
-      sourceType: 'mcp',
+      id: 'source-sellersprite-import',
+      name: 'SellerSprite import fixture',
+      sourceType: 'import',
       async fetchMarketOverview() { throw new Error('not used'); },
       async fetchMarketProducts() { return []; },
       async fetchKeywordData() { return []; },
@@ -197,6 +284,7 @@ describe('data refresh routing', () => {
     const task = await service.runDataTask({
       taskType: 'owned_sku_refresh',
       target: 'route-product',
+      sourcePreference: adapter.id,
     });
 
     expect(task.errorLog).toBeNull();
@@ -224,7 +312,7 @@ describe('data refresh routing', () => {
     database = openDatabase(':memory:');
     seedDemoData(database);
     database.exec(`UPDATE app_settings SET mode = 'live' WHERE id = 1`);
-    const adapter = testAdapter({
+    const adapter = testImportAdapter({
       async fetchProductDetail() { throw new Error('fixture product fetch failed'); },
     });
     const service = new IntelligenceService(
@@ -238,7 +326,9 @@ describe('data refresh routing', () => {
         (SELECT COUNT(*) FROM ai_insights) AS insights
     `).get() as { marketSnapshots: number; productSnapshots: number; insights: number };
 
-    const task = await service.runDataTask({ taskType: 'dashboard_core_refresh', target: 'all' });
+    const task = await service.runDataTask({
+      taskType: 'dashboard_core_refresh', target: 'all', sourcePreference: adapter.id,
+    });
 
     expect(task).toMatchObject({
       status: 'failed',
@@ -260,7 +350,7 @@ describe('data refresh routing', () => {
     database = openDatabase(':memory:');
     seedDemoData(database);
     database.exec(`UPDATE app_settings SET mode = 'live' WHERE id = 1`);
-    const adapter = testAdapter();
+    const adapter = testImportAdapter();
     const service = new IntelligenceService(
       database,
       new DataSourceRouter(new AdapterRegistry([adapter])),
@@ -273,8 +363,12 @@ describe('data refresh routing', () => {
         (SELECT COUNT(*) FROM product_snapshots) AS productSnapshots
     `).get();
 
-    const keywordTask = await service.runDataTask({ taskType: 'keyword_refresh', target: marketId });
-    const reviewTask = await service.runDataTask({ taskType: 'review_refresh', target: productId });
+    const keywordTask = await service.runDataTask({
+      taskType: 'keyword_refresh', target: marketId, sourcePreference: adapter.id,
+    });
+    const reviewTask = await service.runDataTask({
+      taskType: 'review_refresh', target: productId, sourcePreference: adapter.id,
+    });
 
     expect(keywordTask).toMatchObject({ status: 'failed', sourceId: adapter.id });
     expect(keywordTask.errorLog).toContain('关键词刷新持久化尚未实现');
@@ -291,7 +385,7 @@ describe('data refresh routing', () => {
     database = openDatabase(':memory:');
     seedDemoData(database);
     database.exec(`UPDATE app_settings SET mode = 'live' WHERE id = 1`);
-    const adapter = testAdapter({ name: 'Renamed SellerSprite connector' });
+    const adapter = testImportAdapter({ name: 'Renamed SellerSprite import connector' });
     const service = new IntelligenceService(
       database,
       new DataSourceRouter(new AdapterRegistry([adapter])),
@@ -326,6 +420,53 @@ describe('data refresh routing', () => {
     });
   });
 
+  it('rejects generic retries and direct execution for run-managed SellerSprite tasks', async () => {
+    database = openDatabase(':memory:');
+    seedDemoData(database);
+    database.exec(`UPDATE app_settings SET mode = 'live' WHERE id = 1`);
+    const service = new IntelligenceService(database);
+    const now = '2026-09-20T00:00:00.000Z';
+    const insert = database.prepare(`
+      INSERT INTO data_tasks (
+        id, sync_run_id, name, task_type, target, source, marketplace, status,
+        started_at, completed_at, total, success, failed, error_log, created_at
+      ) VALUES (?, ?, ?, ?, ?, 'SellerSprite MCP', 'US', 'failed', ?, ?, 1, 0, 1, 'failure', ?)
+    `);
+    insert.run('critical-run', 'critical-run', 'Critical sync', 'critical_sync', 'market-1', now, now, now);
+    insert.run('secondary-task', 'critical-run', 'Competitor refresh', 'competitor_refresh', 'market-1', now, now, now);
+    const before = database.prepare('SELECT COUNT(*) AS count FROM data_tasks').get();
+
+    await expect(service.runDataTask({ retryTaskId: 'critical-run' }))
+      .rejects.toThrow(/设置.*数据源.*关键同步/);
+    await expect(service.runDataTask({ retryTaskId: 'secondary-task' }))
+      .rejects.toThrow(/设置.*数据源.*关键同步/);
+    await expect(service.runDataTask({ taskType: 'critical_sync', target: 'market-1' }))
+      .rejects.toThrow(/设置.*数据源.*关键同步/);
+    expect(database.prepare('SELECT COUNT(*) AS count FROM data_tasks').get()).toEqual(before);
+  });
+
+  it('rejects generic retries for ResearchJob-owned tasks without creating a new task', async () => {
+    database = openDatabase(':memory:');
+    seedDemoData(database);
+    database.exec(`UPDATE app_settings SET mode = 'live' WHERE id = 1`);
+    const service = new IntelligenceService(database);
+    const now = '2026-09-20T00:00:00.000Z';
+    database.prepare(`
+      INSERT INTO data_tasks (
+        id, name, task_type, target, source, marketplace, status,
+        started_at, completed_at, total, success, failed, error_log, created_at,
+        research_job_id
+      ) VALUES ('research-collection-task', 'Research collection', 'market_refresh',
+        'mkt-memory-foam', 'Persisted Snapshot', 'US', 'failed', ?, ?, 1, 0, 1,
+        'missing data', ?, 'research-job-1')
+    `).run(now, now, now);
+    const before = database.prepare('SELECT COUNT(*) AS count FROM data_tasks').get();
+
+    await expect(service.runDataTask({ retryTaskId: 'research-collection-task' }))
+      .rejects.toThrow(/Research Job.*工作流.*重试/);
+    expect(database.prepare('SELECT COUNT(*) AS count FROM data_tasks').get()).toEqual(before);
+  });
+
   it('rejects mismatched product identity and non-ISO dates before persistence', async () => {
     database = openDatabase(':memory:');
     seedDemoData(database);
@@ -334,47 +475,52 @@ describe('data refresh routing', () => {
     const before = database.prepare(`
       SELECT COUNT(*) AS count FROM product_snapshots WHERE product_id = ?
     `).get(productId);
+    const importProvenance = testProvenance({
+      source: 'SellerSprite fixture import ss-42', sourceType: 'import',
+    });
     const invalidDetails: Array<{ expected: RegExp; detail: (input: ProductInput) => ProductDetailRecord }> = [
       {
         expected: /ASIN.*不一致/,
-        detail: (input) => ({ ...testProductDetail(input), asin: 'B0WRONGASIN' }),
+        detail: (input) => ({ ...testProductDetail(input, importProvenance), asin: 'B0WRONGASIN' }),
       },
       {
         expected: /marketplace.*不一致/,
-        detail: (input) => ({ ...testProductDetail(input), marketplace: 'CA' }),
+        detail: (input) => ({ ...testProductDetail(input, importProvenance), marketplace: 'CA' }),
       },
       {
         expected: /产品与快照身份不一致/,
         detail: (input) => ({
-          ...testProductDetail(input),
-          latest: { ...testProductDetail(input).latest, productId: 'another-external-product' },
+          ...testProductDetail(input, importProvenance),
+          latest: { ...testProductDetail(input, importProvenance).latest, productId: 'another-external-product' },
         }),
       },
       {
         expected: /有效日期/,
         detail: (input) => ({
-          ...testProductDetail(input),
-          latest: { ...testProductDetail(input).latest, date: '2026-02-30' },
+          ...testProductDetail(input, importProvenance),
+          latest: { ...testProductDetail(input, importProvenance).latest, date: '2026-02-30' },
         }),
       },
       {
         expected: /ISO-8601/,
         detail: (input) => {
-          const provenance = testProvenance({ collectedAt: '09/12/2026' });
+          const provenance = { ...importProvenance, collectedAt: '09/12/2026' };
           return testProductDetail(input, provenance);
         },
       },
     ];
 
     for (const invalid of invalidDetails) {
-      const adapter = testAdapter({
+      const adapter = testImportAdapter({
         async fetchProductDetail(input) { return invalid.detail(input); },
       });
       const service = new IntelligenceService(
         database,
         new DataSourceRouter(new AdapterRegistry([adapter])),
       );
-      const task = await service.runDataTask({ taskType: 'owned_sku_refresh', target: productId });
+      const task = await service.runDataTask({
+        taskType: 'owned_sku_refresh', target: productId, sourcePreference: adapter.id,
+      });
       expect(task.status).toBe('failed');
       expect(task.errorLog).toMatch(invalid.expected);
       expect(database.prepare(`

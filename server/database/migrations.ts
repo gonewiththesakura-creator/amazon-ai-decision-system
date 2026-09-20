@@ -1810,6 +1810,88 @@ const migrations = [
       }
     },
   },
+  {
+    version: 22,
+    sql: `
+      ALTER TABLE mcp_call_logs ADD COLUMN sync_run_id TEXT REFERENCES data_tasks(id);
+      ALTER TABLE market_snapshots ADD COLUMN sync_run_id TEXT REFERENCES data_tasks(id);
+      ALTER TABLE product_snapshots ADD COLUMN sync_run_id TEXT REFERENCES data_tasks(id);
+      ALTER TABLE metric_facts ADD COLUMN sync_run_id TEXT REFERENCES data_tasks(id);
+      ALTER TABLE data_tasks ADD COLUMN sync_run_id TEXT;
+      ALTER TABLE evidence_records ADD COLUMN sync_run_id TEXT REFERENCES data_tasks(id);
+
+      CREATE TABLE mcp_sync_observation_links (
+        sync_run_id TEXT NOT NULL REFERENCES data_tasks(id),
+        snapshot_kind TEXT NOT NULL CHECK (snapshot_kind IN ('market', 'product')),
+        snapshot_id TEXT NOT NULL,
+        entity_id TEXT NOT NULL,
+        disposition TEXT NOT NULL CHECK (disposition IN ('inserted', 'reused')),
+        PRIMARY KEY (sync_run_id, snapshot_kind, snapshot_id)
+      );
+      CREATE INDEX idx_mcp_sync_links_run_entity
+        ON mcp_sync_observation_links(sync_run_id, snapshot_kind, entity_id);
+      CREATE INDEX idx_mcp_call_logs_sync_run ON mcp_call_logs(sync_run_id, capability, entity_id);
+      CREATE INDEX idx_market_snapshots_sync_run ON market_snapshots(sync_run_id);
+      CREATE INDEX idx_product_snapshots_sync_run ON product_snapshots(sync_run_id);
+      CREATE INDEX idx_metric_facts_sync_run ON metric_facts(sync_run_id);
+      CREATE INDEX idx_evidence_records_sync_run ON evidence_records(sync_run_id);
+    `,
+  },
+  {
+    version: 23,
+    sql: `
+      DROP INDEX IF EXISTS idx_mcp_sync_links_run_entity;
+      ALTER TABLE mcp_sync_observation_links RENAME TO mcp_sync_observation_links_v22;
+      CREATE TABLE mcp_sync_observation_links (
+        sync_run_id TEXT NOT NULL REFERENCES data_tasks(id),
+        snapshot_kind TEXT NOT NULL CHECK (snapshot_kind IN ('market', 'product', 'fact')),
+        snapshot_id TEXT NOT NULL,
+        entity_id TEXT NOT NULL,
+        disposition TEXT NOT NULL CHECK (disposition IN ('inserted', 'reused')),
+        PRIMARY KEY (sync_run_id, snapshot_kind, snapshot_id)
+      );
+      INSERT INTO mcp_sync_observation_links (
+        sync_run_id, snapshot_kind, snapshot_id, entity_id, disposition
+      ) SELECT sync_run_id, snapshot_kind, snapshot_id, entity_id, disposition
+        FROM mcp_sync_observation_links_v22;
+      DROP TABLE mcp_sync_observation_links_v22;
+      CREATE INDEX idx_mcp_sync_links_run_entity
+        ON mcp_sync_observation_links(sync_run_id, snapshot_kind, entity_id);
+    `,
+  },
+  {
+    version: 24,
+    sql: `
+      ALTER TABLE competitor_candidates
+        ADD COLUMN sync_run_id TEXT REFERENCES data_tasks(id);
+      CREATE INDEX idx_competitor_candidates_sync_run
+        ON competitor_candidates(sync_run_id, source_product_id);
+
+      CREATE TABLE competitor_candidate_run_links (
+        sync_run_id TEXT NOT NULL REFERENCES data_tasks(id),
+        candidate_id TEXT NOT NULL REFERENCES competitor_candidates(id),
+        source_product_id TEXT NOT NULL REFERENCES products(id),
+        disposition TEXT NOT NULL CHECK (disposition IN ('inserted', 'reused')),
+        created_at TEXT NOT NULL,
+        PRIMARY KEY (sync_run_id, candidate_id)
+      );
+      CREATE INDEX idx_candidate_run_links_run_product
+        ON competitor_candidate_run_links(sync_run_id, source_product_id, disposition);
+      CREATE INDEX idx_candidate_run_links_candidate
+        ON competitor_candidate_run_links(candidate_id, created_at DESC);
+    `,
+  },
+  {
+    version: 25,
+    sql: `
+      ALTER TABLE provider_capability_snapshots
+        ADD COLUMN sync_run_id TEXT REFERENCES data_tasks(id);
+      CREATE INDEX idx_provider_capabilities_sync_run
+        ON provider_capability_snapshots(sync_run_id, collected_at DESC);
+      CREATE INDEX idx_data_tasks_sync_run
+        ON data_tasks(sync_run_id, task_type, status);
+    `,
+  },
 ];
 
 export function migrate(database: DatabaseSync): void {

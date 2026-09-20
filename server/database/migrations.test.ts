@@ -60,7 +60,7 @@ function v13Database(): AppDatabase {
   for (let version = 1; version <= 13; version += 1) insertMigration.run(version, appliedAt);
   // This deliberately minimal fixture isolates the V14 backfill and does not
   // reproduce the application tables needed by later migrations.
-  for (let version = 15; version <= 21; version += 1) insertMigration.run(version, appliedAt);
+  for (let version = 15; version <= 25; version += 1) insertMigration.run(version, appliedAt);
   return database;
 }
 
@@ -126,6 +126,165 @@ function restoreV15DevelopmentProjects(db: AppDatabase): void {
 }
 
 describe('database migrations', () => {
+  it('adds nullable critical-sync lineage without assigning legacy observations to a run', () => {
+    const db = testDatabase();
+    for (const table of [
+      'mcp_call_logs', 'market_snapshots', 'product_snapshots',
+      'metric_facts', 'data_tasks', 'evidence_records',
+    ]) {
+      const columns = db.prepare(`PRAGMA table_info(${table})`).all()
+        .map((column) => String((column as { name: unknown }).name));
+      expect(columns).toContain('sync_run_id');
+    }
+    expect(db.prepare(`SELECT name FROM sqlite_master
+      WHERE type = 'table' AND name = 'mcp_sync_observation_links'`).get())
+      .toMatchObject({ name: 'mcp_sync_observation_links' });
+    seedDemoData(db);
+    expect(db.prepare(`SELECT sync_run_id FROM market_snapshots WHERE id = 'ms-mfm-2026-09-09'`).get())
+      .toEqual({ sync_run_id: null });
+    expect(db.prepare(`SELECT sync_run_id FROM product_snapshots WHERE id = 'ps-owned-sku-01-4'`).get())
+      .toEqual({ sync_run_id: null });
+  });
+
+  it('keeps inserted and reused observation links distinct within a critical sync', () => {
+    const db = testDatabase();
+    db.prepare(`INSERT INTO data_tasks (
+      id, name, task_type, target, source, marketplace, status, created_at
+    ) VALUES ('test-run', 'Critical sync', 'critical_sync', 'market-1',
+      'SellerSprite MCP', 'US', 'running', '2026-09-20T00:00:00.000Z')`).run();
+    const insert = db.prepare(`INSERT INTO mcp_sync_observation_links (
+      sync_run_id, snapshot_kind, snapshot_id, entity_id, disposition
+    ) VALUES (?, ?, ?, ?, ?)`);
+    insert.run('test-run', 'market', 'market-snapshot-1', 'market-1', 'reused');
+    insert.run('test-run', 'product', 'product-snapshot-1', 'owned-1', 'inserted');
+    insert.run('test-run', 'fact', 'metric-fact-1', 'owned-1', 'reused');
+    expect(db.prepare(`SELECT snapshot_kind, snapshot_id, entity_id, disposition
+      FROM mcp_sync_observation_links WHERE sync_run_id = 'test-run' ORDER BY snapshot_kind`).all())
+      .toEqual([
+        { snapshot_kind: 'fact', snapshot_id: 'metric-fact-1', entity_id: 'owned-1', disposition: 'reused' },
+        { snapshot_kind: 'market', snapshot_id: 'market-snapshot-1', entity_id: 'market-1', disposition: 'reused' },
+        { snapshot_kind: 'product', snapshot_id: 'product-snapshot-1', entity_id: 'owned-1', disposition: 'inserted' },
+      ]);
+    expect(() => insert.run('test-run', 'market', 'market-snapshot-1', 'market-1', 'reused'))
+      .toThrow(/UNIQUE|PRIMARY KEY/);
+    expect(() => insert.run('test-run', 'other', 'snapshot-2', 'market-1', 'reused'))
+      .toThrow(/CHECK/);
+    expect(() => insert.run('missing-run', 'market', 'snapshot-3', 'market-1', 'reused'))
+      .toThrow(/FOREIGN KEY/);
+  });
+
+  it('upgrades an applied V22 link table without losing prior snapshot lineage', () => {
+    const db = testDatabase();
+    db.prepare(`INSERT INTO data_tasks (
+      id, name, task_type, target, source, marketplace, status, created_at
+    ) VALUES ('v22-run', 'Critical sync', 'critical_sync', 'market-1',
+      'SellerSprite MCP', 'US', 'success', '2026-09-20T00:00:00.000Z')`).run();
+    db.prepare(`INSERT INTO mcp_sync_observation_links (
+      sync_run_id, snapshot_kind, snapshot_id, entity_id, disposition
+    ) VALUES ('v22-run', 'market', 'snapshot-v22', 'market-1', 'inserted')`).run();
+    db.exec(`
+      DELETE FROM schema_migrations WHERE version = 23;
+      DROP INDEX idx_mcp_sync_links_run_entity;
+      ALTER TABLE mcp_sync_observation_links RENAME TO mcp_sync_observation_links_v23;
+      CREATE TABLE mcp_sync_observation_links (
+        sync_run_id TEXT NOT NULL REFERENCES data_tasks(id),
+        snapshot_kind TEXT NOT NULL CHECK (snapshot_kind IN ('market', 'product')),
+        snapshot_id TEXT NOT NULL,
+        entity_id TEXT NOT NULL,
+        disposition TEXT NOT NULL CHECK (disposition IN ('inserted', 'reused')),
+        PRIMARY KEY (sync_run_id, snapshot_kind, snapshot_id)
+      );
+      INSERT INTO mcp_sync_observation_links
+        SELECT * FROM mcp_sync_observation_links_v23;
+      DROP TABLE mcp_sync_observation_links_v23;
+      CREATE INDEX idx_mcp_sync_links_run_entity
+        ON mcp_sync_observation_links(sync_run_id, snapshot_kind, entity_id);
+    `);
+
+    migrate(db);
+    db.prepare(`INSERT INTO mcp_sync_observation_links (
+      sync_run_id, snapshot_kind, snapshot_id, entity_id, disposition
+    ) VALUES ('v22-run', 'fact', 'fact-v23', 'market-1', 'reused')`).run();
+
+    expect(db.prepare(`SELECT snapshot_kind, snapshot_id
+      FROM mcp_sync_observation_links ORDER BY snapshot_kind`).all()).toEqual([
+      { snapshot_kind: 'fact', snapshot_id: 'fact-v23' },
+      { snapshot_kind: 'market', snapshot_id: 'snapshot-v22' },
+    ]);
+    expect(db.prepare(`SELECT version FROM schema_migrations WHERE version = 23`).get())
+      .toEqual({ version: 23 });
+    expect(db.prepare('PRAGMA foreign_key_check').all()).toEqual([]);
+  });
+
+  it('adds candidate origin and multi-run links without assigning legacy candidates to a run', () => {
+    const db = testDatabase();
+    const now = '2026-09-20T00:00:00.000Z';
+    db.exec(`
+      DROP TABLE competitor_candidate_run_links;
+      DROP INDEX idx_competitor_candidates_sync_run;
+      ALTER TABLE competitor_candidates DROP COLUMN sync_run_id;
+      DELETE FROM schema_migrations WHERE version = 24;
+      INSERT INTO market_nodes (
+        id, name, level, marketplace, status, source_type, created_at
+      ) VALUES ('candidate-lineage-market', 'Candidate lineage', 1, 'US', 'active', 'import', '${now}');
+      INSERT INTO products (
+        id, asin, brand, title, image_url, marketplace, product_type, is_owned,
+        market_node_id, source_type, created_at
+      ) VALUES ('candidate-lineage-owned', 'B0LINEAGE1', 'Brand', 'Owned', '', 'US',
+        'pillow', 1, 'candidate-lineage-market', 'import', '${now}');
+      INSERT INTO competitor_candidates (
+        id, marketplace, asin, source_product_id, source, source_type, status, created_at
+      ) VALUES ('legacy-candidate', 'US', 'B0LEGACY01', 'candidate-lineage-owned',
+        'SellerSprite MCP', 'mcp', 'pending_review', '${now}');
+    `);
+
+    migrate(db);
+
+    expect(db.prepare(`SELECT sync_run_id FROM competitor_candidates WHERE id = 'legacy-candidate'`).get())
+      .toEqual({ sync_run_id: null });
+    expect(db.prepare(`SELECT COUNT(*) AS count FROM competitor_candidate_run_links`).get())
+      .toEqual({ count: 0 });
+    expect(db.prepare(`SELECT name FROM sqlite_master
+      WHERE type = 'index' AND name IN (
+        'idx_competitor_candidates_sync_run', 'idx_candidate_run_links_run_product'
+      ) ORDER BY name`).all()).toEqual([
+      { name: 'idx_candidate_run_links_run_product' },
+      { name: 'idx_competitor_candidates_sync_run' },
+    ]);
+    expect(db.prepare(`SELECT version FROM schema_migrations WHERE version = 24`).get())
+      .toEqual({ version: 24 });
+    expect(db.prepare('PRAGMA foreign_key_check').all()).toEqual([]);
+  });
+
+  it('adds run lineage to capability snapshots without assigning legacy discovery to a run', () => {
+    const db = testDatabase();
+    const now = '2026-09-20T00:00:00.000Z';
+    db.exec(`
+      DROP INDEX idx_provider_capabilities_sync_run;
+      DROP INDEX idx_data_tasks_sync_run;
+      ALTER TABLE provider_capability_snapshots DROP COLUMN sync_run_id;
+      DELETE FROM schema_migrations WHERE version = 25;
+      INSERT INTO provider_capability_snapshots (
+        id, provider_id, capabilities_json, collected_at
+      ) VALUES ('legacy-capability', 'sellersprite', '{}', '${now}');
+    `);
+
+    migrate(db);
+
+    expect(db.prepare(`SELECT sync_run_id FROM provider_capability_snapshots
+      WHERE id = 'legacy-capability'`).get()).toEqual({ sync_run_id: null });
+    expect(db.prepare(`SELECT name FROM sqlite_master
+      WHERE type = 'index' AND name IN (
+        'idx_provider_capabilities_sync_run', 'idx_data_tasks_sync_run'
+      ) ORDER BY name`).all()).toEqual([
+      { name: 'idx_data_tasks_sync_run' },
+      { name: 'idx_provider_capabilities_sync_run' },
+    ]);
+    expect(db.prepare(`SELECT version FROM schema_migrations WHERE version = 25`).get())
+      .toEqual({ version: 25 });
+    expect(db.prepare('PRAGMA foreign_key_check').all()).toEqual([]);
+  });
+
   it('applies the complete migration chain with a valid schema', () => {
     const db = testDatabase();
     const versions = db.prepare(`
@@ -133,7 +292,7 @@ describe('database migrations', () => {
     `).all() as Array<{ version: number }>;
 
     expect(versions.map((row) => Number(row.version))).toEqual(
-      Array.from({ length: 21 }, (_, index) => index + 1),
+      Array.from({ length: 25 }, (_, index) => index + 1),
     );
     expect(db.prepare('PRAGMA foreign_key_check').all()).toEqual([]);
     expect(db.prepare('PRAGMA quick_check').get()).toMatchObject({ quick_check: 'ok' });
@@ -222,8 +381,12 @@ describe('database migrations', () => {
     const appliedAt = '2026-09-19T00:00:00.000Z';
     const migration = db.prepare('INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)');
     for (let version = 1; version <= 19; version += 1) migration.run(version, appliedAt);
-    // This minimal V19 fixture isolates V20 and omits the full tables V21 backfills.
+    // This minimal V19 fixture isolates V20 and omits the tables later migrations require.
     migration.run(21, appliedAt);
+    migration.run(22, appliedAt);
+    migration.run(23, appliedAt);
+    migration.run(24, appliedAt);
+    migration.run(25, appliedAt);
     db.prepare("INSERT INTO app_settings (id, mode) VALUES (1, 'demo')").run();
     db.prepare("INSERT INTO market_nodes (id, marketplace) VALUES ('market-us', 'US')").run();
     db.prepare(`

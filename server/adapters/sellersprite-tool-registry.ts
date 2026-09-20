@@ -34,7 +34,9 @@ export class SellerSpriteToolRegistry {
 
   constructor(private readonly options: { store?: McpCapabilityStore; now?: () => Date } = {}) {}
 
-  async refresh(discover: () => Promise<McpToolDefinition[]>): Promise<McpCapabilitySnapshot> {
+  async refresh(
+    discover: () => Promise<McpToolDefinition[]>, runId: string | null = null,
+  ): Promise<McpCapabilitySnapshot> {
     this.tools = (await discover()).map((tool) => mcpToolSchema.parse(tool));
     this.mapping.clear();
     const assigned = new Set<string>();
@@ -52,6 +54,7 @@ export class SellerSpriteToolRegistry {
     const snapshot: McpCapabilitySnapshot = {
       id: randomUUID(),
       provider: 'sellersprite',
+      runId,
       discoveredAt: (this.options.now?.() ?? new Date()).toISOString(),
       tools: this.tools.map((tool) => ({
         name: safeMetadataText(tool.name),
@@ -75,6 +78,14 @@ export class SellerSpriteToolRegistry {
     return SELLERSPRITE_CAPABILITIES.filter((capability) => !this.mapping.has(capability));
   }
 
+  supportsArgument(capability: SellerSpriteCapability, argument: string): boolean {
+    const tool = this.mapping.get(capability);
+    if (!tool) return false;
+    const schema = capability.startsWith('ASIN_')
+      ? tool.inputSchema : marketRequestSchema(tool.inputSchema);
+    return Boolean(schema && Object.hasOwn(schema.properties ?? {}, argument));
+  }
+
   validateArguments(capability: SellerSpriteCapability, args: Record<string, unknown>): void {
     const tool = this.mapping.get(capability);
     if (!tool) throw new Error(`SellerSprite capability unavailable: ${capability}`);
@@ -95,18 +106,32 @@ export class SellerSpriteToolRegistry {
 }
 
 function supportsSchema(capability: SellerSpriteCapability, tool: McpToolDefinition): boolean {
-  const required = tool.inputSchema.required ?? [];
-  const properties = tool.inputSchema.properties ?? {};
-  const asinCapability = capability.startsWith('ASIN_');
-  if (asinCapability) return required.includes('asin') && Object.hasOwn(properties, 'asin');
-  const request = properties.request;
-  const nested = typeof request === 'object' && request !== null && !Array.isArray(request)
-    ? request as Record<string, unknown> : null;
-  const nestedProperties = nested?.properties;
-  const hasNestedMarket = required.includes('request') && nested?.type === 'object'
-    && typeof nestedProperties === 'object' && nestedProperties !== null
-    && Object.hasOwn(nestedProperties, 'marketplace');
-  return hasNestedMarket || Object.hasOwn(properties, 'marketplace');
+  const schema = capability.startsWith('ASIN_')
+    ? tool.inputSchema : marketRequestSchema(tool.inputSchema);
+  if (!schema) return false;
+  const requiredScope = capability.startsWith('ASIN_')
+    ? ['marketplace', 'asin']
+    : capability === 'MARKET_RESEARCH' ? ['marketplace'] : ['marketplace', 'nodeIdPath'];
+  const required = schema.required ?? [];
+  const properties = schema.properties ?? {};
+  return requiredScope.every((field) => required.includes(field) && Object.hasOwn(properties, field));
+}
+
+function marketRequestSchema(
+  schema: McpToolDefinition['inputSchema'],
+): McpToolDefinition['inputSchema'] | null {
+  const request = schema.properties?.request;
+  if (!schema.required?.includes('request')) return schema;
+  if (!request || typeof request !== 'object' || Array.isArray(request)) return null;
+  const nested = request as Record<string, unknown>;
+  if (nested.type !== 'object') return null;
+  return {
+    type: 'object',
+    properties: typeof nested.properties === 'object' && nested.properties !== null
+      ? nested.properties as Record<string, unknown> : undefined,
+    required: Array.isArray(nested.required)
+      ? nested.required.filter((field: unknown): field is string => typeof field === 'string') : undefined,
+  };
 }
 
 function scoreTool(capability: SellerSpriteCapability, tool: McpToolDefinition): number {

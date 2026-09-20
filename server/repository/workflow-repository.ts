@@ -534,11 +534,17 @@ export class WorkflowRepository {
 
   createEvidence(jobId: string, input: Omit<WorkflowEvidence, 'id' | 'researchJobId'>): WorkflowEvidence {
     const job = this.database.prepare(`
-      SELECT data_version FROM research_jobs WHERE id = ? AND marketplace = ?
+      SELECT data_version, marketplace FROM research_jobs WHERE id = ? AND marketplace = ?
     `).get(jobId, this.intelligence.getSettings().marketplace) as DbRow | undefined;
     if (!job) throw new Error('Research Job 不存在或不属于当前站点。');
     if (input.dataVersion !== stringValue(job.data_version)) {
       throw new Error('Evidence 必须写入 Research Job 的当前数据版本。');
+    }
+    const syncRunId = this.sourceSyncRunId(
+      input.sourceType, input.sourceRecordId, stringValue(job.marketplace),
+    );
+    if (input.syncRunId !== undefined && input.syncRunId !== syncRunId) {
+      throw new Error('Evidence 同步批次必须匹配来源记录的实际同步批次。');
     }
     const existing = this.database.prepare(`
       SELECT * FROM evidence_records
@@ -549,22 +555,91 @@ export class WorkflowRepository {
       jobId, input.claim, input.metricName, JSON.stringify(input.metricValue),
       input.sourceRecordId ?? null, input.dataVersion,
     ) as DbRow | undefined;
-    if (existing) return mapEvidence(existing);
+    if (existing && nullableString(existing.sync_run_id) === syncRunId) return mapEvidence(existing);
     const id = randomUUID();
     const now = new Date().toISOString();
     this.database.prepare(`
       INSERT INTO evidence_records (
         id, research_job_id, insight_id, claim, metric_name, metric_value_json,
         source, source_type, source_record_id, collected_at, period, is_estimated,
-        calculation, confidence, data_version, created_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        calculation, confidence, data_version, created_at, sync_run_id
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).run(
       id, jobId, input.insightId ?? null, input.claim, input.metricName,
       JSON.stringify(input.metricValue), input.source, input.sourceType,
       input.sourceRecordId ?? null, input.collectedAt, input.period,
-      input.isEstimated ? 1 : 0, input.calculation, input.confidence, input.dataVersion, now,
+      input.isEstimated ? 1 : 0, input.calculation, input.confidence, input.dataVersion, now, syncRunId,
     );
     return this.getEvidence(jobId).find((item) => item.id === id)!;
+  }
+
+  private sourceSyncRunId(
+    sourceType: WorkflowEvidence['sourceType'], sourceRecordId: string | undefined, marketplace: string,
+  ): string | null {
+    if (sourceType !== 'mcp') return null;
+    if (!sourceRecordId) throw new Error('Evidence MCP 来源必须指定可追溯记录。');
+    const rows = this.database.prepare(`
+      SELECT source_type, sync_run_id, marketplace, entity_id, 'fact' AS record_kind
+      FROM metric_facts WHERE id = ?
+      UNION ALL
+      SELECT snapshot.source_type, snapshot.sync_run_id, market.marketplace,
+        snapshot.market_node_id AS entity_id,
+        'market' AS record_kind
+      FROM market_snapshots snapshot
+      JOIN market_nodes market ON market.id = snapshot.market_node_id
+      WHERE snapshot.id = ?
+      UNION ALL
+      SELECT snapshot.source_type, snapshot.sync_run_id, product.marketplace,
+        snapshot.product_id AS entity_id,
+        'product' AS record_kind
+      FROM product_snapshots snapshot
+      JOIN products product ON product.id = snapshot.product_id
+      WHERE snapshot.id = ?
+    `).all(sourceRecordId, sourceRecordId, sourceRecordId) as DbRow[];
+    if (rows.length > 1) throw new Error('Evidence 来源记录 ID 在事实与快照中不唯一。');
+    const source = rows[0];
+    if (!source) throw new Error('Evidence MCP 来源记录不存在。');
+    if (stringValue(source.source_type) !== 'mcp' || stringValue(source.marketplace) !== marketplace) {
+      throw new Error('Evidence MCP 来源记录的类型或站点不匹配。');
+    }
+    const verifiedReuse = this.database.prepare(`
+      SELECT link.sync_run_id AS syncRunId
+      FROM mcp_sync_observation_links link
+      JOIN data_coverage_runs coverage ON coverage.id = link.sync_run_id
+        AND coverage.marketplace = ? AND coverage.run_type = 'critical_sync'
+        AND coverage.is_complete = 1
+      JOIN data_tasks task ON task.id = link.sync_run_id
+        AND task.sync_run_id = link.sync_run_id AND task.marketplace = coverage.marketplace
+        AND task.source_id = 'source-sellersprite-mcp'
+        AND task.task_type = 'critical_sync' AND task.status = 'success'
+        AND task.success = task.total AND task.failed = 0
+      WHERE link.snapshot_kind = ? AND link.snapshot_id = ?
+        AND link.entity_id = ?
+      ORDER BY coverage.created_at DESC, link.sync_run_id DESC
+      LIMIT 1
+    `).get(marketplace, stringValue(source.record_kind), sourceRecordId,
+      stringValue(source.entity_id)) as DbRow | undefined;
+    if (verifiedReuse) return stringValue(verifiedReuse.syncRunId);
+    const directRunId = nullableString(source.sync_run_id);
+    if (!directRunId) {
+      throw new Error('Evidence MCP 来源记录尚未关联成功完成的同步运行。');
+    }
+    const validDirectRun = this.database.prepare(`
+      SELECT 1 FROM data_tasks task
+      WHERE task.id = ? AND task.sync_run_id = task.id
+        AND task.marketplace = ? AND task.source_id = 'source-sellersprite-mcp'
+        AND task.status = 'success' AND task.failed = 0 AND task.success = task.total
+        AND (task.task_type <> 'critical_sync' OR EXISTS (
+          SELECT 1 FROM data_coverage_runs coverage
+          WHERE coverage.id = task.id AND coverage.marketplace = task.marketplace
+            AND coverage.run_type = 'critical_sync' AND coverage.is_complete = 1
+        ))
+      LIMIT 1
+    `).get(directRunId, marketplace);
+    if (!validDirectRun) {
+      throw new Error('Evidence MCP 来源记录尚未由成功完成的同步运行验证。');
+    }
+    return directRunId;
   }
 
   getEvidence(jobId: string): WorkflowEvidence[] {
@@ -1171,6 +1246,7 @@ function mapEvidence(row: DbRow): WorkflowEvidence {
     source: stringValue(row.source),
     sourceType: stringValue(row.source_type, 'manual') as WorkflowEvidence['sourceType'],
     sourceRecordId: nullableString(row.source_record_id),
+    syncRunId: nullableString(row.sync_run_id) ?? null,
     collectedAt: stringValue(row.collected_at), period: stringValue(row.period, 'point_in_time'),
     isEstimated: numberValue(row.is_estimated) === 1,
     calculation: stringValue(row.calculation), confidence: numberValue(row.confidence),

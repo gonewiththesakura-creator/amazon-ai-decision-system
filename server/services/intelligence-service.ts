@@ -71,6 +71,16 @@ export interface DevelopmentInput {
   sourceOpportunityId?: string;
 }
 
+const RUN_MANAGED_TASK_TYPES = new Set(['critical_sync', 'competitor_discovery']);
+
+function isRunManagedTask(task: Pick<DataTask, 'syncRunId' | 'taskType'>): boolean {
+  return task.syncRunId !== null || RUN_MANAGED_TASK_TYPES.has(task.taskType);
+}
+
+function runManagedTaskError(): Error {
+  return new Error('请在设置 -> 数据源中重新运行 SellerSprite 关键同步；运行级任务不能通过通用数据任务接口执行或重试。');
+}
+
 export class IntelligenceService {
   readonly repository: IntelligenceRepository;
   readonly ai: DeterministicAIService;
@@ -814,13 +824,18 @@ export class IntelligenceService {
       if (previous.marketplace !== activeMarketplace) {
         throw new Error(`原任务属于 ${previous.marketplace} 站点，请切换到该站点后重试。`);
       }
+      if (previous.researchJobId) {
+        throw new Error(`该数据任务由 Research Job ${previous.researchJobId} 工作流管理；请在 Research Job 页面补数或重试，不能通过通用数据任务接口重试。`);
+      }
       if (previous.taskType === 'file_import') {
         throw new Error('文件导入任务不能无文件重试，请重新上传原 CSV/XLSX 文件。');
       }
+      if (isRunManagedTask(previous)) throw runManagedTaskError();
       taskType = previous.taskType;
       target = previous.target;
       sourcePreference = previous.sourceId ?? previous.source;
     }
+    if (RUN_MANAGED_TASK_TYPES.has(taskType)) throw runManagedTaskError();
     let watchItem: WatchlistItem | undefined;
     if (input.watchlistId) {
       watchItem = this.repository.getWatchlist().find((candidate) => candidate.id === input.watchlistId);
@@ -855,6 +870,9 @@ export class IntelligenceService {
     try {
       if (routeError) throw routeError;
       if (!adapter) throw new Error('当前任务没有可用真实数据源，请先配置数据源。');
+      if (settings.mode === 'live' && adapter.id === 'source-sellersprite-mcp') {
+        throw new Error('SellerSprite MCP 必须通过设置 -> 数据源中的关键同步或专用同步运行，通用数据任务无法创建运行级追溯。');
+      }
       const refreshed = await this.refreshTarget(taskType, target, input.watchlistId, adapter);
       const completedAt = new Date().toISOString();
       this.database.prepare(`

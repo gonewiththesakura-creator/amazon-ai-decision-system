@@ -71,6 +71,50 @@ describe('DataTasksPage coverage', () => {
     await screen.findByRole('heading', { name: '还没有数据任务' });
   });
 
+  it('routes run-managed SellerSprite retries back through critical sync', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({
+        data: [{
+          id: 'critical-run', syncRunId: 'critical-run', name: 'SellerSprite 关键同步',
+          taskType: 'critical_sync', target: 'market-1', sourceId: 'source-sellersprite-mcp',
+          source: 'SellerSprite MCP', marketplace: 'US', status: 'failed',
+          startedAt: '2026-09-20T00:00:00.000Z', completedAt: '2026-09-20T00:01:00.000Z',
+          total: 5, success: 0, failed: 5, errorLog: '连接失败', createdAt: '2026-09-20T00:00:00.000Z',
+        }],
+      }),
+    }));
+    render(<MemoryRouter><DataTasksPage /></MemoryRouter>);
+
+    fireEvent.click(await screen.findByRole('button', { name: '查看 SellerSprite 关键同步 错误详情' }));
+    expect(screen.queryByRole('button', { name: '创建重试任务' })).not.toBeInTheDocument();
+    expect(screen.getByText(/设置.*数据源.*关键同步/)).toBeInTheDocument();
+  });
+
+  it('routes ResearchJob-owned task failures back to the owning workflow', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({
+        data: [{
+          id: 'research-task', syncRunId: null, researchJobId: 'research-job-1',
+          name: '市场数据采集', taskType: 'collect_market', target: 'market-1',
+          sourceId: null, source: 'Persisted Snapshot', marketplace: 'US', status: 'failed',
+          startedAt: '2026-09-20T00:00:00.000Z', completedAt: '2026-09-20T00:01:00.000Z',
+          total: 1, success: 0, failed: 1, errorLog: '缺少可比较的历史快照。',
+          createdAt: '2026-09-20T00:00:00.000Z',
+        }],
+      }),
+    }));
+    render(<MemoryRouter><DataTasksPage /></MemoryRouter>);
+
+    fireEvent.click(await screen.findByRole('button', { name: '查看 市场数据采集 错误详情' }));
+
+    expect(screen.queryByRole('button', { name: '创建重试任务' })).not.toBeInTheDocument();
+    expect(screen.getByText(/Research Job.*工作流/)).toBeInTheDocument();
+    expect(screen.getByRole('link', { name: '打开 Research Job' }))
+      .toHaveAttribute('href', '/research-jobs/research-job-1');
+  });
+
   it('passes explicit Amazon report period and marketplace to preview', async () => {
     vi.mocked(previewImport).mockResolvedValue({
       token: 'preview', detectedType: 'amazon_business_report', entityType: 'product',

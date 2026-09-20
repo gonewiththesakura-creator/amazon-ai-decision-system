@@ -66,6 +66,110 @@ function insertObservationFixture(
 }
 
 describe('GoLiveMigrationService', () => {
+  it('itemizes retained Demo rule and rejection history without exposing record payloads', () => {
+    database = openDatabase(':memory:');
+    seedDemoData(database);
+    const profile = database.prepare('SELECT id, version FROM rule_profiles LIMIT 1').get() as {
+      id: string; version: number;
+    };
+    database.prepare(`
+      INSERT INTO research_jobs (
+        id, name, job_type, marketplace, status, entity_type, entity_id, rule_profile_id,
+        rule_profile_version, rule_profile_snapshot_json, is_demo, created_by, data_version,
+        prompt_version, created_at, updated_at
+      ) VALUES ('demo-adjacent-history', 'Private job', 'adjacent_product', 'US',
+        'waiting_approval', 'development_project', 'dev-lumbar', ?, ?, '{}', 1,
+        'private-owner', 'demo-retain-v1', 'prompt-v1', '2026-09-19', '2026-09-19')
+    `).run(profile.id, profile.version);
+    const mixedEvidence = [
+      { id: 'mock-fact', claim: 'private mock claim', metrics: [], provenance: [{
+        source: 'Demo task input (DEMO)', sourceType: 'mock',
+      }] },
+      { id: 'demo-rule-score', claim: 'private metric claim', metrics: [], provenance: [{
+        source: `${profile.id}@${profile.version}`, sourceType: 'manual',
+      }] },
+    ];
+    database.prepare(`
+      INSERT INTO ai_insights (
+        id, entity_type, entity_id, insight_type, status, title, summary,
+        evidence_json, confidence, model, data_version, input_hash, generated_at,
+        research_job_id, evidence_ids_json
+      ) VALUES ('demo-history-insight', 'research_job', 'demo-adjacent-history',
+        'new_product_research', 'pending_approval', 'Private title', 'Private summary',
+        ?, 0.8, 'rule-engine-v1', 'demo-retain-v1', 'history-input', '2026-09-19',
+        'demo-adjacent-history', '["demo-rule-score"]')
+    `).run(JSON.stringify(mixedEvidence));
+    database.prepare(`
+      INSERT INTO evidence_records (
+        id, research_job_id, insight_id, claim, metric_name, metric_value_json,
+        source, source_type, collected_at, period, calculation, confidence,
+        data_version, created_at
+      ) VALUES ('demo-rule-score', 'demo-adjacent-history', 'demo-history-insight',
+        'private metric claim', 'opportunity_score', '71', ?, 'manual',
+        '2026-09-19', 'research_run', '{"private":"calculation"}', 1,
+        'demo-retain-v1', '2026-09-19')
+    `).run(`${profile.id}@${profile.version}`);
+    database.prepare(`
+      INSERT INTO approvals (
+        id, research_job_id, action, status, requested_by, requested_at
+      ) VALUES ('demo-pending-approval', 'demo-adjacent-history', 'test', 'pending',
+        'private-owner', '2026-09-19')
+    `).run();
+    database.prepare(`
+      UPDATE opportunities SET status = 'rejected', updated_at = '2026-09-19'
+      WHERE id = 'opp-school-kit'
+    `).run();
+    database.prepare(`
+      DELETE FROM demo_seed_records WHERE seed_id = 'v2-demo-seed'
+        AND table_name = 'opportunities' AND record_id = 'opp-school-kit'
+    `).run();
+    database.prepare(`
+      INSERT INTO ai_insights (
+        id, entity_type, entity_id, insight_type, status, title, summary,
+        evidence_json, confidence, model, data_version, input_hash, generated_at
+      ) VALUES ('demo-rejection-insight', 'opportunity', 'opp-school-kit',
+        'opportunity_analysis', 'rejected', 'Private title', 'Private summary', ?,
+        0.8, 'rule-engine-v1', 'demo-rejection-v1', 'rejection-input', '2026-09-19')
+    `).run(JSON.stringify([{ id: 'rejection-evidence', claim: 'private rejection claim', metrics: [],
+      provenance: [{ source: '演示数据 / Mock Adapter', sourceType: 'mock' }] }]));
+    database.prepare(`
+      INSERT INTO decisions (
+        id, entity_type, entity_id, decision, reason, ai_insight_id,
+        data_version, decided_by, decided_at
+      ) VALUES ('demo-rejection-decision', 'opportunity', 'opp-school-kit', 'reject',
+        'private rejection rationale', 'demo-rejection-insight', 'demo-rejection-v1',
+        'private-owner', '2026-09-19')
+    `).run();
+
+    const service = new GoLiveMigrationService(database);
+    const writesBefore = database.prepare('SELECT total_changes() AS count').get();
+    const preview = service.preview();
+
+    expect(preview.retainedDemoHistory).toEqual([
+      expect.objectContaining({ kind: 'demo_rule_score_evidence', status: 'waiting_approval' }),
+      expect.objectContaining({ kind: 'legacy_demo_rejection', status: 'rejected' }),
+    ]);
+    expect(preview.retainedDemoHistory.map((item) => item.ref)).toEqual([
+      expect.stringMatching(/^demo-[0-9a-f]{12}$/), expect.stringMatching(/^demo-[0-9a-f]{12}$/),
+    ]);
+    expect(preview.blockers).toContain('unregistered Mock insights: 2');
+    expect(database.prepare('SELECT total_changes() AS count').get()).toEqual(writesBefore);
+    const exposed = JSON.stringify(preview);
+    for (const sensitive of [
+      'demo-rule-score', 'demo-rejection-decision', 'opp-school-kit', 'private metric claim',
+      'private rejection rationale', 'private-owner', 'Private title', 'calculation', '71',
+    ]) expect(exposed).not.toContain(sensitive);
+
+    database.prepare(`UPDATE ai_insights SET evidence_json = ? WHERE id = 'demo-history-insight'`)
+      .run(JSON.stringify([...mixedEvidence, {
+        id: 'real-fact', claim: 'private real claim', metrics: [], provenance: [{
+          source: 'SellerSprite Import', sourceType: 'import',
+        }],
+      }]));
+    expect(service.preview().retainedDemoHistory.map((item) => item.kind))
+      .toEqual(['legacy_demo_rejection']);
+  });
+
   it('preserves Demo until the current market and a real owned ASIN have verified MCP coverage', () => {
     database = openDatabase(':memory:');
     seedDemoData(database);
@@ -87,10 +191,552 @@ describe('GoLiveMigrationService', () => {
     ) VALUES ('unrelated-market', 'Unrelated market', 1, 'US', 'active', 'import', '2026-09-19')`).run();
     database.prepare(`UPDATE products SET market_node_id = 'unrelated-market' WHERE id = 'verified-owned'`).run();
     expect(service.verify()).toMatchObject({ readyForDemoCleanup: false });
+    database.prepare(`UPDATE market_nodes SET source_type = 'import', status = 'active'
+      WHERE id = 'mkt-cervical'`).run();
     database.prepare(`UPDATE products SET market_node_id = 'mkt-cervical' WHERE id = 'verified-owned'`).run();
-    expect(service.verify()).toMatchObject({ readyForDemoCleanup: true });
+    expect(service.verify()).toMatchObject({ readyForDemoCleanup: false });
     database.prepare(`UPDATE market_nodes SET category_id = 'unverified-path' WHERE id = 'mkt-memory-foam'`).run();
     expect(service.verify()).toMatchObject({ readyForDemoCleanup: false });
+  });
+
+  it('invalidates a complete run when an owned SKU market node is Mock, cross-site, or out of scope', () => {
+    database = openDatabase(':memory:');
+    insertObservationFixture(database, 'mcp', 'mcp');
+    addVerifiedMcpCoverage(database, 'market-us', 'owned-product');
+    const service = new GoLiveMigrationService(database);
+    expect(service.verify().sellerSpriteCriticalRunId).toEqual(expect.any(String));
+
+    database.prepare(`UPDATE market_nodes SET source_type = 'mock' WHERE id = 'market-us'`).run();
+    expect(service.verify().sellerSpriteCriticalRunId).toBeNull();
+    database.prepare(`UPDATE market_nodes SET source_type = 'mcp' WHERE id = 'market-us'`).run();
+
+    database.prepare(`INSERT INTO market_nodes (
+      id, name, level, marketplace, status, source_type, created_at
+    ) VALUES ('outside-us', 'Outside', 1, 'US', 'active', 'import', '2026-09-20')`).run();
+    database.prepare(`UPDATE products SET market_node_id = 'outside-us' WHERE id = 'owned-product'`).run();
+    expect(service.verify()).toMatchObject({ sellerSpriteCriticalRunId: null, readyForDemoCleanup: false });
+
+    database.prepare(`INSERT INTO market_nodes (
+      id, name, level, marketplace, status, source_type, created_at
+    ) VALUES ('outside-uk', 'Outside UK', 1, 'UK', 'active', 'import', '2026-09-20')`).run();
+    database.prepare(`UPDATE products SET market_node_id = 'outside-uk' WHERE id = 'owned-product'`).run();
+    expect(service.verify()).toMatchObject({ sellerSpriteCriticalRunId: null, readyForDemoCleanup: false });
+  });
+
+  it('requires the latest SellerSprite capability catalog to be fresh', () => {
+    database = openDatabase(':memory:');
+    insertObservationFixture(database, 'mcp', 'mcp');
+    addVerifiedMcpCoverage(database, 'market-us', 'owned-product');
+    const service = new GoLiveMigrationService(database);
+    expect(service.verify()).toMatchObject({
+      sellerSpriteCapabilitiesAvailable: true,
+      readyForDemoCleanup: true,
+    });
+
+    database.prepare(`UPDATE provider_capability_snapshots
+      SET collected_at = datetime('now', '-25 hours') WHERE provider_id = 'sellersprite'`).run();
+
+    expect(service.verify()).toMatchObject({
+      sellerSpriteCapabilitiesAvailable: false,
+      readyForDemoCleanup: false,
+      hasMinimumRealCoverage: false,
+    });
+  });
+
+  it('requires tool discovery and its capability snapshot from the same critical run', () => {
+    database = openDatabase(':memory:');
+    insertObservationFixture(database, 'mcp', 'mcp');
+    addVerifiedMcpCoverage(database, 'market-us', 'owned-product');
+    const service = new GoLiveMigrationService(database);
+    expect(service.verify().sellerSpriteCriticalRunId).toEqual(expect.any(String));
+
+    database.prepare(`UPDATE provider_capability_snapshots SET sync_run_id = NULL
+      WHERE provider_id = 'sellersprite'`).run();
+    expect(service.verify()).toMatchObject({
+      sellerSpriteCriticalRunId: null,
+      readyForDemoCleanup: false,
+    });
+
+    const run = database.prepare(`SELECT id FROM data_tasks WHERE task_type = 'critical_sync'
+      ORDER BY created_at DESC LIMIT 1`).get() as { id: string };
+    database.prepare(`UPDATE provider_capability_snapshots SET sync_run_id = ?
+      WHERE provider_id = 'sellersprite'`).run(run.id);
+    database.prepare(`DELETE FROM mcp_call_logs WHERE sync_run_id = ?
+      AND capability = 'LIST_TOOLS'`).run(run.id);
+    expect(service.verify()).toMatchObject({
+      sellerSpriteCriticalRunId: null,
+      readyForDemoCleanup: false,
+    });
+  });
+
+  it('requires linked non-Demo workflow Evidence for the market and each owned SKU', () => {
+    database = openDatabase(':memory:');
+    insertObservationFixture(database, 'mcp', 'mcp');
+    addVerifiedMcpCoverage(database, 'market-us', 'owned-product');
+    const service = new GoLiveMigrationService(database);
+    expect(service.verify()).toMatchObject({
+      readyForDemoCleanup: true,
+      verifiedEvidenceEntities: 2,
+      requiredEvidenceEntities: 2,
+    });
+    database.prepare(`UPDATE research_jobs SET entity_type = 'product'
+      WHERE entity_type = 'owned_product'`).run();
+    expect(service.verify()).toMatchObject({
+      readyForDemoCleanup: true,
+      verifiedEvidenceEntities: 2,
+      requiredEvidenceEntities: 2,
+    });
+
+    const evidence = database.prepare(`
+      SELECT evidence.id, evidence.source_record_id AS sourceRecordId,
+        job.entity_type AS entityType
+      FROM evidence_records evidence
+      JOIN research_jobs job ON job.id = evidence.research_job_id
+      WHERE evidence.sync_run_id IS NOT NULL
+      ORDER BY job.entity_type
+    `).all() as Array<{ id: string; sourceRecordId: string; entityType: string }>;
+    const market = evidence.find((item) => item.entityType === 'market_node')!;
+    const owned = evidence.find((item) => item.entityType === 'product')!;
+    database.prepare(`DELETE FROM evidence_records WHERE id = ?`).run(market.id);
+    expect(service.verify()).toMatchObject({
+      sellerSpriteCriticalRunId: null,
+      readyForDemoCleanup: false,
+      verifiedEvidenceEntities: 1,
+      requiredEvidenceEntities: 2,
+    });
+
+    database.prepare(`UPDATE evidence_records SET source_record_id = ? WHERE id = ?`)
+      .run(market.sourceRecordId, owned.id);
+    expect(service.verify()).toMatchObject({ sellerSpriteCriticalRunId: null, readyForDemoCleanup: false });
+  });
+
+  it('does not certify Demo or mismatched-run Evidence as current critical proof', () => {
+    database = openDatabase(':memory:');
+    insertObservationFixture(database, 'mcp', 'mcp');
+    addVerifiedMcpCoverage(database, 'market-us', 'owned-product');
+    const service = new GoLiveMigrationService(database);
+    expect(service.verify().readyForDemoCleanup).toBe(true);
+
+    database.prepare(`UPDATE research_jobs SET is_demo = 1
+      WHERE entity_type = 'owned_product'`).run();
+    expect(service.verify().sellerSpriteCriticalRunId).toBeNull();
+    database.prepare(`UPDATE research_jobs SET is_demo = 0
+      WHERE entity_type = 'owned_product'`).run();
+    database.prepare(`UPDATE evidence_records SET sync_run_id = NULL
+      WHERE research_job_id IN (SELECT id FROM research_jobs WHERE entity_type = 'owned_product')`).run();
+    expect(service.verify().sellerSpriteCriticalRunId).toBeNull();
+  });
+
+  it('rejects an Insight that mixes MCP Evidence from another run into the candidate run', () => {
+    database = openDatabase(':memory:');
+    insertObservationFixture(database, 'mcp', 'mcp');
+    addVerifiedMcpCoverage(database, 'market-us', 'owned-product');
+    const service = new GoLiveMigrationService(database);
+    expect(service.verify()).toMatchObject({
+      readyForDemoCleanup: true,
+      verifiedEvidenceEntities: 2,
+      requiredEvidenceEntities: 2,
+    });
+    const job = database.prepare(`
+      SELECT job.id, job.data_version AS dataVersion, insight.id AS insightId,
+        insight.evidence_ids_json AS evidenceIdsJson
+      FROM research_jobs job
+      JOIN ai_insights insight ON insight.research_job_id = job.id
+      WHERE job.entity_id = 'owned-product' AND job.status = 'monitoring'
+      LIMIT 1
+    `).get() as { id: string; dataVersion: string; insightId: string; evidenceIdsJson: string };
+    const otherRunId = '123e4567-e89b-42d3-a456-426614174099';
+    const now = new Date().toISOString();
+    database.prepare(`INSERT INTO data_tasks (
+      id, sync_run_id, name, source_id, task_type, target, source, marketplace,
+      status, started_at, completed_at, total, success, failed, created_at
+    ) VALUES (?, ?, 'Other complete critical run', 'source-sellersprite-mcp',
+      'critical_sync', 'other-market', 'SellerSprite MCP', 'US', 'success',
+      ?, ?, 1, 1, 0, ?)`)
+      .run(otherRunId, otherRunId, now, now, now);
+    database.prepare(`INSERT INTO data_coverage_runs (
+      id, marketplace, run_type, coverage_json, is_complete, created_at
+    ) VALUES (?, 'US', 'critical_sync', '{}', 1, ?)`)
+      .run(otherRunId, now);
+    database.prepare(`INSERT INTO product_snapshots (
+      id, product_id, date, estimated_sales, source, source_type, collected_at,
+      period, is_estimated, confidence, observation_date, dedup_key, sync_run_id
+    ) VALUES ('other-run-owned-snapshot', 'owned-product', '2026-08-31', 9,
+      'SellerSprite MCP', 'mcp', ?, '1M', 1, 0.8, '2026-08-31',
+      'other-run-owned-snapshot', ?)`)
+      .run(now, otherRunId);
+    database.prepare(`INSERT INTO mcp_sync_observation_links (
+      sync_run_id, snapshot_kind, snapshot_id, entity_id, disposition
+    ) VALUES (?, 'product', 'other-run-owned-snapshot', 'owned-product', 'inserted')`)
+      .run(otherRunId);
+    const crossRunEvidenceId = 'cross-run-owned-evidence';
+    database.prepare(`INSERT INTO evidence_records (
+      id, research_job_id, insight_id, claim, metric_name, metric_value_json,
+      source, source_type, source_record_id, collected_at, period, is_estimated,
+      calculation, confidence, data_version, created_at, sync_run_id
+    ) VALUES (?, ?, ?, 'Cross-run measured observation', 'estimated_sales', '9',
+      'SellerSprite MCP', 'mcp', 'other-run-owned-snapshot', ?, '1M', 1,
+      'provider observation', 0.8, ?, ?, ?)`)
+      .run(crossRunEvidenceId, job.id, job.insightId, now, job.dataVersion, now, otherRunId);
+    const evidenceIds = JSON.parse(job.evidenceIdsJson) as string[];
+    database.prepare(`UPDATE ai_insights SET evidence_ids_json = ? WHERE id = ?`)
+      .run(JSON.stringify([...evidenceIds, crossRunEvidenceId]), job.insightId);
+
+    expect(service.verify()).toMatchObject({
+      sellerSpriteCriticalRunId: null,
+      readyForDemoCleanup: false,
+      verifiedEvidenceEntities: 1,
+      requiredEvidenceEntities: 2,
+    });
+  });
+
+  it('rejects orphan Evidence from an unfinished or failed workflow', () => {
+    database = openDatabase(':memory:');
+    insertObservationFixture(database, 'mcp', 'mcp');
+    addVerifiedMcpCoverage(database, 'market-us', 'owned-product');
+    const service = new GoLiveMigrationService(database);
+    expect(service.verify().readyForDemoCleanup).toBe(true);
+
+    database.prepare(`UPDATE research_jobs SET status = 'failed'
+      WHERE entity_id = 'owned-product'`).run();
+    expect(service.verify()).toMatchObject({
+      sellerSpriteCriticalRunId: null,
+      readyForDemoCleanup: false,
+      verifiedEvidenceEntities: 1,
+    });
+
+    database.prepare(`UPDATE research_jobs SET status = 'monitoring'
+      WHERE entity_id = 'owned-product'`).run();
+    database.prepare(`DELETE FROM research_steps WHERE research_job_id = (
+      SELECT id FROM research_jobs WHERE entity_id = 'owned-product' LIMIT 1
+    ) AND step_type = 'report'`).run();
+    expect(service.verify()).toMatchObject({
+      sellerSpriteCriticalRunId: null,
+      readyForDemoCleanup: false,
+      verifiedEvidenceEntities: 1,
+    });
+  });
+
+  it('reconciles claimed candidate counts with candidate links from the same run', () => {
+    database = openDatabase(':memory:');
+    insertObservationFixture(database, 'mcp', 'mcp');
+    addVerifiedMcpCoverage(database, 'market-us', 'owned-product');
+    const service = new GoLiveMigrationService(database);
+    expect(service.verify().readyForDemoCleanup).toBe(true);
+    const run = database.prepare(`SELECT id, coverage_json AS coverageJson
+      FROM data_coverage_runs WHERE run_type = 'critical_sync'`).get() as {
+      id: string; coverageJson: string;
+    };
+    const coverage = JSON.parse(run.coverageJson) as Record<string, Record<string, unknown>>;
+    const candidate = coverage.candidateDiscovery!;
+    candidate.candidates = 1;
+    candidate.covered = (candidate.covered as Array<Record<string, unknown>>)
+      .map((item) => ({ ...item, candidates: 1 }));
+    database.prepare(`UPDATE data_coverage_runs SET coverage_json = ? WHERE id = ?`)
+      .run(JSON.stringify(coverage), run.id);
+
+    expect(service.verify()).toMatchObject({
+      sellerSpriteCriticalRunId: null,
+      readyForDemoCleanup: false,
+    });
+  });
+
+  it('does not splice independent successful calls and snapshots into Go Live proof', () => {
+    database = openDatabase(':memory:');
+    insertObservationFixture(database, 'mcp', 'mcp');
+    addVerifiedMcpCoverage(database, 'market-us', 'owned-product');
+    const service = new GoLiveMigrationService(database);
+    expect(service.verify().readyForDemoCleanup).toBe(true);
+
+    database.prepare(`UPDATE mcp_call_logs SET sync_run_id = NULL
+      WHERE provider_id = 'sellersprite'`).run();
+
+    expect(service.verify()).toMatchObject({
+      readyForDemoCleanup: false, hasMinimumRealCoverage: false,
+      sellerSpriteCriticalRunId: null,
+    });
+    expect(() => service.activateLiveMode()).toThrow(/真实数据覆盖/);
+  });
+
+  it('does not splice a fact from another run into critical coverage', () => {
+    database = openDatabase(':memory:');
+    insertObservationFixture(database, 'mcp', 'mcp');
+    addVerifiedMcpCoverage(database, 'market-us', 'owned-product');
+    const service = new GoLiveMigrationService(database);
+    const run = database.prepare(`
+      SELECT id FROM data_coverage_runs WHERE run_type = 'critical_sync' AND is_complete = 1
+      ORDER BY created_at DESC LIMIT 1
+    `).get() as { id: string };
+    const fact = database.prepare(`
+      SELECT id FROM metric_facts WHERE sync_run_id = ? AND entity_type = 'product' LIMIT 1
+    `).get(run.id) as { id: string };
+    database.prepare(`UPDATE metric_facts SET sync_run_id = NULL WHERE id = ?`).run(fact.id);
+
+    expect(service.verify()).toMatchObject({
+      sellerSpriteCriticalRunId: null,
+      readyForDemoCleanup: false,
+      hasMinimumRealCoverage: false,
+    });
+  });
+
+  it('requires the run, completed task, and call ledger to be within 24 hours', () => {
+    database = openDatabase(':memory:');
+    insertObservationFixture(database, 'mcp', 'mcp');
+    addVerifiedMcpCoverage(database, 'market-us', 'owned-product');
+    const service = new GoLiveMigrationService(database);
+    const run = database.prepare(`
+      SELECT id FROM data_coverage_runs WHERE run_type = 'critical_sync' AND is_complete = 1
+      ORDER BY created_at DESC LIMIT 1
+    `).get() as { id: string };
+    expect(service.verify().sellerSpriteCriticalRunId).toBe(run.id);
+
+    database.prepare(`
+      UPDATE data_coverage_runs SET created_at = datetime('now', '-25 hours') WHERE id = ?
+    `).run(run.id);
+
+    expect(service.verify()).toMatchObject({
+      sellerSpriteConnectionVerified: true,
+      sellerSpriteCriticalRunId: null,
+      readyForDemoCleanup: false,
+      hasMinimumRealCoverage: false,
+    });
+    database.prepare(`
+      UPDATE data_coverage_runs SET created_at = datetime('now') WHERE id = ?
+    `).run(run.id);
+    database.prepare(`
+      UPDATE data_tasks SET completed_at = datetime('now', '-25 hours') WHERE id = ?
+    `).run(run.id);
+
+    expect(service.verify()).toMatchObject({
+      sellerSpriteConnectionVerified: true,
+      sellerSpriteCriticalRunId: null,
+      readyForDemoCleanup: false,
+      hasMinimumRealCoverage: false,
+    });
+    database.prepare(`
+      UPDATE data_tasks SET completed_at = datetime('now') WHERE id = ?
+    `).run(run.id);
+    expect(service.verify().sellerSpriteCriticalRunId).toBe(run.id);
+    database.prepare(`
+      UPDATE mcp_call_logs SET started_at = datetime('now', '-25 hours')
+      WHERE sync_run_id = ? AND capability = 'ASIN_SALES_TREND'
+    `).run(run.id);
+    expect(service.verify()).toMatchObject({
+      sellerSpriteConnectionVerified: true,
+      sellerSpriteCriticalRunId: null,
+      readyForDemoCleanup: false,
+      hasMinimumRealCoverage: false,
+    });
+    database.prepare(`
+      UPDATE mcp_call_logs SET started_at = datetime('now'), completed_at = datetime('now', '-25 hours')
+      WHERE sync_run_id = ? AND capability = 'ASIN_SALES_TREND'
+    `).run(run.id);
+    expect(service.verify().sellerSpriteCriticalRunId).toBeNull();
+  });
+
+  it('accepts historical monthly observations revalidated by a recent uncached critical run', () => {
+    database = openDatabase(':memory:');
+    insertObservationFixture(database, 'mcp', 'mcp');
+    addVerifiedMcpCoverage(database, 'market-us', 'owned-product', '2026-09-18T00:00:00.000Z');
+    const service = new GoLiveMigrationService(database);
+    const run = database.prepare(`
+      SELECT id FROM data_coverage_runs WHERE run_type = 'critical_sync' AND is_complete = 1
+      ORDER BY created_at DESC LIMIT 1
+    `).get() as { id: string };
+    expect(service.verify().sellerSpriteCriticalRunId).toBe(run.id);
+
+    expect(service.verify()).toMatchObject({
+      realOwnedProductSnapshots: 1,
+      sellerSpriteCriticalRunId: run.id,
+      readyForDemoCleanup: true,
+      hasMinimumRealCoverage: true,
+    });
+    expect(database.prepare(`SELECT collected_at FROM product_snapshots
+      WHERE sync_run_id = ?`).get(run.id)).toEqual({ collected_at: '2026-09-18T00:00:00.000Z' });
+  });
+
+  it('does not certify cached calls as a fresh critical acquisition', () => {
+    database = openDatabase(':memory:');
+    insertObservationFixture(database, 'mcp', 'mcp');
+    addVerifiedMcpCoverage(database, 'market-us', 'owned-product');
+    const service = new GoLiveMigrationService(database);
+    const run = database.prepare(`
+      SELECT id FROM data_coverage_runs WHERE run_type = 'critical_sync' AND is_complete = 1
+      ORDER BY created_at DESC LIMIT 1
+    `).get() as { id: string };
+    expect(service.verify().sellerSpriteCriticalRunId).toBe(run.id);
+
+    database.prepare(`
+      INSERT INTO mcp_call_logs (
+        id, provider_id, capability, request_hash, status, cache_hit,
+        entity_type, entity_id, result_count, started_at, sync_run_id
+      ) VALUES ('cached-associated-call', 'sellersprite', 'MARKET_RESEARCH',
+        'cached-associated-call', 'success', 1, 'market', '1055398:1063252', 1, ?, ?)
+    `).run(new Date().toISOString(), run.id);
+
+    expect(service.verify()).toMatchObject({
+      sellerSpriteCriticalRunId: null,
+      readyForDemoCleanup: false,
+      hasMinimumRealCoverage: false,
+    });
+  });
+
+  it('requires both secondary coverage summaries to match completed child tasks', () => {
+    database = openDatabase(':memory:');
+    insertObservationFixture(database, 'mcp', 'mcp');
+    addVerifiedMcpCoverage(database, 'market-us', 'owned-product');
+    const service = new GoLiveMigrationService(database);
+    const run = database.prepare(`
+      SELECT id, coverage_json AS coverageJson FROM data_coverage_runs
+      WHERE run_type = 'critical_sync' AND is_complete = 1
+      ORDER BY created_at DESC LIMIT 1
+    `).get() as { id: string; coverageJson: string };
+    const coverage = JSON.parse(run.coverageJson) as Record<string, unknown>;
+    expect(service.verify().sellerSpriteCriticalRunId).toBe(run.id);
+
+    delete coverage.candidateDiscovery;
+    database.prepare(`UPDATE data_coverage_runs SET coverage_json = ? WHERE id = ?`)
+      .run(JSON.stringify(coverage), run.id);
+    expect(service.verify().sellerSpriteCriticalRunId).toBeNull();
+
+    const child = database.prepare(`
+      SELECT id, status, total, success, failed FROM data_tasks
+      WHERE sync_run_id = ? AND task_type = 'competitor_discovery'
+    `).get(run.id) as { id: string; status: string; total: number; success: number; failed: number };
+    coverage.candidateDiscovery = {
+      taskId: child.id,
+      status: child.status,
+      total: child.total + 1,
+      success: child.success + 1,
+      failed: child.failed,
+    };
+    database.prepare(`UPDATE data_coverage_runs SET coverage_json = ? WHERE id = ?`)
+      .run(JSON.stringify(coverage), run.id);
+    expect(service.verify().sellerSpriteCriticalRunId).toBeNull();
+  });
+
+  it('rejects a fully failed direct-competitor batch when it omits current competitors', () => {
+    database = openDatabase(':memory:');
+    insertObservationFixture(database, 'mcp', 'mcp');
+    database.exec(`
+      INSERT INTO products (
+        id, asin, sku, brand, title, image_url, marketplace, product_type,
+        is_owned, market_node_id, source_type, created_at
+      ) VALUES
+        ('direct-one', 'B0DIRECT01', 'DIRECT-1', 'Brand', 'Direct one', '',
+          'US', 'pillow', 0, 'market-us', 'import', '2026-09-19'),
+        ('direct-two', 'B0DIRECT02', 'DIRECT-2', 'Brand', 'Direct two', '',
+          'US', 'pillow', 0, 'market-us', 'import', '2026-09-19');
+      INSERT INTO competitor_relations (
+        id, owned_product_id, competitor_product_id, relation_type,
+        similarity_score, reason, ai_tags_json
+      ) VALUES
+        ('direct-relation-one', 'owned-product', 'direct-one', 'direct', 90, 'confirmed', '[]'),
+        ('direct-relation-two', 'owned-product', 'direct-two', 'direct', 85, 'confirmed', '[]');
+    `);
+    addVerifiedMcpCoverage(database, 'market-us', 'owned-product');
+    const service = new GoLiveMigrationService(database);
+    const run = database.prepare(`
+      SELECT id, coverage_json AS coverageJson FROM data_coverage_runs
+      WHERE run_type = 'critical_sync' AND is_complete = 1
+      ORDER BY created_at DESC LIMIT 1
+    `).get() as { id: string; coverageJson: string };
+    const coverage = JSON.parse(run.coverageJson) as Record<string, Record<string, unknown>>;
+    const taskId = coverage.secondaryCompetitors!.taskId as string;
+    database.prepare(`
+      UPDATE data_tasks SET status = 'failed', total = 2, success = 0, failed = 2
+      WHERE id = ? AND sync_run_id = ?
+    `).run(taskId, run.id);
+    coverage.secondaryCompetitors = {
+      taskId, status: 'failed', total: 2, success: 0, failed: 2,
+      roster: [
+        { id: 'direct-one', asin: 'B0DIRECT01' },
+        { id: 'direct-two', asin: 'B0DIRECT02' },
+      ],
+    };
+    database.prepare(`UPDATE data_coverage_runs SET coverage_json = ? WHERE id = ?`)
+      .run(JSON.stringify(coverage), run.id);
+
+    expect(service.verify()).toMatchObject({
+      sellerSpriteCriticalRunId: null,
+      readyForDemoCleanup: false,
+      hasMinimumRealCoverage: false,
+    });
+  });
+
+  it('rejects an old run after the direct competitor roster changes', () => {
+    database = openDatabase(':memory:');
+    insertObservationFixture(database, 'mcp', 'mcp');
+    addVerifiedMcpCoverage(database, 'market-us', 'owned-product');
+    const service = new GoLiveMigrationService(database);
+    expect(service.verify().readyForDemoCleanup).toBe(true);
+
+    database.exec(`
+      INSERT INTO products (
+        id, asin, sku, brand, title, image_url, marketplace, product_type,
+        is_owned, market_node_id, source_type, created_at
+      ) VALUES (
+        'new-direct', 'B0DIRECT01', 'DIRECT-1', 'Brand', 'New direct competitor', '',
+        'US', 'pillow', 0, 'market-us', 'import', '2026-09-19'
+      );
+      INSERT INTO competitor_relations (
+        id, owned_product_id, competitor_product_id, relation_type,
+        similarity_score, reason, ai_tags_json
+      ) VALUES (
+        'new-direct-relation', 'owned-product', 'new-direct', 'direct', 90,
+        'confirmed after sync', '[]'
+      );
+    `);
+
+    expect(service.verify()).toMatchObject({
+      sellerSpriteCriticalRunId: null,
+      readyForDemoCleanup: false,
+      hasMinimumRealCoverage: false,
+    });
+  });
+
+  it('requires concentration and every current real owned ASIN in the same complete run', () => {
+    database = openDatabase(':memory:');
+    insertObservationFixture(database, 'mcp', 'mcp');
+    addVerifiedMcpCoverage(database, 'market-us', 'owned-product');
+    const service = new GoLiveMigrationService(database);
+    expect(service.verify().readyForDemoCleanup).toBe(true);
+
+    database.prepare(`UPDATE mcp_call_logs SET status = 'failed'
+      WHERE capability = 'PRODUCT_CONCENTRATION'`).run();
+    expect(service.verify().readyForDemoCleanup).toBe(false);
+    database.prepare(`UPDATE mcp_call_logs SET status = 'success'
+      WHERE capability = 'PRODUCT_CONCENTRATION'`).run();
+    database.prepare(`
+      INSERT INTO products (id, asin, sku, brand, title, image_url, marketplace,
+        product_type, is_owned, market_node_id, source_type, created_at)
+      VALUES ('added-owned', 'B0LIVE0002', 'LIVE-2', 'Brand', 'New title', '', 'US',
+        'pillow', 1, 'market-us', 'import', '2026-09-19')
+    `).run();
+    expect(service.verify().readyForDemoCleanup).toBe(false);
+  });
+
+  it('accepts one complete roster across multiple nodes inside the main-market tree', () => {
+    database = openDatabase(':memory:');
+    insertObservationFixture(database, 'mcp', 'mcp');
+    database.exec(`
+      INSERT INTO market_nodes (
+        id, name, parent_id, level, marketplace, status, source_type, created_at
+      ) VALUES ('secondary-node', 'Secondary owned category', 'market-us', 2, 'US', 'active', 'import',
+        '2026-09-19T00:00:00.000Z');
+      INSERT INTO products (
+        id, asin, sku, brand, title, image_url, marketplace, product_type, is_owned,
+        market_node_id, source_type, created_at
+      ) VALUES ('second-owned', 'B0LIVE0002', 'LIVE-2', 'Brand', 'Second owned', '',
+        'US', 'pillow', 1, 'secondary-node', 'import', '2026-09-19T00:00:00.000Z');
+    `);
+
+    addVerifiedMcpCoverage(database, 'market-us', 'owned-product');
+
+    expect(new GoLiveMigrationService(database).verify()).toMatchObject({
+      readyForDemoCleanup: true,
+      sellerSpriteCriticalRunId: expect.any(String),
+    });
   });
 
   it('requires verified coverage before clearing observations and rejects Live with active mock masters', async () => {
@@ -110,6 +756,28 @@ describe('GoLiveMigrationService', () => {
     const backupPath = join(temporaryDirectory, 'backup.db');
     await service.backup(backupPath);
     expect(existsSync(backupPath)).toBe(true);
+  });
+
+  it('blocks Live and Demo cleanup when Mock metric facts remain without deleting them', () => {
+    database = openDatabase(':memory:');
+    insertObservationFixture(database, 'mcp', 'mcp');
+    addVerifiedMcpCoverage(database, 'market-us', 'owned-product');
+    database.prepare(`
+      INSERT INTO metric_facts (
+        id, entity_type, entity_id, marketplace, metric_name, numeric_value,
+        source, source_id, source_type, is_estimated, confidence, observation_date,
+        collected_at, dedup_key
+      ) VALUES ('mock-fact', 'product', 'owned-product', 'US', 'estimated_sales', 99,
+        'Mock Adapter', 'source-mock', 'mock', 1, 0.5, '2026-09-19', ?, 'mock-fact')
+    `).run(new Date().toISOString());
+    const service = new GoLiveMigrationService(database);
+
+    expect(service.verify()).toMatchObject({ mockObservations: 1, hasMinimumRealCoverage: false });
+    expect(service.preview().blockers).toContain('unregistered Mock metric facts: 1');
+    expect(() => service.activateLiveMode()).toThrow(/Mock/);
+    expect(() => service.clearDemoObservations()).toThrow(/禁止清理/);
+    expect(database.prepare(`SELECT id FROM metric_facts WHERE id = 'mock-fact'`).get())
+      .toEqual({ id: 'mock-fact' });
   });
 
   it('activates only when market and active owned-product coverage are real', () => {
@@ -166,7 +834,12 @@ describe('GoLiveMigrationService', () => {
       WHERE id = 'source-sellersprite-mcp'
     `).run(new Date().toISOString());
     expect(service.verify()).toMatchObject({
+      sellerSpriteConnectionVerified: true, hasMinimumRealCoverage: false,
+    });
+    addVerifiedMcpCoverage(database, 'market-us', 'owned-product');
+    expect(service.verify()).toMatchObject({
       sellerSpriteConnectionVerified: true, hasMinimumRealCoverage: true,
+      sellerSpriteCriticalRunId: expect.any(String),
     });
     database.prepare(`UPDATE data_sources SET status = 'disconnected'
       WHERE id = 'source-sellersprite-mcp'`).run();
@@ -185,6 +858,49 @@ describe('GoLiveMigrationService', () => {
     `).run(new Date().toISOString());
     expect(service.verify()).toMatchObject({ hasMinimumRealCoverage: true });
     service.activateLiveMode();
+    expect(database.prepare('SELECT mode FROM app_settings WHERE id = 1').get()).toEqual({ mode: 'live' });
+  });
+
+  it('holds the write lock from verification through Live activation', () => {
+    temporaryDirectory = mkdtempSync(join(tmpdir(), 'go-live-atomic-'));
+    const databasePath = join(temporaryDirectory, 'atomic.db');
+    database = openDatabase(databasePath);
+    insertObservationFixture(database, 'mcp', 'mcp');
+    addVerifiedMcpCoverage(database, 'market-us', 'owned-product');
+    const competingDatabase = openDatabase(databasePath);
+    competingDatabase.exec('PRAGMA busy_timeout = 0');
+    let competingWriteBlocked = false;
+    const guardedDatabase = new Proxy(database, {
+      get(target, property) {
+        if (property === 'prepare') {
+          return (sql: string) => {
+            if (/UPDATE app_settings SET mode = 'live'/u.test(sql)) {
+              try {
+                competingDatabase.prepare(`
+                  UPDATE data_sources SET status = 'disconnected'
+                  WHERE id = 'source-sellersprite-mcp'
+                `).run();
+              } catch (error) {
+                competingWriteBlocked = error instanceof Error && /locked|busy/u.test(error.message);
+              }
+            }
+            return target.prepare(sql);
+          };
+        }
+        const value = Reflect.get(target, property, target) as unknown;
+        return typeof value === 'function' ? value.bind(target) : value;
+      },
+    }) as AppDatabase;
+
+    try {
+      new GoLiveMigrationService(guardedDatabase).activateLiveMode();
+    } finally {
+      competingDatabase.close();
+    }
+
+    expect(competingWriteBlocked).toBe(true);
+    expect(database.prepare(`SELECT status FROM data_sources
+      WHERE id = 'source-sellersprite-mcp'`).get()).toEqual({ status: 'connected' });
     expect(database.prepare('SELECT mode FROM app_settings WHERE id = 1').get()).toEqual({ mode: 'live' });
   });
 

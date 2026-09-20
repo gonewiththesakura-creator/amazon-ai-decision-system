@@ -23,6 +23,7 @@ import { calculateRelativePerformance, detectProductAnomalies, percentileRank } 
 import type { AppDatabase } from '../database/database.js';
 import { deriveSnapshotGrowth, type SnapshotGrowthPair } from '../domain/snapshot-growth.js';
 import { MetricAuthorityResolver, type MetricFact } from '../services/metric-authority-resolver.js';
+import { isLiveObservationReadable } from '../services/live-observation-readability.js';
 
 type DbPrimitive = string | number | bigint | null;
 type DbRow = Record<string, DbPrimitive>;
@@ -265,15 +266,20 @@ export class IntelligenceRepository {
   }
 
   getProductSnapshots(productId: string): ProductSnapshot[] {
+    const live = this.getSettings().mode === 'live';
     const rows = this.database.prepare(`
       SELECT * FROM product_snapshots WHERE product_id = ?
       ORDER BY observation_date, collected_at, id
     `).all(productId) as DbRow[];
+    const readableRows = live ? rows.filter((row) => isLiveObservationReadable(
+      this.database, 'product', stringValue(row.id), stringValue(row.source_type),
+      row.sync_run_id === null ? null : stringValue(row.sync_run_id),
+    )) : rows;
     const product = this.database.prepare('SELECT is_owned FROM products WHERE id = ?')
       .get(productId) as DbRow | undefined;
     const entityType = product && !booleanValue(product.is_owned) ? 'competitor' : 'product';
     const selectedRows = this.authoritativeSnapshotRows(
-      rows, entityType, productId, PRODUCT_METRICS, 'estimated_sales',
+      readableRows, entityType, productId, PRODUCT_METRICS, 'estimated_sales',
     );
     return selectedRows.map((row, index) => {
       const growth = deriveSnapshotGrowth(selectedRows.slice(0, index + 1).map((snapshot) => ({
@@ -340,6 +346,7 @@ export class IntelligenceRepository {
         WHERE latest.marketplace = ? AND latest.entity_id = ?
           AND latest.entity_type IN (${entityPlaceholders})
           AND latest.job_type IN (${jobPlaceholders})
+          AND (? = 0 OR latest.is_demo = 0)
         ORDER BY latest.updated_at DESC, latest.created_at DESC, latest.id DESC
         LIMIT 1
       )
@@ -367,6 +374,7 @@ export class IntelligenceRepository {
       entityId,
       ...mapping.entityTypes,
       ...mapping.jobTypes,
+      this.getSettings().mode === 'live' ? 1 : 0,
     ) as DbRow[];
 
     for (const row of rows) {
@@ -539,11 +547,16 @@ export class IntelligenceRepository {
   }
 
   private getMarketSnapshotRows(id: string): DbRow[] {
+    const live = this.getSettings().mode === 'live';
     const rows = this.database.prepare(`
       SELECT * FROM market_snapshots WHERE market_node_id = ?
       ORDER BY observation_date, collected_at, id
     `).all(id) as DbRow[];
-    return this.authoritativeSnapshotRows(rows, 'market', id, MARKET_METRICS, 'monthly_sales');
+    const readableRows = live ? rows.filter((row) => isLiveObservationReadable(
+      this.database, 'market', stringValue(row.id), stringValue(row.source_type),
+      row.sync_run_id === null ? null : stringValue(row.sync_run_id),
+    )) : rows;
+    return this.authoritativeSnapshotRows(readableRows, 'market', id, MARKET_METRICS, 'monthly_sales');
   }
 
   private authoritativeSnapshotRows(
@@ -558,11 +571,14 @@ export class IntelligenceRepository {
       byDate.set(date, candidates);
     }
     const authority = new MetricAuthorityResolver(this.database);
+    const live = this.getSettings().mode === 'live';
     return [...byDate.entries()].map(([date, candidates]) => {
       const resolve = (metric: string): MetricFact | null => {
-        const selected = authority.resolveMetric({
+        const resolution = authority.resolveMetric({
           entityType, entityId, metric, observationDate: date,
-        }).selected;
+        });
+        const selected = [resolution.selected, ...resolution.alternatives]
+          .find((fact) => fact && (!live || fact.sourceType !== 'mock')) ?? null;
         if (entityType !== 'competitor'
           || (selected?.sourceRecordType === 'metric_fact' && selected.sourceType === 'mcp'
             && selected.sourceId === 'source-sellersprite-mcp')) return selected;
@@ -642,8 +658,11 @@ export class IntelligenceRepository {
 
   private mapProduct(row: DbRow): Product {
     const productId = stringValue(row.id);
-    const latest = this.getProductSnapshots(productId).at(-1)
-      ?? this.mapJoinedSnapshot(row, productId);
+    const snapshots = this.getProductSnapshots(productId);
+    const latest = snapshots.at(-1)
+      ?? (this.getSettings().mode === 'live'
+        ? this.emptyProductSnapshot(productId)
+        : this.mapJoinedSnapshot(row, productId));
     return {
       id: productId,
       asin: stringValue(row.asin),
@@ -700,7 +719,8 @@ export class IntelligenceRepository {
   }
 
   private mapJoinedSnapshot(row: DbRow, productId: string): ProductSnapshot {
-    if (row.snapshot_id === null || row.snapshot_id === undefined) {
+    if (row.snapshot_id === null || row.snapshot_id === undefined
+      || (this.getSettings().mode === 'live' && row.snapshot_source_type === 'mock')) {
       const provenance: Provenance = {
         source: '尚未导入数据', sourceType: 'import', collectedAt: '', period: '30D',
         isEstimated: true, confidence: 0,
@@ -736,6 +756,19 @@ export class IntelligenceRepository {
         isEstimated: booleanValue(row.snapshot_is_estimated),
         confidence: numberValue(row.snapshot_confidence),
       },
+    };
+  }
+
+  private emptyProductSnapshot(productId: string): ProductSnapshot {
+    const provenance: Provenance = {
+      source: '尚未导入数据', sourceType: 'import', collectedAt: '', period: '30D',
+      isEstimated: true, confidence: 0,
+    };
+    return {
+      id: '', snapshotAvailable: false, productId, date: '', price: null, rating: null,
+      reviewCount: null, bsr: null, estimatedSales: null, estimatedRevenue: null,
+      sellerCount: null, growth7d: null, growth30d: null, growth30dAvailable: false,
+      growth90d: null, provenance,
     };
   }
 
@@ -935,11 +968,16 @@ export class IntelligenceRepository {
     if (!insight.researchJobId || evidenceIds.length === 0 || insight.evidence.length === 0) {
       return false;
     }
+    const live = this.getSettings().mode === 'live';
+    if (live && insight.evidence.some((item) => (
+      item.provenance.some((source) => source.sourceType === 'mock')
+    ))) return false;
     const placeholders = evidenceIds.map(() => '?').join(',');
     const rows = this.database.prepare(`
       SELECT id FROM evidence_records
       WHERE research_job_id = ? AND data_version = ? AND id IN (${placeholders})
-    `).all(insight.researchJobId, insight.dataVersion, ...evidenceIds) as DbRow[];
+        AND (? = 0 OR source_type <> 'mock')
+    `).all(insight.researchJobId, insight.dataVersion, ...evidenceIds, live ? 1 : 0) as DbRow[];
     return rows.length === evidenceIds.length;
   }
 
@@ -995,6 +1033,8 @@ export class IntelligenceRepository {
   private mapDataTask(row: DbRow): DataTask {
     return {
       id: stringValue(row.id),
+      syncRunId: row.sync_run_id === null || row.sync_run_id === undefined
+        ? null : stringValue(row.sync_run_id),
       name: stringValue(row.name),
       taskType: stringValue(row.task_type),
       target: stringValue(row.target),
