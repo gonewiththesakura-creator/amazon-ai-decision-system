@@ -11,7 +11,16 @@ export const SELLERSPRITE_CAPABILITIES = [
   'ASIN_COMPETITOR_DISCOVERY',
 ] as const;
 
-export type SellerSpriteCapability = typeof SELLERSPRITE_CAPABILITIES[number];
+export const SELLERSPRITE_OPTIONAL_CAPABILITIES = ['ASIN_DETAIL'] as const;
+
+export type SellerSpriteCapability =
+  | typeof SELLERSPRITE_CAPABILITIES[number]
+  | typeof SELLERSPRITE_OPTIONAL_CAPABILITIES[number];
+
+const ALL_SELLERSPRITE_CAPABILITIES: readonly SellerSpriteCapability[] = [
+  ...SELLERSPRITE_CAPABILITIES,
+  ...SELLERSPRITE_OPTIONAL_CAPABILITIES,
+];
 
 const aliases: Record<SellerSpriteCapability, string[]> = {
   MARKET_RESEARCH: ['market_research'],
@@ -19,6 +28,7 @@ const aliases: Record<SellerSpriteCapability, string[]> = {
   PRODUCT_CONCENTRATION: ['market_product_concentration', 'product_concentration'],
   ASIN_SALES_TREND: ['asin_sales_trend'],
   ASIN_COMPETITOR_DISCOVERY: ['asin_competitor', 'asin_competitor_discovery'],
+  ASIN_DETAIL: ['asin_detail'],
 };
 
 const signals: Record<SellerSpriteCapability, RegExp> = {
@@ -27,6 +37,7 @@ const signals: Record<SellerSpriteCapability, RegExp> = {
   PRODUCT_CONCENTRATION: /product.*concentration|brand.*concentration/i,
   ASIN_SALES_TREND: /asin.*sales.*trend|sales.*trend.*asin/i,
   ASIN_COMPETITOR_DISCOVERY: /asin.*competitor|competitor.*asin/i,
+  ASIN_DETAIL: /asin.*detail|detail.*asin/i,
 };
 
 export class SellerSpriteToolRegistry {
@@ -41,7 +52,7 @@ export class SellerSpriteToolRegistry {
     this.tools = (await discover()).map((tool) => mcpToolSchema.parse(tool));
     this.mapping.clear();
     const assigned = new Set<string>();
-    for (const capability of SELLERSPRITE_CAPABILITIES) {
+    for (const capability of ALL_SELLERSPRITE_CAPABILITIES) {
       const candidate = this.tools
         .filter((tool) => !assigned.has(tool.name) && supportsSchema(capability, tool))
         .map((tool) => ({ tool, score: scoreTool(capability, tool) }))
@@ -91,6 +102,16 @@ export class SellerSpriteToolRegistry {
     const schema = capability.startsWith('ASIN_')
       ? tool.inputSchema : marketRequestSchema(tool.inputSchema);
     return Boolean(schema && Object.hasOwn(schema.properties ?? {}, argument));
+  }
+
+  supportsStringArgument(capability: SellerSpriteCapability, argument: string): boolean {
+    const tool = this.mapping.get(capability);
+    if (!tool) return false;
+    const schema = capability.startsWith('ASIN_')
+      ? tool.inputSchema : marketRequestSchema(tool.inputSchema);
+    const property = schema?.properties?.[argument];
+    return Boolean(property && typeof property === 'object' && !Array.isArray(property)
+      && (property as Record<string, unknown>).type === 'string');
   }
 
   validateArguments(capability: SellerSpriteCapability, args: Record<string, unknown>): void {
@@ -261,8 +282,10 @@ function marketRequestSchema(
 }
 
 function scoreTool(capability: SellerSpriteCapability, tool: McpToolDefinition): number {
+  if (capability !== 'ASIN_DETAIL' && tool.name.toLowerCase() === 'asin_detail') return 0;
   const aliasIndex = aliases[capability].indexOf(tool.name.toLowerCase());
   if (aliasIndex >= 0) return 100 - aliasIndex;
+  if (capability === 'ASIN_DETAIL') return 0;
   if (capability === 'MARKET_RESEARCH' && /statistics|concentration/i.test(tool.name)) return 0;
   return signals[capability].test(`${tool.name} ${tool.description ?? ''}`) ? 10 : 0;
 }

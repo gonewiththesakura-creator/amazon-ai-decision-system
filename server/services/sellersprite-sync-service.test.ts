@@ -1103,6 +1103,40 @@ describe('SellerSprite real-data sync', () => {
     });
   });
 
+  it.each([
+    ['uses a finite alias after a non-finite canonical share', Infinity, 12.5, 12.5],
+    ['keeps the share null when canonical and alias are both non-finite', Number.NaN, Infinity, null],
+  ])('%s during a critical batch', async (
+    _scenario, newProductShare, newProductProportion, expectedShare,
+  ) => {
+    database = fixtureDatabase();
+    const base = fixturePort();
+    const port = fixturePort({
+      async fetchMarketStatistics(input) {
+        return {
+          data: {
+            marketplace: input.marketplace, nodeIdPath: input.nodeIdPath, month: input.month,
+            products: 100, newProductShare, newProductProportion,
+          },
+          provenance,
+        };
+      },
+      async fetchMarketConcentration(input, context) {
+        return base.fetchMarketConcentration(input, context);
+      },
+    });
+
+    await new SellerSpriteSyncService(database, port)
+      .syncCriticalBatch({ marketId: 'market-1', month: '202608' });
+
+    expect(database.prepare(`SELECT observation_date AS observationDate,
+      new_product_share AS newProductShare FROM market_snapshots
+      WHERE market_node_id = 'market-1' ORDER BY observation_date`).all()).toEqual([
+      { observationDate: '2026-07-31', newProductShare: expectedShare },
+      { observationDate: '2026-08-31', newProductShare: expectedShare },
+    ]);
+  });
+
   it('captures the root and each distinct owned child market within one critical run', async () => {
     database = fixtureDatabase();
     database.exec(`

@@ -83,6 +83,10 @@ const ownedProductPatchSchema = z.object({
 
 const relationTypeSchema = z.enum(['direct', 'top100', 'benchmark', 'fast_growth', 'price_peer']);
 
+const comparisonSkuIdsSchema = z.string().trim().min(1)
+  .transform((value) => [...new Set(value.split(',').map((id) => id.trim()))])
+  .pipe(z.array(z.string().min(1)).min(1).max(5));
+
 const developmentSchema = z.object({
   name: z.string().trim().min(1),
   productType: z.string().trim().min(1),
@@ -245,11 +249,13 @@ export function createApp(options: CreateAppOptions = {}): express.Express {
     const query = z.object({
       range: z.enum(['7D', '30D', '90D', '180D', '1Y']).default('30D'),
       skuId: z.string().trim().min(1).optional(),
+      compareSkuIds: comparisonSkuIdsSchema.optional(),
       marketplace: z.string().trim().min(1).optional(),
     }).parse(request.query);
     assertRequestedMarketplace(repository, query.marketplace);
     if (query.skuId) requireOwnedProduct(repository, query.skuId);
-    sendData(response, executiveDashboard.getDashboard(query.range, query.skuId), repository);
+    query.compareSkuIds?.forEach((id) => requireSellableOwnedProduct(repository, id));
+    sendData(response, executiveDashboard.getDashboard(query.range, query.skuId, query.compareSkuIds), repository);
   });
   app.get('/api/dashboard/executive/run-proof/:runId', adminOnly, (request, response) => {
     const runId = z.string().uuid().parse(routeParam(request, 'runId'));
@@ -850,6 +856,12 @@ function requireMarket(repository: IntelligenceRepository, id: string) {
 function requireOwnedProduct(repository: IntelligenceRepository, id: string) {
   const product = repository.getOwnedProduct(id);
   if (!product) throw httpError(404, '自有产品不存在。');
+  return product;
+}
+
+function requireSellableOwnedProduct(repository: IntelligenceRepository, id: string) {
+  const product = repository.getSellableOwnedProducts().find((item) => item.id === id);
+  if (!product) throw httpError(404, '可销售自有产品不存在。');
   return product;
 }
 

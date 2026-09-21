@@ -801,6 +801,7 @@ export interface ExecutiveDashboardViewModel {
   kpis: ExecutiveDashboardKpis;
   trendComparison: IndexedTrendSeries[];
   trendComparisonMeta: IndexedTrendComparisonMeta;
+  comparisonSkuIds: string[];
   ownedSkuPerformance: ExecutiveSkuPerformance[];
   marketDistribution: ExecutiveMarketDistribution;
   fastGrowthCompetitors: ExecutiveCompetitorGrowth[];

@@ -43,6 +43,7 @@ npm start
 
 - AI 经营驾驶舱：市场 30D、跑赢市场 SKU、需关注 SKU、高增长竞品四项经营 KPI，以及市场/自有 SKU 指数趋势、市场结构、SKU 相对表现、竞品增长、开发机会、研究状态和数据新鲜度。
 - 驾驶舱支持 `7D`、`30D`、`90D`、`180D`、`1Y` 范围；每条有效趋势以范围内首个正数观测统一为 `100`，用于比较相对走势，不伪装成绝对体量。
+- 趋势图默认由服务端选取最多 5 个 active 自有 SKU；超过 5 个时可选最多 5 个对比产品，选择保留在 URL。已选但历史不足的 SKU 保留选择状态，不生成曲线。自有 SKU 达到 13 个时，相对表现图展示高低各 5 个及额外最多 5 个重点监控项，历史不足数量仍单独提示；完整组合在“自有产品”页查看。
 - SKU Focus：从相对表现图下钻单个 SKU，对比所属市场和直接竞品平均，集中查看经营指标、直接竞品 TOP5、正式 AI 判断与仍缺失的数据。
 - MarketPage 改为图表优先：先展示销量/销售额/平均价格趋势、价格带、集中度和细分市场机会，再提供完整市场树、TOP100 商品表、AI 判断和事实账本。
 - 顶栏“问 AI”只引用当前 Marketplace、当前版本的正式 ResearchJob/Rule/Evidence；证据抽屉展示指标、计算方法、来源时间及 data/rule/prompt 版本，并可回到对应研究任务。证据不足时明确拒绝形成正式结论。
@@ -101,7 +102,7 @@ SellerSprite MCP 已接入服务端；历史文件仍可通过 CSV/XLSX 回填�
 
 Review Gap 只把评论中的问题频率作为已知事实。供应链可解性和成本影响必须由任务输入中的 `review_gap_support.<issue>` 提供逐问题、可追溯且已验证的 supplier/cost 证据；缺失时保持 `null` 与 `insufficient_evidence`，不会从任务描述或评论文本猜测。
 
-SellerSprite MCP 通过服务端环境变量接入，先发现真实工具 schema，再映射第一批市场、集中度、ASIN 趋势和竞品发现能力。确认候选竞品后，可在竞品行手动同步其历史快照。浏览器读取已落库的 Snapshot，不会因刷新页面直接调用 MCP；失败不会在 Live 下回退 Mock。
+SellerSprite MCP 通过服务端环境变量接入，先发现真实工具 schema，再映射第一批市场、集中度、ASIN 趋势和竞品发现能力。关键市场统计及集中度必须返回与请求一致的观察月份和范围，无法认证时拒绝写入；`returnFields` 仅在工具 schema 声明字符串参数时发送。精确的 `asin_detail` 是可选身份能力，不代替必需的 ASIN 趋势。确认候选竞品后，可在竞品行手动同步其历史快照。浏览器读取已落库的 Snapshot，不会因刷新页面直接调用 MCP；失败不会在 Live 下回退 Mock。
 
 ## 启用 Demo
 
@@ -146,9 +147,10 @@ V2.1 驾驶舱聚合接口：
 ```http
 GET /api/dashboard/executive?marketplace=US&range=30D
 GET /api/dashboard/executive?marketplace=US&range=30D&skuId=<owned-product-id>
+GET /api/dashboard/executive?marketplace=US&range=30D&compareSkuIds=<id-1>,<id-2>
 ```
 
-`range` 只接受 `7D|30D|90D|180D|1Y`；`marketplace` 必须与当前工作区一致，`skuId` 必须是当前站点的自有 SKU。响应包含 KPI、指数趋势、结构分布、竞品增长、正式结论、开发/研究状态、数据状态和可选 SKU Focus。
+`range` 只接受 `7D|30D|90D|180D|1Y`；`marketplace` 必须与当前工作区一致，`skuId` 必须是当前站点的 active 自有 SKU。可选 `compareSkuIds` 是逗号分隔的 active 自有 SKU ID，去重后最多 5 个，顺序即图表顺序；响应中的 `comparisonSkuIds` 表示实际选择，省略参数时返回服务端默认选择。响应还包含 KPI、指数趋势、结构分布、竞品增长、正式结论、开发/研究状态、数据状态和可选 SKU Focus。
 
 SQLite 默认位于 `data/opportunity-intelligence.db`，已被 `.gitignore` 排除。Migration 版本只向前推进并保留可验证的既有业务数据；V14-V15 补齐审批版本链，V16-V19 统一未知指标的 nullable 语义，V2.2 后续迁移补充身份/Variation、观察日期、去重及真实数据登记。迁移详情以代码和测试为准。
 

@@ -126,6 +126,47 @@ describe('executive dashboard presentation invariants', () => {
     expect(screen.getByText(/历史较短 SKU因历史数据不足未参与当前周期比较/)).toBeInTheDocument();
   });
 
+  it('limits comparison selection to five owned SKUs and preserves selection order', () => {
+    const onCompareSkuIdsChange = vi.fn();
+    render(<MarketSkuTrendChart
+      commonBaselineDate="2026-09-01T00:00:00.000Z"
+      excludedSeries={[]}
+      marketConfigured
+      series={[]}
+      comparisonSkus={Array.from({ length: 6 }, (_, index) => ({
+        id: `sku-${index + 1}`,
+        name: `自有 SKU ${index + 1}`,
+      }))}
+      selectedComparisonSkuIds={['sku-3', 'sku-1', 'sku-2', 'sku-4', 'sku-5']}
+      onComparisonSkuIdsChange={onCompareSkuIdsChange}
+    />);
+
+    const sixthSku = screen.getByRole('checkbox', { name: '自有 SKU 6' });
+    expect(sixthSku).toBeDisabled();
+    const selector = screen.getByText('选择对比产品 5/5').closest('details');
+    expect(selector).not.toHaveAttribute('open');
+    expect(screen.getByText('最多选择 5 个产品')).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('checkbox', { name: '自有 SKU 3' }));
+    expect(onCompareSkuIdsChange).toHaveBeenCalledWith(['sku-1', 'sku-2', 'sku-4', 'sku-5']);
+  });
+
+  it('does not render a comparison selector when the portfolio has five or fewer SKUs', () => {
+    render(<MarketSkuTrendChart
+      commonBaselineDate={null}
+      excludedSeries={[]}
+      marketConfigured
+      series={[]}
+      comparisonSkus={Array.from({ length: 5 }, (_, index) => ({
+        id: `sku-${index + 1}`,
+        name: `自有 SKU ${index + 1}`,
+      }))}
+      selectedComparisonSkuIds={['sku-1', 'sku-2', 'sku-3', 'sku-4', 'sku-5']}
+      onComparisonSkuIdsChange={vi.fn()}
+    />);
+
+    expect(screen.queryByText('选择对比产品 5/5')).not.toBeInTheDocument();
+  });
+
   it('never treats the first SKU as a market series when no primary market is configured', () => {
     render(
       <MemoryRouter>
@@ -204,6 +245,89 @@ describe('executive dashboard presentation invariants', () => {
     const table = screen.getByRole('table', { name: '自有 SKU 相对市场表现完整数据' });
     expect(within(table).getByText('白色枕').closest('tr')).toHaveTextContent('白色枕不可用数据不足');
     expect(within(table).getByText('灰色枕').closest('tr')).toHaveTextContent('灰色枕+8.0%跑赢');
+  });
+
+  it('summarizes a large SKU portfolio with the five highest and five lowest comparable values', () => {
+    const items = [
+      ...Array.from({ length: 47 }, (_, index) => ({
+        id: `sku-${index + 1}`,
+        name: `SKU ${index + 1}`,
+        relativeDelta: index - 23,
+        performance: 'in_line' as const,
+      })),
+      { id: 'pending-a', name: '待补数据 A', relativeDelta: null, performance: 'insufficient_data' as const },
+      { id: 'pending-b', name: '待补数据 B', relativeDelta: null, performance: 'insufficient_data' as const },
+      { id: 'pending-c', name: '待补数据 C', relativeDelta: null, performance: 'insufficient_data' as const },
+    ];
+
+    render(<MemoryRouter><SkuRelativeBarChart items={items} /></MemoryRouter>);
+
+    const details = screen.getByLabelText('SKU 相对表现明细');
+    expect(within(details).getAllByRole('button')).toHaveLength(10);
+    expect(within(details).getByText('SKU 47')).toBeInTheDocument();
+    expect(within(details).getByText('SKU 43')).toBeInTheDocument();
+    expect(within(details).getByText('SKU 1')).toBeInTheDocument();
+    expect(within(details).getByText('SKU 5')).toBeInTheDocument();
+    expect(within(details).queryByText('SKU 6')).not.toBeInTheDocument();
+    expect(within(details).queryByText('SKU 42')).not.toBeInTheDocument();
+    expect(screen.getByText(/3 个 SKU 因历史数据不足未参与比较/)).toBeInTheDocument();
+
+    const table = screen.getByRole('table', { name: '自有 SKU 相对市场表现摘要数据' });
+    expect(within(table).getAllByRole('row')).toHaveLength(11);
+    expect(within(table).queryByText('SKU 6')).not.toBeInTheDocument();
+    expect(within(table).queryByText('待补数据 A')).not.toBeInTheDocument();
+    expect(screen.getByRole('link', { name: '查看完整产品组合' })).toHaveAttribute('href', '/owned-products');
+  });
+
+  it('keeps a middle-range attention SKU in a large portfolio summary', () => {
+    const items = Array.from({ length: 13 }, (_, index) => ({
+      id: `sku-${index + 1}`,
+      name: `SKU ${index + 1}`,
+      relativeDelta: index - 6,
+      performance: 'in_line' as const,
+      attention: index === 6,
+    }));
+
+    render(<MemoryRouter><SkuRelativeBarChart items={items} /></MemoryRouter>);
+
+    const details = screen.getByLabelText('SKU 相对表现明细');
+    expect(within(details).getAllByRole('button')).toHaveLength(11);
+    expect(within(details).getByText('SKU 7')).toBeInTheDocument();
+    expect(screen.getByText(/最高和最低及最多 5 个重点监控/)).toBeInTheDocument();
+  });
+
+  it('caps additional attention SKUs in a 50-item portfolio at five', () => {
+    const items = Array.from({ length: 50 }, (_, index) => ({
+      id: `sku-${index + 1}`,
+      name: `SKU ${index + 1}`,
+      relativeDelta: index - 25,
+      performance: 'underperform' as const,
+      attention: true,
+    }));
+
+    render(<MemoryRouter><SkuRelativeBarChart items={items} /></MemoryRouter>);
+
+    const details = screen.getByLabelText('SKU 相对表现明细');
+    expect(within(details).getAllByRole('button')).toHaveLength(15);
+    expect(within(details).getByText('SKU 6')).toBeInTheDocument();
+    expect(within(details).queryByText('SKU 11')).not.toBeInTheDocument();
+    expect(screen.getByText(/最多 5 个重点监控/)).toBeInTheDocument();
+  });
+
+  it('keeps the pending count truthful when a large portfolio has no comparable SKU', () => {
+    const items = Array.from({ length: 13 }, (_, index) => ({
+      id: `pending-${index + 1}`,
+      name: `待补数据 ${index + 1}`,
+      relativeDelta: null,
+      performance: 'insufficient_data' as const,
+    }));
+
+    render(<MemoryRouter><SkuRelativeBarChart items={items} /></MemoryRouter>);
+
+    expect(screen.getByText('暂无可比较的 SKU')).toBeInTheDocument();
+    expect(screen.getByText(/13 个 SKU 因历史数据不足未参与比较/)).toBeInTheDocument();
+    expect(screen.queryByText(/已显示相对表现最高和最低的 SKU/)).not.toBeInTheDocument();
+    expect(screen.getByRole('link', { name: '查看完整产品组合' })).toHaveAttribute('href', '/owned-products');
   });
 
   it('labels unavailable opportunities without manufacturing zero scores', () => {

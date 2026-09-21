@@ -16,7 +16,7 @@ import {
 } from '../components/dashboard';
 import { Onboarding } from '../components/Onboarding';
 import { ErrorState, PageLoading } from '../components/StateViews';
-import { useApi } from '../lib/api';
+import { ApiError, useApi } from '../lib/api';
 import { useApp } from '../lib/AppContext';
 import './dashboard-page.css';
 
@@ -33,10 +33,14 @@ export default function DashboardPage() {
   const previousMarketplace = useRef(settings.marketplace);
   const range = isTimeRange(searchParams.get('range')) ? searchParams.get('range') as TimeRange : '30D';
   const selectedSkuId = searchParams.get('sku');
+  const compareSkuIds = comparisonSkuIds(searchParams.get('compareSkuIds'));
   const marketplace = encodeURIComponent(settings.marketplace);
   const skuParam = selectedSkuId ? `&skuId=${encodeURIComponent(selectedSkuId)}` : '';
+  const comparisonParam = compareSkuIds.length
+    ? `&compareSkuIds=${encodeURIComponent(compareSkuIds.join(','))}`
+    : '';
   const query = useApi<ExecutiveDashboardViewModel>(
-    `/api/dashboard/executive?marketplace=${marketplace}&range=${range}${skuParam}`,
+    `/api/dashboard/executive?marketplace=${marketplace}&range=${range}${skuParam}${comparisonParam}`,
     refreshKey,
   );
   const coverageQuery = useApi<DataCoverageReport>(
@@ -57,10 +61,32 @@ export default function DashboardPage() {
     setSearchParams(next, { replace: true });
   }, [query.data, searchParams, selectedSkuId, setSearchParams]);
 
+  useEffect(() => {
+    if (!compareSkuIds.length || !query.data || query.data.ownedSkuPerformance.length > 5) return;
+    const next = new URLSearchParams(searchParams);
+    next.delete('compareSkuIds');
+    setSearchParams(next, { replace: true });
+  }, [compareSkuIds.length, query.data, searchParams, setSearchParams]);
+
+  useEffect(() => {
+    if (!compareSkuIds.length || selectedSkuId || !(query.error instanceof ApiError) || query.error.status !== 404) return;
+    const next = new URLSearchParams(searchParams);
+    next.delete('compareSkuIds');
+    setSearchParams(next, { replace: true });
+  }, [compareSkuIds.length, query.error, searchParams, selectedSkuId, setSearchParams]);
+
   const updateParameter = (key: 'range' | 'sku', value: string | null) => {
     const next = new URLSearchParams(searchParams);
     if (value) next.set(key, value);
     else next.delete(key);
+    setSearchParams(next, { replace: true });
+  };
+
+  const updateComparisonSkuIds = (skuIds: string[]) => {
+    const next = new URLSearchParams(searchParams);
+    const value = comparisonSkuIds(skuIds.join(','));
+    if (value.length) next.set('compareSkuIds', value.join(','));
+    else next.delete('compareSkuIds');
     setSearchParams(next, { replace: true });
   };
 
@@ -76,6 +102,9 @@ export default function DashboardPage() {
 
   const data = query.data;
   const focus = data.skuFocus;
+  const displayedComparisonSkuIds = compareSkuIds.length
+    ? compareSkuIds
+    : data.comparisonSkuIds ?? [];
 
   return (
     <div className="page-stack executive-dashboard-page">
@@ -161,6 +190,9 @@ export default function DashboardPage() {
               range={range}
               onRangeChange={(nextRange) => updateParameter('range', nextRange)}
               marketHref={data.market ? `/market?market=${encodeURIComponent(data.market.id)}` : undefined}
+              comparisonSkus={data.ownedSkuPerformance}
+              selectedComparisonSkuIds={displayedComparisonSkuIds}
+              onComparisonSkuIdsChange={updateComparisonSkuIds}
             />
             <MarketConcentrationDonut
               concentration={data.marketDistribution.concentration}
@@ -186,6 +218,11 @@ export default function DashboardPage() {
       )}
     </div>
   );
+}
+
+function comparisonSkuIds(value: string | null): string[] {
+  if (!value) return [];
+  return [...new Set(value.split(',').map((id) => id.trim()).filter(Boolean))].slice(0, 5);
 }
 
 function coverageSummary(report: DataCoverageReport | null): 'complete' | 'partial' | 'missing' {

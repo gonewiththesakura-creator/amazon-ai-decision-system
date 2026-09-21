@@ -380,6 +380,27 @@ describe('executive dashboard portfolio selection', () => {
     expect(select()).toEqual(['focus', 'attention-a', 'attention-b', 'strong-a', 'weak-a']);
     expect(select()).toEqual(['focus', 'attention-a', 'attention-b', 'strong-a', 'weak-a']);
   });
+
+  it('uses only explicitly selected SKU IDs in their supplied order', () => {
+    const owned = ['sku-a', 'sku-b', 'sku-c', 'sku-d', 'sku-e', 'sku-f']
+      .map((id) => ({ id } as unknown as OwnedProductSummary));
+    const performance = owned.map((product) => ({
+      id: product.id, relativeDelta: 0, attention: false,
+    } as unknown as ExecutiveSkuPerformance));
+
+    expect(selectOverviewProducts(owned, performance, undefined, ['sku-f', 'sku-b']))
+      .toEqual([owned[5], owned[1]]);
+  });
+
+  it('keeps every SKU in a five-or-fewer portfolio despite an explicit subset', () => {
+    const owned = ['sku-a', 'sku-b', 'sku-c', 'sku-d']
+      .map((id) => ({ id } as unknown as OwnedProductSummary));
+    const performance = owned.map((product) => ({
+      id: product.id, relativeDelta: 0, attention: false,
+    } as unknown as ExecutiveSkuPerformance));
+
+    expect(selectOverviewProducts(owned, performance, undefined, ['sku-d'])).toEqual(owned);
+  });
 });
 
 describe('GET /api/dashboard/executive', () => {
@@ -398,6 +419,7 @@ describe('GET /api/dashboard/executive', () => {
       expect(dashboard.ownedSkuPerformance).toHaveLength(total);
       expect(ownedSeries).toHaveLength(Math.min(total, 5));
       expect(dashboard.trendComparison).toHaveLength(total === 0 ? 0 : Math.min(total, 5) + 1);
+      expect(dashboard.comparisonSkuIds).toHaveLength(Math.min(total, 5));
       expect(new Set(ownedSeries.map((item) => item.id)).size).toBe(ownedSeries.length);
     },
   );
@@ -413,6 +435,62 @@ describe('GET /api/dashboard/executive', () => {
 
     expect(dashboard.trendComparison.filter((item) => item.kind === 'owned_sku')).toHaveLength(5);
     expect(dashboard.trendComparison.map((item) => item.id)).toContain('sku:portfolio-sku-12');
+  });
+
+  it('uses the explicitly selected owned SKUs in request order after deduplicating IDs', async () => {
+    const app = testApp();
+    await enableDemo(app);
+    configureActivePortfolio(12);
+
+    const dashboard = (await request(app)
+      .get('/api/dashboard/executive?compareSkuIds=portfolio-sku-12,owned-sku-02,portfolio-sku-12')
+      .expect(200)).body.data as ExecutiveDashboardViewModel;
+
+    expect(dashboard.trendComparison.filter((item) => item.kind === 'owned_sku').map((item) => item.id))
+      .toEqual(['sku:portfolio-sku-12', 'sku:owned-sku-02']);
+    expect(dashboard.comparisonSkuIds).toEqual(['portfolio-sku-12', 'owned-sku-02']);
+  });
+
+  it('ignores an explicit comparison subset when five or fewer sellable SKUs are active', async () => {
+    const app = testApp();
+    await enableDemo(app);
+    configureActivePortfolio(4);
+
+    const dashboard = (await request(app)
+      .get('/api/dashboard/executive?compareSkuIds=owned-sku-01')
+      .expect(200)).body.data as ExecutiveDashboardViewModel;
+
+    expect(dashboard.comparisonSkuIds).toHaveLength(4);
+    expect(dashboard.comparisonSkuIds).toContain('owned-sku-01');
+    expect(dashboard.trendComparison.filter((item) => item.kind === 'owned_sku')).toHaveLength(4);
+  });
+
+  it('retains explicitly selected SKU IDs when a SKU is excluded for insufficient history', async () => {
+    const app = testApp();
+    await enableDemo(app);
+    configureActivePortfolio(12);
+    database!.prepare("DELETE FROM product_snapshots WHERE product_id = 'portfolio-sku-12'").run();
+
+    const dashboard = (await request(app)
+      .get('/api/dashboard/executive?compareSkuIds=portfolio-sku-12,owned-sku-02')
+      .expect(200)).body.data as ExecutiveDashboardViewModel;
+
+    expect(dashboard.comparisonSkuIds).toEqual(['portfolio-sku-12', 'owned-sku-02']);
+    expect(dashboard.trendComparison.map((series) => series.id)).not.toContain('sku:portfolio-sku-12');
+    expect(dashboard.trendComparisonMeta.excludedSeries.map((series) => series.id))
+      .toContain('sku:portfolio-sku-12');
+  });
+
+  it('rejects comparison selections beyond five and inactive or unknown owned SKUs', async () => {
+    const app = testApp();
+    await enableDemo(app);
+    configureActivePortfolio(12);
+    database!.prepare("UPDATE products SET status = 'inactive' WHERE id = 'portfolio-sku-03'").run();
+
+    await request(app).get('/api/dashboard/executive?compareSkuIds=portfolio-sku-01,portfolio-sku-02,portfolio-sku-04,portfolio-sku-05,portfolio-sku-06,portfolio-sku-07')
+      .expect(400);
+    await request(app).get('/api/dashboard/executive?compareSkuIds=portfolio-sku-03').expect(404);
+    await request(app).get('/api/dashboard/executive?compareSkuIds=missing-sku').expect(404);
   });
 
   it('excludes inactive products from current KPIs without deleting their historical snapshots', async () => {

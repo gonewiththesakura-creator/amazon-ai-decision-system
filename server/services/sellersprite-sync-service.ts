@@ -759,7 +759,8 @@ export class SellerSpriteSyncService {
       medianReviews: finiteNumber(data.medianReviews),
       top10Share: percentOrNull(data.top10Share),
       top20Share: percentOrNull(data.top20Share),
-      newProductShare: finiteNumber(data.newProductShare ?? data.newProductProportion),
+      newProductShare: finiteNumber(data.newProductShare)
+        ?? finiteNumber(data.newProductProportion),
     };
     if (Object.values(metrics).every((value) => value === null)) {
       throw new Error('SellerSprite 市场响应没有有效指标。');

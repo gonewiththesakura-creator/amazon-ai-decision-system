@@ -382,6 +382,24 @@ describe('SellerSpriteMCPAdapter', () => {
       .rejects.toMatchObject({ code: 'INVALID_SCHEMA' });
   });
   it.each([
+    ['missing marketplace', { nodeIdPath: '1055398:1063252', month: '202608' }],
+    ['empty marketplace', { marketplace: '', nodeIdPath: '1055398:1063252', month: '202608' }],
+    ['wrong marketplace', { marketplace: 'CA', nodeIdPath: '1055398:1063252', month: '202608' }],
+    ['missing nodeIdPath', { marketplace: 'US', month: '202608' }],
+    ['empty nodeIdPath', { marketplace: 'US', nodeIdPath: '', month: '202608' }],
+    ['wrong nodeIdPath', { marketplace: 'US', nodeIdPath: 'wrong', month: '202608' }],
+  ])('rejects critical concentration items with %s', async (_scenario, scope) => {
+    const transport = new AdapterTransport();
+    transport.marketToolsRequireMonth = true;
+    transport.responseData = [{ asin: 'B000TEST01', totalUnitsRatio: 0.1, ...scope }];
+    const adapter = new SellerSpriteMCPAdapter({ client: new SellerSpriteMcpClient({ transport }) });
+
+    await expect(adapter.fetchMarketConcentration({
+      marketplace: 'US', nodeIdPath: '1055398:1063252', month: '202608',
+    }, { runId: '123e4567-e89b-42d3-a456-426614174000', requireObservationMonth: true }))
+      .rejects.toMatchObject({ code: 'INVALID_SCHEMA' });
+  });
+  it.each([
     ['identity', { asin: { asin: 'B000TEST02', marketplace: 'US' }, salesTrendPoints: [{ month: '2026-07', childUnitSales: 10 }] }],
     ['history', { asin: { asin: 'B000TEST01', marketplace: 'US' }, salesTrendPoints: [{ asin: 'B000TEST02', month: '2026-07', childUnitSales: 10 }] }],
     ['marketplace', { asin: { asin: 'B000TEST01', marketplace: 'CA' }, salesTrendPoints: [{ month: '2026-07', childUnitSales: 10 }] }],
@@ -627,6 +645,84 @@ describe('SellerSpriteMCPAdapter', () => {
     ]);
   });
 
+  it.each([
+    ['nested request', false, {
+      request: {
+        marketplace: 'US', nodeIdPath: 'bed-pillows', month: '202608',
+        returnFields: 'marketplace,nodeIdPath,month,products,sellers,brands,totalUnits,totalRevenue,avgPrice,medianPrice,avgRating,medianReviews,top10Share,top20Share,newProductShare,newProductProportion',
+      },
+    }],
+    ['flat schema', true, {
+      marketplace: 'US', nodeIdPath: 'bed-pillows', month: '202608',
+      returnFields: 'marketplace,nodeIdPath,month,products,sellers,brands,totalUnits,totalRevenue,avgPrice,medianPrice,avgRating,medianReviews,top10Share,top20Share,newProductShare,newProductProportion',
+    }],
+  ])('projects only synchronized statistics fields for a %s supporting returnFields', async (_shape, flatMarketTools, expected) => {
+    const transport = new AdapterTransport();
+    transport.flatMarketTools = flatMarketTools;
+    transport.marketToolsSupportReturnFields = true;
+    const adapter = new SellerSpriteMCPAdapter({ client: new SellerSpriteMcpClient({ transport }) });
+
+    await adapter.fetchMarketStatistics({
+      marketplace: 'US', nodeIdPath: 'bed-pillows', month: '202608',
+    });
+
+    expect(transport.calls).toEqual([{
+      name: 'market_research_statistics', arguments: expected,
+    }]);
+  });
+
+  it.each([
+    ['nested request', false, {
+      request: {
+        marketplace: 'US', nodeIdPath: 'bed-pillows', month: '202608',
+        returnFields: 'marketplace,nodeIdPath,month,asin,title,brand,price,rating,ratings,totalUnits,totalRevenue,totalUnitsRatio,totalRevenueRatio',
+      },
+    }],
+    ['flat schema', true, {
+      marketplace: 'US', nodeIdPath: 'bed-pillows', month: '202608',
+      returnFields: 'marketplace,nodeIdPath,month,asin,title,brand,price,rating,ratings,totalUnits,totalRevenue,totalUnitsRatio,totalRevenueRatio',
+    }],
+  ])('projects only synchronized concentration fields for a %s supporting returnFields', async (_shape, flatMarketTools, expected) => {
+    const transport = new AdapterTransport();
+    transport.flatMarketTools = flatMarketTools;
+    transport.marketToolsSupportReturnFields = true;
+    const adapter = new SellerSpriteMCPAdapter({ client: new SellerSpriteMcpClient({ transport }) });
+
+    await adapter.fetchMarketConcentration({
+      marketplace: 'US', nodeIdPath: 'bed-pillows', month: '202608',
+    });
+
+    expect(transport.calls).toEqual([{
+      name: 'market_product_concentration', arguments: expected,
+    }]);
+  });
+
+  it.each([
+    ['nested statistics', false, 'market_research_statistics'],
+    ['flat statistics', true, 'market_research_statistics'],
+    ['nested concentration', false, 'market_product_concentration'],
+    ['flat concentration', true, 'market_product_concentration'],
+  ])('does not send returnFields to a %s tool declaring a non-string schema', async (
+    _shape, flatMarketTools, toolName,
+  ) => {
+    const transport = new AdapterTransport();
+    transport.flatMarketTools = flatMarketTools;
+    transport.marketToolsSupportReturnFields = true;
+    transport.marketReturnFieldsType = 'array';
+    const adapter = new SellerSpriteMCPAdapter({ client: new SellerSpriteMcpClient({ transport }) });
+    const input = { marketplace: 'US', nodeIdPath: 'bed-pillows', month: '202608' };
+
+    if (toolName === 'market_research_statistics') await adapter.fetchMarketStatistics(input);
+    else await adapter.fetchMarketConcentration(input);
+
+    expect(transport.calls).toEqual([{
+      name: toolName,
+      arguments: flatMarketTools
+        ? { marketplace: 'US', nodeIdPath: 'bed-pillows', month: '202608' }
+        : { request: { marketplace: 'US', nodeIdPath: 'bed-pillows', month: '202608' } },
+    }]);
+  });
+
   it('routes concentration, monthly ASIN trend, and competitor candidates through their discovered tools', async () => {
     const transport = new AdapterTransport();
     const adapter = new SellerSpriteMCPAdapter({ client: new SellerSpriteMcpClient({ transport }) });
@@ -646,6 +742,181 @@ describe('SellerSpriteMCPAdapter', () => {
     expect(transport.calls.at(-1)?.arguments).toEqual({ marketplace: 'US', asin: 'B000TEST01', size: 10 });
   });
 
+  it('fetches only the requested ASIN identity fields and preserves nullable fields', async () => {
+    const transport = new AdapterTransport();
+    transport.includeAsinDetail = true;
+    transport.asinDetail = {
+      asin: 'B000TEST01', marketplace: 'US', title: null, brand: null,
+      parent: null, nodeIdPath: null,
+    };
+    const adapter = new SellerSpriteMCPAdapter({ client: new SellerSpriteMcpClient({ transport }) });
+
+    const identity = await adapter.fetchAsinIdentity({ marketplace: 'US', asin: 'B000TEST01' });
+
+    expect(identity.data).toEqual({
+      asin: 'B000TEST01', marketplace: 'US', title: null, brand: null,
+      parent: null, nodeIdPath: null,
+    });
+    expect(transport.calls).toEqual([{
+      name: 'asin_detail',
+      arguments: {
+        marketplace: 'US', asin: 'B000TEST01',
+        returnFields: 'asin,title,brand,parent,nodeIdPath,marketplace',
+      },
+    }]);
+  });
+
+  it.each([
+    ['absent', undefined],
+    ['non-string', 'array'],
+  ])('calls exact asin_detail without projection when returnFields is %s', async (
+    _scenario, returnFieldsType,
+  ) => {
+    const transport = new AdapterTransport();
+    transport.includeAsinDetail = true;
+    transport.asinDetailReturnFieldsType = returnFieldsType;
+    const adapter = new SellerSpriteMCPAdapter({ client: new SellerSpriteMcpClient({ transport }) });
+
+    const identity = await adapter.fetchAsinIdentity({ marketplace: 'US', asin: 'B000TEST01' });
+
+    expect(identity.data.title).toBe('Detailed product');
+    expect(transport.calls).toEqual([{
+      name: 'asin_detail', arguments: { marketplace: 'US', asin: 'B000TEST01' },
+    }]);
+  });
+
+  it.each([
+    ['ASIN', { asin: 'B000TEST02', marketplace: 'US' }],
+    ['marketplace', { asin: 'B000TEST01', marketplace: 'CA' }],
+  ])('rejects asin_detail responses with mismatched %s scope', async (_scope, asinDetail) => {
+    const transport = new AdapterTransport();
+    transport.includeAsinDetail = true;
+    transport.asinDetail = asinDetail;
+    const adapter = new SellerSpriteMCPAdapter({ client: new SellerSpriteMcpClient({ transport }) });
+
+    await expect(adapter.fetchAsinIdentity({ marketplace: 'US', asin: 'B000TEST01' }))
+      .rejects.toMatchObject({ code: 'INVALID_SCHEMA' });
+  });
+
+  it('records asin_detail with sanitized product ledger context', async () => {
+    const database = openDatabase(':memory:');
+    try {
+      const transport = new AdapterTransport();
+      transport.includeAsinDetail = true;
+      const adapter = new SellerSpriteMCPAdapter({ client: new SellerSpriteMcpClient({
+        transport, ledgerStore: new SqliteMcpCallLedgerStore(database),
+      }) });
+
+      await adapter.fetchAsinIdentity({ marketplace: 'US', asin: 'B000TEST01' });
+
+      expect(database.prepare(`SELECT capability, entity_type, entity_id, response_metadata_json
+        FROM mcp_call_logs WHERE capability <> 'LIST_TOOLS'`).get()).toEqual({
+        capability: 'ASIN_DETAIL', entity_type: 'product', entity_id: 'B000TEST01',
+        response_metadata_json: JSON.stringify({ operation: 'product_detail', attempt: 1 }),
+      });
+    } finally { database.close(); }
+  });
+
+  it('keeps asin_detail run context in fresh discovery snapshots and call ledger only', async () => {
+    const database = openDatabase(':memory:');
+    try {
+      const runId = '123e4567-e89b-42d3-a456-426614174009';
+      database.prepare(`INSERT INTO data_tasks (
+        id, name, task_type, target, source, marketplace, status, created_at
+      ) VALUES (?, 'Identity sync', 'owned_sku_refresh', 'B000TEST01',
+        'SellerSprite MCP', 'US', 'running', '2026-09-21T00:00:00.000Z')`).run(runId);
+      const transport = new AdapterTransport();
+      transport.includeAsinDetail = true;
+      const client = new SellerSpriteMcpClient({
+        transport, ledgerStore: new SqliteMcpCallLedgerStore(database),
+      });
+      const adapter = new SellerSpriteMCPAdapter({ client, database });
+
+      await adapter.fetchAsinIdentity(
+        { marketplace: 'US', asin: 'B000TEST01' }, { runId },
+      );
+
+      expect(transport.listToolsCallCount).toBe(1);
+      expect(transport.calls).toEqual([{
+        name: 'asin_detail', arguments: {
+          marketplace: 'US', asin: 'B000TEST01',
+          returnFields: 'asin,title,brand,parent,nodeIdPath,marketplace',
+        },
+      }]);
+      expect(database.prepare(`SELECT sync_run_id AS runId
+        FROM provider_capability_snapshots`).all()).toEqual([{ runId }]);
+      expect(database.prepare(`SELECT capability, sync_run_id AS runId
+        FROM mcp_call_logs ORDER BY rowid`).all()).toEqual([
+        { capability: 'LIST_TOOLS', runId },
+        { capability: 'ASIN_DETAIL', runId },
+      ]);
+    } finally { database.close(); }
+  });
+
+  it('uses optional asin_detail identity while requiring trend data for the snapshot', async () => {
+    const transport = new AdapterTransport();
+    transport.includeAsinDetail = true;
+    transport.asinDetail = {
+      asin: 'B000TEST01', marketplace: 'US', title: 'Detailed title', brand: 'Detailed brand',
+      parent: 'B000PARENT', nodeIdPath: 'Home/Bed Pillows',
+    };
+    const adapter = new SellerSpriteMCPAdapter({ client: new SellerSpriteMcpClient({ transport }) });
+
+    const detail = await adapter.fetchProductDetail({ marketplace: 'US', asin: 'B000TEST01' });
+
+    expect(detail).toMatchObject({
+      asin: 'B000TEST01', title: 'Detailed title', brand: 'Detailed brand',
+      marketNodeId: 'Home/Bed Pillows', latest: { estimatedSales: 200 },
+    });
+    expect(transport.calls.map((call) => call.name)).toEqual(['asin_sales_trend', 'asin_detail']);
+
+    transport.salesTrendPoints = [];
+    const freshAdapter = new SellerSpriteMCPAdapter({
+      client: new SellerSpriteMcpClient({ transport, cacheTtlMs: 0 }),
+    });
+    await expect(freshAdapter.fetchProductDetail({ marketplace: 'US', asin: 'B000TEST01' }))
+      .rejects.toMatchObject({ code: 'INVALID_SCHEMA' });
+  });
+
+  it('falls back field by field to trend identity when optional detail fields are null', async () => {
+    const transport = new AdapterTransport();
+    transport.includeAsinDetail = true;
+    transport.asinDetail = {
+      asin: 'B000TEST01', marketplace: 'US', title: null, brand: 'Detailed brand',
+      parent: null, nodeIdPath: null,
+    };
+    const adapter = new SellerSpriteMCPAdapter({ client: new SellerSpriteMcpClient({ transport }) });
+
+    const detail = await adapter.fetchProductDetail({ marketplace: 'US', asin: 'B000TEST01' });
+
+    expect(detail).toMatchObject({
+      title: 'Test product', brand: 'Detailed brand', marketNodeId: '',
+    });
+  });
+
+  it('keeps product detail available when optional asin_detail is absent', async () => {
+    const transport = new AdapterTransport();
+    const adapter = new SellerSpriteMCPAdapter({ client: new SellerSpriteMcpClient({ transport }) });
+
+    const detail = await adapter.fetchProductDetail({ marketplace: 'US', asin: 'B000TEST01' });
+
+    expect(detail.title).toBe('Test product');
+    expect(transport.calls.map((call) => call.name)).toEqual(['asin_sales_trend']);
+  });
+
+  it('keeps diagnostics at five required capabilities when optional asin_detail is available', async () => {
+    const transport = new AdapterTransport();
+    transport.includeAsinDetail = true;
+    const adapter = new SellerSpriteMCPAdapter({ client: new SellerSpriteMcpClient({ transport }) });
+
+    const diagnostics = await adapter.testConnection();
+
+    expect(diagnostics).toMatchObject({
+      toolCount: 6, requiredCapabilityCount: 5,
+      availableRequiredCapabilityCount: 5, missingCapabilities: [],
+    });
+  });
+
   it('rejects failed SellerSprite envelopes and missing legacy overview metrics without fabricating data', async () => {
     const transport = new AdapterTransport();
     const adapter = new SellerSpriteMCPAdapter({ client: new SellerSpriteMcpClient({ transport }) });
@@ -655,6 +926,65 @@ describe('SellerSpriteMCPAdapter', () => {
     transport.remoteCode = 'DENIED';
     await expect(adapter.fetchAsinSalesTrend({ marketplace: 'US', asin: 'B000TEST01' }))
       .rejects.toThrow(/rejected|失败/i);
+  });
+
+  it.each([
+    ['uses a finite newProductProportion alias', { newProductProportion: 12.5 }, 12.5],
+    ['rejects a string newProductProportion alias', { newProductProportion: '12.5' }, null],
+    ['rejects a non-finite newProductShare', { newProductShare: Infinity }, null],
+  ])('%s in legacy market overview data', async (_scenario, newProductMetric, expectedShare) => {
+    const transport = new AdapterTransport();
+    transport.marketStatisticsByMonth = {
+      undefined: {
+        marketplace: 'US', nodeIdPath: 'Home/Bed Pillows',
+        products: 100, sellers: 69, brands: 71, totalUnits: 8_000, totalRevenue: 320_000,
+        avgPrice: 40, medianPrice: 38, avgRating: 4.3, medianReviews: 100, ...newProductMetric,
+      },
+    };
+    transport.concentrationItems = Array.from({ length: 20 }, (_, index) => ({
+      asin: `B000TEST${String(index).padStart(2, '0')}`, totalUnitsRatio: 0.01,
+    }));
+    const adapter = new SellerSpriteMCPAdapter({ client: new SellerSpriteMcpClient({ transport }) });
+
+    const overview = adapter.fetchMarketOverview({
+      marketplace: 'US', keywords: ['pillow'], marketId: 'Home/Bed Pillows',
+    });
+
+    if (expectedShare === null) {
+      await expect(overview).rejects.toMatchObject({ code: 'INVALID_SCHEMA' });
+    } else {
+      await expect(overview).resolves.toMatchObject({ newProductShare: expectedShare });
+    }
+  });
+
+  it.each([
+    ['uses a finite alias after a non-finite canonical value', Infinity, 12.5, 12.5],
+    ['rejects when canonical and alias values are both non-finite', Number.NaN, Infinity, null],
+  ])('%s', async (_scenario, newProductShare, newProductProportion, expectedShare) => {
+    const transport = new AdapterTransport();
+    transport.structuredPayloadByTool.market_research_statistics = {
+      code: 'OK',
+      data: {
+        marketplace: 'US', nodeIdPath: 'Home/Bed Pillows',
+        products: 100, sellers: 69, brands: 71, totalUnits: 8_000, totalRevenue: 320_000,
+        avgPrice: 40, medianPrice: 38, avgRating: 4.3, medianReviews: 100,
+        newProductShare, newProductProportion,
+      },
+    };
+    transport.concentrationItems = Array.from({ length: 20 }, (_, index) => ({
+      asin: `B000TEST${String(index).padStart(2, '0')}`, totalUnitsRatio: 0.01,
+    }));
+    const adapter = new SellerSpriteMCPAdapter({ client: new SellerSpriteMcpClient({ transport }) });
+
+    const overview = adapter.fetchMarketOverview({
+      marketplace: 'US', keywords: ['pillow'], marketId: 'Home/Bed Pillows',
+    });
+
+    if (expectedShare === null) {
+      await expect(overview).rejects.toMatchObject({ code: 'INVALID_SCHEMA' });
+    } else {
+      await expect(overview).resolves.toMatchObject({ newProductShare: expectedShare });
+    }
   });
 
   it('fails closed with a configuration error when no server endpoint exists', async () => {
@@ -712,12 +1042,25 @@ class AdapterTransport implements SellerSpriteMcpTransport {
   remoteCode = 'OK';
   responseData: unknown;
   responsePayload: unknown;
+  structuredPayloadByTool: Record<string, Record<string, unknown>> = {};
   marketItems: Array<Record<string, unknown>> = [];
   marketStatisticsByMonth: Record<string, Record<string, unknown>> | undefined;
+  concentrationItems: Array<Record<string, unknown>> = [
+    { asin: 'B000TEST01', totalUnitsRatio: 0.1, totalRevenueRatio: 0.12 },
+    { asin: 'B000TEST02', totalUnitsRatio: 0.08, totalRevenueRatio: 0.09 },
+  ];
   flatMarketTools = false;
   marketToolsRequireMonth = false;
+  marketToolsSupportReturnFields = false;
+  marketReturnFieldsType = 'string';
   echoConcentrationMonth = false;
   omitCompetitorTool = false;
+  includeAsinDetail = false;
+  asinDetailReturnFieldsType: string | undefined = 'string';
+  asinDetail: Record<string, unknown> = {
+    asin: 'B000TEST01', marketplace: 'US', title: 'Detailed product',
+    brand: 'Detailed brand', parent: null, nodeIdPath: 'Home/Bed Pillows',
+  };
   listToolsCallCount = 0;
   salesTrendPoints: Array<Record<string, unknown>> = [
     { month: '2026-07', childUnitSales: 200, childSalesRevenue: 8_000 },
@@ -730,15 +1073,28 @@ class AdapterTransport implements SellerSpriteMcpTransport {
   async listTools(): Promise<unknown> {
     this.listToolsCallCount += 1;
     const marketTool = this.flatMarketTools
-      ? (name: string, required: string[]) => tool(name, required)
+      ? (name: string, required: string[]) => {
+          const result = tool(name, required);
+          if (this.marketToolsSupportReturnFields) {
+            result.inputSchema.properties.returnFields = { type: this.marketReturnFieldsType };
+          }
+          return result;
+        }
       : (name: string) => tool(name, ['request'], {
           marketplace: {}, nodeIdPath: {}, ...(this.marketToolsRequireMonth ? { month: {} } : {}),
+          ...(this.marketToolsSupportReturnFields
+            ? { returnFields: { type: this.marketReturnFieldsType } } : {}),
         });
+    const asinDetailTool = tool('asin_detail', ['marketplace', 'asin']);
+    if (this.asinDetailReturnFieldsType) {
+      asinDetailTool.inputSchema.properties.returnFields = { type: this.asinDetailReturnFieldsType };
+    }
     return {
       tools: [
         marketTool('market_research_statistics', this.flatMarketTools ? ['marketplace', 'nodeIdPath'] : ['request']),
         marketTool('market_product_concentration', this.flatMarketTools ? ['marketplace', 'nodeIdPath'] : ['request']),
         tool('asin_sales_trend', ['marketplace', 'asin']),
+        ...(this.includeAsinDetail ? [asinDetailTool] : []),
         ...(this.omitCompetitorTool ? [] : [tool('asin_competitor', ['marketplace', 'asin'])]),
         this.flatMarketTools
           ? tool('market_research', ['marketplace', 'nodeIdPath'])
@@ -760,22 +1116,26 @@ class AdapterTransport implements SellerSpriteMcpTransport {
     const data: Record<string, unknown> = {
       market_research_statistics: this.marketStatisticsByMonth?.[String(request.month)]
         ?? defaultMarketStatistics,
-      market_product_concentration: [
-        { asin: 'B000TEST01', totalUnitsRatio: 0.1, totalRevenueRatio: 0.12,
-          ...(this.echoConcentrationMonth ? { month: request.month } : {}) },
-        { asin: 'B000TEST02', totalUnitsRatio: 0.08, totalRevenueRatio: 0.09,
-          ...(this.echoConcentrationMonth ? { month: request.month } : {}) },
-      ],
+      market_product_concentration: this.concentrationItems.map((item) => ({
+        ...item, ...(this.echoConcentrationMonth ? {
+          marketplace: request.marketplace,
+          nodeIdPath: request.nodeIdPath,
+          month: request.month,
+        } : {}),
+      })),
       asin_sales_trend: {
         asin: { asin: request.asin, title: 'Test product', marketplace: request.marketplace,
           price: 50, rating: 4.5, ratings: 300, bsr: 10, sellers: 2 },
         salesTrendPoints: this.salesTrendPoints,
       },
+      asin_detail: this.asinDetail,
       asin_competitor: [{ asin: 'B000TEST02', title: 'Candidate', units: 300 }],
       market_research: { pages: 1, page: 1, size: 5, total: this.marketItems.length, items: this.marketItems, hasNextPage: false },
     };
     const payload = this.responsePayload ?? { code: this.remoteCode, message: this.remoteCode === 'OK' ? 'success' : 'denied',
       data: this.responseData === undefined ? data[params.name] : this.responseData };
+    const structuredContent = this.structuredPayloadByTool[params.name];
+    if (structuredContent) return { content: [], structuredContent, isError: false };
     return {
       content: [{ type: 'text', text: JSON.stringify(payload), annotations: { audience: ['assistant'], priority: 1 } }],
       isError: false,
@@ -792,7 +1152,8 @@ function tool(name: string, required: string[], requestProperties?: Record<strin
       type: 'object',
       required,
       properties: Object.fromEntries(required.map((field) => [field, field === 'request'
-        ? { type: 'object', required: Object.keys(requestProperties ?? {}), properties: requestProperties }
+        ? { type: 'object', required: Object.keys(requestProperties ?? {})
+            .filter((property) => property !== 'returnFields'), properties: requestProperties }
         : { type: 'string' }])),
     },
     annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },

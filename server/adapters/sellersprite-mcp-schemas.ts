@@ -47,6 +47,15 @@ export const sellerSpriteAsinTrendSchema = z.object({
   salesTrendPoints: z.array(sellerSpriteObjectSchema),
 }).passthrough();
 
+export const sellerSpriteAsinIdentitySchema = z.object({
+  asin: z.string().trim().min(1),
+  marketplace: z.string().trim().min(1),
+  title: z.string().nullable().optional(),
+  brand: z.string().nullable().optional(),
+  parent: z.string().nullable().optional(),
+  nodeIdPath: z.string().nullable().optional(),
+}).passthrough();
+
 export const sellerSpriteMarketResearchSchema = z.object({
   items: z.array(z.object({
     marketplace: z.string().trim().min(1),

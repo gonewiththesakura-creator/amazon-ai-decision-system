@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import {
+  SELLERSPRITE_CAPABILITIES,
   sellerSpriteSchemaHash,
   SellerSpriteToolRegistry,
   type SellerSpriteCapability,
@@ -25,6 +26,57 @@ describe('SellerSpriteToolRegistry', () => {
     expect(registry.resolve('MARKET_STATISTICS')?.inputSchema.required).toContain('request');
     expect(store.snapshots).toHaveLength(1);
     expect(JSON.stringify(store.snapshots)).not.toMatch(/endpoint|Authorization|secret-value/i);
+  });
+
+  it('maps asin_detail as optional without changing the five required capabilities', async () => {
+    const registry = new SellerSpriteToolRegistry();
+    const detail = mcpTool('asin_detail', 'Get ASIN product identity', ['marketplace', 'asin']);
+    detail.inputSchema.properties = {
+      ...detail.inputSchema.properties,
+      returnFields: { type: 'string' },
+    };
+
+    const snapshot = await registry.refresh(async () => [...discoveredTools, detail]);
+
+    expect(SELLERSPRITE_CAPABILITIES).toHaveLength(5);
+    expect(snapshot.missingCapabilities).toEqual([]);
+    expect(snapshot.capabilities.ASIN_DETAIL).toBe('asin_detail');
+    expect(registry.resolve('ASIN_DETAIL')?.name).toBe('asin_detail');
+  });
+
+  it('does not report absent optional asin_detail as a missing required capability', async () => {
+    const registry = new SellerSpriteToolRegistry();
+
+    const snapshot = await registry.refresh(async () => discoveredTools);
+
+    expect(snapshot.missingCapabilities).toEqual([]);
+    expect(snapshot.capabilities).not.toHaveProperty('ASIN_DETAIL');
+    expect(registry.resolve('ASIN_DETAIL')).toBeUndefined();
+  });
+
+  it('does not let a coupon-trend tool substitute for the optional ASIN identity capability', async () => {
+    const registry = new SellerSpriteToolRegistry();
+
+    const snapshot = await registry.refresh(async () => [mcpTool(
+      'asin_detail_with_coupon_trend',
+      'Returns coupon and promotion trends for an ASIN',
+      ['marketplace', 'asin'],
+    )]);
+
+    expect(registry.resolve('ASIN_DETAIL')).toBeUndefined();
+    expect(snapshot.capabilities).not.toHaveProperty('ASIN_DETAIL');
+  });
+
+  it('never lets optional asin_detail substitute for the critical ASIN trend capability', async () => {
+    const registry = new SellerSpriteToolRegistry();
+
+    const snapshot = await registry.refresh(async () => [mcpTool(
+      'asin_detail', 'ASIN detail with current sales trend summary', ['marketplace', 'asin'],
+    )]);
+
+    expect(registry.resolve('ASIN_DETAIL')?.name).toBe('asin_detail');
+    expect(registry.resolve('ASIN_SALES_TREND')).toBeUndefined();
+    expect(snapshot.missingCapabilities).toContain('ASIN_SALES_TREND');
   });
 
   it('marks a capability missing when names, descriptions, and schemas do not support it', async () => {
@@ -423,6 +475,35 @@ describe('SellerSpriteToolRegistry', () => {
     expect(registry.supportsArgument('MARKET_STATISTICS', 'marketplace')).toBe(true);
     expect(registry.supportsArgument('MARKET_STATISTICS', 'month')).toBe(false);
   });
+
+  it.each([
+    ['flat', {
+      type: 'object', required: ['marketplace', 'nodeIdPath'],
+      properties: {
+        marketplace: { type: 'string' }, nodeIdPath: { type: 'string' },
+        returnFields: { type: 'array' },
+      },
+    }],
+    ['nested', {
+      type: 'object', required: ['request'],
+      properties: { request: {
+        type: 'object', required: ['marketplace', 'nodeIdPath'],
+        properties: {
+          marketplace: { type: 'string' }, nodeIdPath: { type: 'string' },
+          returnFields: { type: 'number' },
+        },
+      } },
+    }],
+  ])('does not certify a non-string %s returnFields argument', async (_shape, inputSchema) => {
+    const registry = new SellerSpriteToolRegistry();
+    await registry.refresh(async () => [{
+      name: 'market_research_statistics',
+      inputSchema: inputSchema as McpToolDefinition['inputSchema'],
+    }]);
+
+    expect(registry.supportsArgument('MARKET_STATISTICS', 'returnFields')).toBe(true);
+    expect(registry.supportsStringArgument('MARKET_STATISTICS', 'returnFields')).toBe(false);
+  });
 });
 
 const discoveredTools: McpToolDefinition[] = [
@@ -460,5 +541,6 @@ const _allCapabilitiesAreCovered: Record<SellerSpriteCapability, true> = {
   PRODUCT_CONCENTRATION: true,
   ASIN_SALES_TREND: true,
   ASIN_COMPETITOR_DISCOVERY: true,
+  ASIN_DETAIL: true,
 };
 void _allCapabilitiesAreCovered;

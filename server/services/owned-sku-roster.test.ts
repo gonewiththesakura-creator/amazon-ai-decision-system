@@ -168,6 +168,13 @@ describe('sellable child SKU roster', () => {
       .toEqual({ id: 'parent-history' });
   });
 
+  it('rejects an active parent master as an executive comparison SKU', async () => {
+    database = setupFamily();
+    const app = createApp({ database });
+
+    await request(app).get('/api/dashboard/executive?compareSkuIds=parent').expect(404);
+  });
+
   it('uses only sellable children for Go Live Evidence requirements', () => {
     database = setupFamily();
 

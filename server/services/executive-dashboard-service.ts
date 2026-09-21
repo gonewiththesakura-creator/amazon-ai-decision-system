@@ -93,7 +93,7 @@ export class ExecutiveDashboardService {
     this.freshness = new DashboardFreshnessService(database);
   }
 
-  getDashboard(range: TimeRange, skuId?: string): ExecutiveDashboardViewModel {
+  getDashboard(range: TimeRange, skuId?: string, comparisonSkuIds?: string[]): ExecutiveDashboardViewModel {
     const settings = this.intelligence.getSettings();
     const owned = this.activeOwnedProducts(settings.marketplace);
     const market = settings.defaultMarketId
@@ -107,7 +107,7 @@ export class ExecutiveDashboardService {
       ? market.node.growth30d
       : null;
     const ownedSkuPerformance = this.ownedPerformance(owned, formalOwnedInsights);
-    const overviewOwned = selectOverviewProducts(owned, ownedSkuPerformance, skuId);
+    const overviewOwned = selectOverviewProducts(owned, ownedSkuPerformance, skuId, comparisonSkuIds);
     const rawTrend = this.generalTrendSeries(market, overviewOwned);
     const trendComparison = buildIndexedSeries(rawTrend, range, 'overview');
     const fastGrowth = this.fastGrowthCompetitors(owned, settings.marketplace);
@@ -151,6 +151,7 @@ export class ExecutiveDashboardService {
       },
       trendComparison: trendComparison.series,
       trendComparisonMeta: comparisonMeta(trendComparison),
+      comparisonSkuIds: overviewOwned.map((product) => product.id),
       ownedSkuPerformance,
       marketDistribution: buildMarketDistribution(market),
       fastGrowthCompetitors: fastGrowth.items,
@@ -431,9 +432,16 @@ export function selectOverviewProducts(
   owned: OwnedProductSummary[],
   performance: ExecutiveSkuPerformance[],
   focusSkuId?: string,
+  comparisonSkuIds?: string[],
 ): OwnedProductSummary[] {
   if (owned.length <= 5) return owned;
   const byId = new Map(owned.map((product) => [product.id, product]));
+  if (comparisonSkuIds?.length) {
+    return comparisonSkuIds
+      .map((id) => byId.get(id))
+      .filter((product): product is OwnedProductSummary => Boolean(product))
+      .slice(0, 5);
+  }
   const performanceById = new Map(performance.map((item) => [item.id, item]));
   const selected: OwnedProductSummary[] = [];
   const selectedIds = new Set<string>();
