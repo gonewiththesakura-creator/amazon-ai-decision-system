@@ -177,6 +177,49 @@ describe('SellerSpriteMcpClient', () => {
     expect(transport.listCursors).toEqual([undefined, undefined]);
   });
 
+  it('uses fresh tool discovery as connection certification without calling optional ping', async () => {
+    const transport = new FakeTransport({
+      pages: [listResult(fiveTools)],
+      pingOutcome: httpError(403, 'forbidden'),
+    });
+    const client = new SellerSpriteMcpClient({ transport });
+
+    await expect(client.connectionTest()).resolves.toMatchObject({
+      connected: true, authenticated: true, toolCount: 5,
+    });
+    expect(transport.listCursors).toEqual([undefined]);
+    expect(transport.pingCount).toBe(0);
+  });
+
+  it('reports fresh tool discovery authentication failures without calling optional ping', async () => {
+    const transport = new FakeTransport({
+      listOutcomes: [httpError(401, 'unauthorized')],
+    });
+    const client = new SellerSpriteMcpClient({
+      transport,
+      retry: { maxAttempts: 1, baseDelayMs: 1 },
+    });
+
+    await expect(client.connectionTest()).resolves.toEqual({
+      connected: false, authenticated: false, toolCount: 0, errorCode: 'AUTH_ERROR',
+    });
+    expect(transport.pingCount).toBe(0);
+  });
+
+  it('reports initialization failures before discovery without calling optional ping', async () => {
+    const transport = new FakeTransport({ connectOutcome: httpError(503, 'unavailable') });
+    const client = new SellerSpriteMcpClient({
+      transport,
+      retry: { maxAttempts: 1, baseDelayMs: 1 },
+    });
+
+    await expect(client.connectionTest()).resolves.toEqual({
+      connected: false, authenticated: true, toolCount: 0, errorCode: 'REMOTE_ERROR',
+    });
+    expect(transport.listCursors).toEqual([]);
+    expect(transport.pingCount).toBe(0);
+  });
+
   it('retries transient tool discovery failures with the same bounded backoff', async () => {
     const delays: number[] = [];
     const transport = new FakeTransport({
@@ -467,6 +510,7 @@ class FakeTransport implements SellerSpriteMcpTransport {
   readonly listCursors: Array<string | undefined> = [];
   callCount = 0;
   closeCount = 0;
+  pingCount = 0;
   private pageIndex = 0;
   private outcomeIndex = 0;
 
@@ -476,12 +520,17 @@ class FakeTransport implements SellerSpriteMcpTransport {
     callOutcomes?: unknown[];
     hangCallsUntilAbort?: boolean;
     connectOutcome?: Error;
+    pingOutcome?: Error;
   }) {}
 
   async connect(): Promise<void> {
     if (this.options.connectOutcome) throw this.options.connectOutcome;
   }
-  async ping(): Promise<Record<string, unknown>> { return { _meta: { progressToken: 'ping' } }; }
+  async ping(): Promise<Record<string, unknown>> {
+    this.pingCount += 1;
+    if (this.options.pingOutcome) throw this.options.pingOutcome;
+    return { _meta: { progressToken: 'ping' } };
+  }
 
   async listTools(
     params: { cursor?: string },

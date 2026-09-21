@@ -139,8 +139,8 @@ export class SellerSpriteMcpClient {
 
   async connectionTest(): Promise<{ connected: boolean; authenticated: boolean; toolCount: number; errorCode?: SellerSpriteMcpErrorCode }> {
     try {
-      const transport = await this.ensureTransport();
-      await this.withTimeout((signal) => transport.ping({ signal }));
+      // Fresh discovery exercises initialization, authentication, and a real provider request.
+      // MCP ping is optional and SellerSprite may reject or ignore it.
       const tools = await this.listTools({ fresh: true });
       return { connected: true, authenticated: true, toolCount: tools.length };
     } catch (error) {

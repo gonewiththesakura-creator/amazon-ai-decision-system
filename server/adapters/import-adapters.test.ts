@@ -71,6 +71,59 @@ describe('file import adapters', () => {
     expect(batch.entityType).toBe('owned_product_master');
   });
 
+  it('preserves UTF-8 Chinese text in CSV rows', () => {
+    const adapter = new SellerSpriteImportAdapter();
+    const batch = adapter.ingest({
+      buffer: Buffer.from([
+        'marketplace,asin,sku,internalName,brand,title,productType,parentAsin,variationTheme,marketNode,monitoringEnabled,status',
+        'US,B0CHINESE001,SKU-中文,刘总枕头,ELOVNOVA,颈椎记忆棉枕头,人体工学枕,,,,true,active',
+      ].join('\n'), 'utf8'),
+      format: 'csv', filename: 'utf8-owned-products.csv', entityType: 'owned_product_master',
+    });
+
+    expect(batch.rows[0]?.values).toMatchObject({
+      sku: 'SKU-中文',
+      internalname: '刘总枕头',
+      title: '颈椎记忆棉枕头',
+      producttype: '人体工学枕',
+    });
+  });
+
+  it('preserves UTF-8 BOM CSV headers, separator directives, and Chinese text', () => {
+    const adapter = new SellerSpriteImportAdapter();
+    const csv = [
+      'sep=;',
+      '"marketplace";"asin";"sku";"internalName";"brand";"title";"productType";"parentAsin";"variationTheme";"marketNode";"monitoringEnabled";"status"',
+      '"US";"B0CHINESE02";"SKU-中文";"刘总枕头";"ELOVNOVA";"颈椎记忆棉枕头";"人体工学枕";;;"颈椎枕";"true";"active"',
+    ].join('\r\n');
+    const batch = adapter.ingest({
+      buffer: Buffer.concat([Buffer.from([0xef, 0xbb, 0xbf]), Buffer.from(csv, 'utf8')]),
+      format: 'csv', filename: 'utf8-bom-owned-products.csv',
+    });
+
+    expect(batch.entityType).toBe('owned_product_master');
+    expect(batch.rows[0]?.values).toMatchObject({
+      marketplace: 'US', sku: 'SKU-中文', internalname: '刘总枕头', title: '颈椎记忆棉枕头',
+    });
+  });
+
+  it('preserves UTF-16LE BOM CSV support', () => {
+    const adapter = new SellerSpriteImportAdapter();
+    const csv = [
+      'marketplace,asin,sku,internalName,brand,title,productType,parentAsin,variationTheme,marketNode,monitoringEnabled,status',
+      'US,B0CHINESE03,SKU-中文,腰枕,ELOVNOVA,腰部支撑枕,人体工学枕,,,腰枕,true,active',
+    ].join('\r\n');
+    const batch = adapter.ingest({
+      buffer: Buffer.concat([Buffer.from([0xff, 0xfe]), Buffer.from(csv, 'utf16le')]),
+      format: 'csv', filename: 'utf16le-owned-products.csv',
+    });
+
+    expect(batch.entityType).toBe('owned_product_master');
+    expect(batch.rows[0]?.values).toMatchObject({
+      marketplace: 'US', sku: 'SKU-中文', internalname: '腰枕', title: '腰部支撑枕',
+    });
+  });
+
   it('does not let ImportService bypass a selected adapter', () => {
     database = openDatabase(':memory:');
     const adapter = new SellerSpriteImportAdapter();

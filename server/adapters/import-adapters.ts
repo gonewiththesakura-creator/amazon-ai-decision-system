@@ -91,13 +91,23 @@ export class AmazonImportAdapter extends FileImportAdapter {
 
 function readRows(buffer: Buffer, format: FileImportInput['format']): ImportRow[] {
   if (buffer.length === 0) throw new Error('文件为空。');
-  const workbook = XLSX.read(buffer, { type: 'buffer', raw: false, dense: false });
+  // Marketplace CSV exports without a BOM are UTF-8. Keep BOM-bearing input
+  // byte-based so SheetJS can still detect UTF-8/UTF-16 and separator hints.
+  const workbook = format === 'csv' && !hasTextBom(buffer)
+    ? XLSX.read(buffer.toString('utf8'), { type: 'string', raw: false, dense: false })
+    : XLSX.read(buffer, { type: 'buffer', raw: false, dense: false });
   const firstSheet = workbook.SheetNames[0];
   if (!firstSheet) throw new Error(`${format.toUpperCase()} 文件没有工作表。`);
   const worksheet = workbook.Sheets[firstSheet];
   const rows = XLSX.utils.sheet_to_json<ImportRow>(worksheet, { defval: null, raw: false });
   if (rows.length === 0) throw new Error('文件中没有可导入的数据行。');
   return rows;
+}
+
+function hasTextBom(buffer: Buffer): boolean {
+  return (buffer[0] === 0xef && buffer[1] === 0xbb && buffer[2] === 0xbf)
+    || (buffer[0] === 0xff && buffer[1] === 0xfe)
+    || (buffer[0] === 0xfe && buffer[1] === 0xff);
 }
 
 function normalizeRow(row: ImportRow): ImportRow {
