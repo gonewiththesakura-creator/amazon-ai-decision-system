@@ -16,7 +16,6 @@ import {
   Settings2,
   Shield,
   Sparkles,
-  Trash2,
   UserRound,
   X,
 } from 'lucide-react';
@@ -306,17 +305,17 @@ export default function SettingsPage() {
     }
   }
 
-  async function removeProduct(product: Product) {
-    if (!window.confirm(`确认删除 ${product.internalName || product.sku || product.asin}？相关快照、竞品关系和监控记录也会删除，此操作不可撤销。`)) return;
+  async function deactivateProduct(product: Product) {
+    if (!window.confirm(`确认停用 ${product.internalName || product.sku || product.asin}？主档、历史 Snapshot、竞品关系和审计记录会保留，当前监控将关闭。`)) return;
     setDeletingProductId(product.id);
     setError(null);
     try {
-      await request<{ id: string; deleted: boolean }>(`/api/owned-products/${encodeURIComponent(product.id)}`, { method: 'DELETE' });
+      await request<{ id: string; deactivated: boolean }>(`/api/owned-products/${encodeURIComponent(product.id)}`, { method: 'DELETE' });
       setProducts((current) => current.filter((item) => item.id !== product.id));
       await reloadAppSettings();
-      setNotice(`已删除 ${product.internalName || product.sku || product.asin}。`);
+      setNotice(`已停用 ${product.internalName || product.sku || product.asin}，历史记录已保留。`);
     } catch (caught) {
-      setError(caught instanceof Error ? caught.message : '删除产品失败');
+      setError(caught instanceof Error ? caught.message : '停用产品失败');
     } finally {
       setDeletingProductId(null);
     }
@@ -424,7 +423,7 @@ export default function SettingsPage() {
               {products.length === 0 ? (
                 <div className="empty-state compact"><PackagePlus size={27} /><h3>尚未录入自有 SKU</h3><p>使用批量向导初始化现有业务；每行独立保存，完成后再导入快照与设置竞品。</p><button className="button button-primary" type="button" disabled={isViewer} onClick={openBatchForm}><Plus size={16} />批量初始化自有 SKU</button></div>
               ) : (
-                <div className="data-table-wrap"><table className="data-table"><thead><tr><th>产品</th><th>ASIN / SKU</th><th>类型</th><th>Marketplace</th><th>市场节点</th><th>监控</th><th><span className="visually-hidden">管理</span></th></tr></thead><tbody>{products.map((product) => <tr key={product.id}><td><div className="product-cell"><ProductImage src={product.imageUrl} alt={product.title} size="sm" /><div><strong>{product.internalName || product.title}</strong><small>{product.brand}</small></div></div></td><td><span>{product.asin}</span><small>{product.sku || '未设置 SKU'}</small></td><td>{product.productType}</td><td>{product.marketplace}</td><td>{product.marketNodeId}</td><td><span className={`status-badge ${product.monitoringEnabled ? 'success' : 'neutral'}`}>{product.monitoringEnabled ? '已启用' : '未启用'}</span></td><td><div className="row-actions"><button className="icon-button" type="button" aria-label={`编辑 ${product.internalName || product.asin}`} title="编辑产品" disabled={isViewer || deletingProductId !== null} onClick={() => openProductEditor(product)}><Pencil size={15} /></button><button className="icon-button danger-text" type="button" aria-label={`删除 ${product.internalName || product.asin}`} title="删除产品" disabled={isViewer || deletingProductId !== null} onClick={() => void removeProduct(product)}>{deletingProductId === product.id ? <Loader2 className="spin" size={15} /> : <Trash2 size={15} />}</button></div></td></tr>)}</tbody></table></div>
+                <div className="data-table-wrap"><table className="data-table"><thead><tr><th>产品</th><th>ASIN / SKU</th><th>类型</th><th>Marketplace</th><th>市场节点</th><th>监控</th><th><span className="visually-hidden">管理</span></th></tr></thead><tbody>{products.map((product) => <tr key={product.id}><td><div className="product-cell"><ProductImage src={product.imageUrl} alt={product.title} size="sm" /><div><strong>{product.internalName || product.title}</strong><small>{product.brand}</small></div></div></td><td><span>{product.asin}</span><small>{product.sku || '未设置 SKU'}</small></td><td>{product.productType}</td><td>{product.marketplace}</td><td>{product.marketNodeId}</td><td><span className={`status-badge ${product.monitoringEnabled ? 'success' : 'neutral'}`}>{product.monitoringEnabled ? '已启用' : '未启用'}</span></td><td><div className="row-actions"><button className="icon-button" type="button" aria-label={`编辑 ${product.internalName || product.asin}`} title="编辑产品" disabled={isViewer || deletingProductId !== null} onClick={() => openProductEditor(product)}><Pencil size={15} /></button><button className="icon-button danger-text" type="button" aria-label={`停用 ${product.internalName || product.asin}`} title="停用产品并保留历史" disabled={isViewer || deletingProductId !== null} onClick={() => void deactivateProduct(product)}>{deletingProductId === product.id ? <Loader2 className="spin" size={15} /> : <CircleOff size={15} />}</button></div></td></tr>)}</tbody></table></div>
               )}
             </section>
           )}

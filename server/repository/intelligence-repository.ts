@@ -549,6 +549,9 @@ export class IntelligenceRepository {
       level: numberValue(row.level),
       marketplace: stringValue(row.marketplace),
       categoryId: row.category_id === null ? undefined : stringValue(row.category_id),
+      sellerSpriteNodePath: row.sellersprite_confirmed_node_path === null
+        ? undefined
+        : stringValue(row.sellersprite_confirmed_node_path),
       keywords: jsonValue(row.keywords_json, []),
       status: stringValue(row.status),
       snapshotAvailable: Boolean(latest),

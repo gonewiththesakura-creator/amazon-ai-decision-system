@@ -62,14 +62,24 @@ describe('dynamic owned roster integration', () => {
         WHERE id = 'source-sellersprite-mcp'
       `).run(new Date().toISOString());
 
+      const directOwner = fixture.ownedProducts[0]!;
+      await fixture.sync.discoverCompetitors({ ownedProductId: directOwner.id });
+      const candidate = fixture.sync.listCompetitorCandidates(directOwner.id)[0]!;
+      fixture.sync.confirmCompetitorCandidate({
+        ownedProductId: directOwner.id,
+        candidateId: candidate.id,
+        relationType: 'direct',
+        reason: 'Dynamic roster human confirmation',
+      });
+
       const run = await fixture.sync.syncCriticalBatch({ marketId: MARKET_ID, month: '202608' });
 
       expect(run).toMatchObject({
         taskId: run.runId,
         marketSnapshots: 2,
         productSnapshots: total * 2,
-        candidateCoverage: { status: 'success', total, success: total, failed: 0 },
-        competitorCoverage: { status: 'success', total: 0, success: 0, failed: 0 },
+        candidateCoverage: { status: 'success', total, success: total, failed: 0, candidates: total },
+        competitorCoverage: { status: 'success', total: 1, success: 1, failed: 0 },
       });
       expect(database!.prepare(`
         SELECT total, success, failed, status FROM data_tasks WHERE id = ?
@@ -78,7 +88,7 @@ describe('dynamic owned roster integration', () => {
         SELECT COUNT(*) AS count FROM mcp_call_logs
         WHERE sync_run_id = ? AND capability = 'ASIN_SALES_TREND'
           AND status = 'success' AND cache_hit = 0
-      `).get(run.runId)).toEqual({ count: total });
+      `).get(run.runId)).toEqual({ count: total + 1 });
       expect(database!.prepare(`
         SELECT COUNT(*) AS count FROM mcp_call_logs
         WHERE sync_run_id = ? AND capability = 'ASIN_COMPETITOR_DISCOVERY'
@@ -112,7 +122,7 @@ describe('dynamic owned roster integration', () => {
         SELECT COUNT(*) AS count, COUNT(DISTINCT entity_id) AS entities
         FROM mcp_sync_observation_links
         WHERE sync_run_id = ? AND snapshot_kind = 'product'
-      `).get(run.runId)).toEqual({ count: total * 2, entities: total });
+      `).get(run.runId)).toEqual({ count: (total + 1) * 2, entities: total + 1 });
 
       const coverage = new DataCoverageService(database!).getCoverage('US');
       expect(coverage.primaryMarket).toMatchObject({ covered: 1, total: 1, status: 'complete' });
@@ -165,6 +175,9 @@ describe('dynamic owned roster integration', () => {
         sellerSpriteCriticalRunId: run.runId,
         verifiedEvidenceEntities: total + 1,
         requiredEvidenceEntities: total + 1,
+        hasPrimaryMarketHistory90d: true,
+        runLinkedCandidateGroups: total,
+        confirmedDirectCompetitors: 1,
         readyForDemoCleanup: true,
         hasMinimumRealCoverage: true,
       });
@@ -183,14 +196,22 @@ function createFixture(total: number): {
   database.exec(`
     INSERT INTO market_nodes (
       id, name, parent_id, level, marketplace, category_id, keywords_json,
-      status, source_type, created_at
+      status, source_type, created_at, sellersprite_confirmed_node_path
     ) VALUES (
       '${MARKET_ID}', 'Dynamic Memory Foam', NULL, 1, 'US', '${NODE_PATH}', '[]',
-      'active', 'import', '2026-09-20T00:00:00.000Z'
+      'active', 'import', '2026-09-20T00:00:00.000Z', '${NODE_PATH}'
     );
     UPDATE app_settings
     SET mode = 'live', marketplace = 'US', default_market_id = '${MARKET_ID}'
     WHERE id = 1;
+    INSERT INTO market_snapshots (
+      id, market_node_id, date, monthly_sales, source, source_type, collected_at,
+      period, is_estimated, confidence, observation_date, dedup_key
+    ) VALUES (
+      'dynamic-market-history', '${MARKET_ID}', '2026-05-31', 1000,
+      'Historical import fixture', 'import', '2026-06-01T00:00:00.000Z',
+      '1M', 0, 1, '2026-05-31', 'dynamic-market-history|2026-05-31|import'
+    );
   `);
   const insertProduct = database.prepare(`
     INSERT INTO products (
@@ -305,7 +326,12 @@ class DynamicRosterTransport implements SellerSpriteMcpTransport {
           { month: '2026-08', childUnitSales: 120, childSalesRevenue: 4_800 },
         ],
       },
-      asin_competitor: [],
+      asin_competitor: [{
+        asin: 'B0PEER0001',
+        title: 'Dynamic direct competitor',
+        brand: 'Peer',
+        units: 100,
+      }],
       market_research: {
         marketplace: request.marketplace,
         nodeIdPath: request.nodeIdPath,

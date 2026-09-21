@@ -26,6 +26,14 @@ const coverage: DataCoverageReport = {
   activeOwnedProducts: { covered: 3, total: 4, status: 'partial', label: '部分覆盖' },
   coreCompetitors: { covered: 0, total: 5, status: 'missing', label: '缺失' },
   history90d: { covered: 2, total: 4, status: 'partial', label: '部分覆盖' },
+  primaryMarketHistory90d: { covered: 1, total: 1, status: 'complete', label: '完整' },
+  ownedProductHistory90d: { covered: 2, total: 4, status: 'partial', label: '部分覆盖' },
+  ownedProductHistory180d: { covered: 1, total: 4, status: 'partial', label: '部分覆盖' },
+  coreCompetitorHistory90d: { covered: 0, total: 5, status: 'missing', label: '缺失' },
+  coreDirectCompetitorTarget: {
+    covered: 1, total: 4, status: 'partial', label: '部分覆盖',
+    minimumPerOwnedProduct: 3, preferredMaximumPerOwnedProduct: 5,
+  },
   amazonActual: { covered: 0, total: 4, status: 'missing', label: '缺失' },
 };
 
@@ -36,13 +44,18 @@ beforeEach(() => {
 afterEach(() => { cleanup(); vi.clearAllMocks(); vi.unstubAllGlobals(); });
 
 describe('DataTasksPage coverage', () => {
-  it('renders all five accessible counters alongside Import Center', async () => {
+  it('renders hard market history and non-blocking owned and competitor targets', async () => {
     render(<MemoryRouter><DataTasksPage /></MemoryRouter>);
     expect(await screen.findByRole('heading', { name: '真实数据覆盖' })).toBeInTheDocument();
     expect(screen.getByLabelText('主市场覆盖：1 / 1，完整')).toBeInTheDocument();
     expect(screen.getByLabelText('活跃自有产品覆盖：3 / 4，部分覆盖')).toBeInTheDocument();
     expect(screen.getByLabelText('核心竞品覆盖：0 / 5，缺失')).toBeInTheDocument();
-    expect(screen.getByLabelText('90 天历史覆盖：2 / 4，部分覆盖')).toBeInTheDocument();
+    expect(screen.getByLabelText('主市场 90 天历史覆盖：1 / 1，完整')).toBeInTheDocument();
+    expect(screen.getByLabelText('自有 SKU 90 天历史覆盖：2 / 4，部分覆盖')).toBeInTheDocument();
+    expect(screen.getByLabelText('自有 SKU 180 天历史覆盖：1 / 4，部分覆盖')).toBeInTheDocument();
+    expect(screen.getByLabelText('核心竞品 90 天历史覆盖：0 / 5，缺失')).toBeInTheDocument();
+    expect(screen.getByLabelText('人工确认 Direct 竞品目标（每 SKU 3-5）覆盖：1 / 4，部分覆盖'))
+      .toBeInTheDocument();
     expect(screen.getByLabelText('Amazon 实际数据覆盖：0 / 4，缺失')).toBeInTheDocument();
     expect(screen.getByRole('heading', { name: '审核文件导入' })).toBeInTheDocument();
   });
@@ -115,6 +128,23 @@ describe('DataTasksPage coverage', () => {
       .toHaveAttribute('href', '/research-jobs/research-job-1');
   });
 
+  it('does not offer generic retry for a failed post-import analysis audit', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({ data: [{
+        id: 'analysis-task', syncRunId: null, researchJobId: null,
+        name: '导入后分析', taskType: 'post_import_analysis', target: 'import-batch-1',
+        sourceId: 'source-sellersprite-import', source: 'SellerSprite Import',
+        marketplace: 'US', status: 'failed', startedAt: '2026-09-20T00:00:00.000Z',
+        completedAt: '2026-09-20T00:01:00.000Z', total: 1, success: 0, failed: 1,
+        errorLog: '导入已提交，自动分析未完成。', createdAt: '2026-09-20T00:00:00.000Z',
+      }] }),
+    }));
+    render(<MemoryRouter><DataTasksPage /></MemoryRouter>);
+    fireEvent.click(await screen.findByRole('button', { name: '查看 导入后分析 错误详情' }));
+    expect(screen.queryByRole('button', { name: '创建重试任务' })).not.toBeInTheDocument();
+  });
+
   it('passes explicit Amazon report period and marketplace to preview', async () => {
     vi.mocked(previewImport).mockResolvedValue({
       token: 'preview', detectedType: 'amazon_business_report', entityType: 'product',
@@ -179,6 +209,27 @@ describe('DataTasksPage coverage', () => {
     fireEvent.click(confirm);
     await waitFor(() => expect(confirmImport).toHaveBeenCalledWith('partial-preview'));
     expect(await screen.findByRole('status')).toHaveTextContent('1 行未写入');
+  });
+
+  it('does not offer partial confirmation for an owned-product master with rejected rows', async () => {
+    vi.mocked(previewImport).mockResolvedValue({
+      token: 'invalid-master', contentDigest: 'digest', detectedType: 'owned_product_master',
+      entityType: 'owned_product_master', totalCount: 5, newCount: 4, updateCount: 0,
+      duplicateCount: 0, errorCount: 1,
+      mappings: [{ sourceHeader: 'asin', targetField: 'asin' }], rows: [],
+      errors: ['第 6 行：缺少必填字段 title。'], previewRowLimit: 20, previewedCount: 0,
+      rowsOmitted: 5, expiresAt: '2026-09-20T00:00:00.000Z',
+    });
+    render(<MemoryRouter><DataTasksPage /></MemoryRouter>);
+    const file = new File(['asin\nB0VALID001'], 'owned-product-master.csv', { type: 'text/csv' });
+    fireEvent.change(document.getElementById('import-center-file')!, { target: { files: [file] } });
+
+    const confirm = await screen.findByRole('button', { name: '确认导入' });
+    expect(confirm).toBeDisabled();
+    expect(screen.queryByRole('checkbox', { name: /只导入有效行/ })).not.toBeInTheDocument();
+    expect(screen.getByText(/产品主数据必须整批通过校验/)).toBeInTheDocument();
+    fireEvent.click(confirm);
+    expect(confirmImport).not.toHaveBeenCalled();
   });
 
   it('locks the file and report period while the preview request is pending', async () => {

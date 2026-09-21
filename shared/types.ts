@@ -121,6 +121,7 @@ export interface MarketNode {
   level: number;
   marketplace: string;
   categoryId?: string;
+  sellerSpriteNodePath?: string;
   keywords: string[];
   status: string;
   snapshotAvailable: boolean;
@@ -820,6 +821,11 @@ export interface DataCoverageCounter {
   label: '完整' | '部分覆盖' | '缺失' | '不适用';
 }
 
+export interface DirectCompetitorTargetCoverage extends DataCoverageCounter {
+  minimumPerOwnedProduct: number;
+  preferredMaximumPerOwnedProduct: number;
+}
+
 export interface DataCoverageReport {
   generatedAt: string;
   marketplace: string;
@@ -827,6 +833,11 @@ export interface DataCoverageReport {
   activeOwnedProducts: DataCoverageCounter;
   coreCompetitors: DataCoverageCounter;
   history90d: DataCoverageCounter;
+  primaryMarketHistory90d: DataCoverageCounter;
+  ownedProductHistory90d: DataCoverageCounter;
+  ownedProductHistory180d: DataCoverageCounter;
+  coreCompetitorHistory90d: DataCoverageCounter;
+  coreDirectCompetitorTarget: DirectCompetitorTargetCoverage;
   amazonActual: DataCoverageCounter;
 }
 

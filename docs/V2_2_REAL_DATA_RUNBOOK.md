@@ -8,7 +8,6 @@
 
 ```powershell
 npm install
-Copy-Item .env.example .env
 npm run dev
 ```
 
@@ -22,13 +21,13 @@ npm run dev
 npm run --silent acceptance:real -- --month 202609
 ```
 
-该命令按固定顺序执行预检、连接、关键同步与本次 fresh `listTools` schema 指纹检查、候选发现和直接竞品 secondary coverage 校验、该运行捕获的真实子 SKU roster 对应的数据库驾驶舱读取及同 `runId` 指标读路径证明、市场/产品 Research Job、同 `runId` Evidence 及 Go Live 清理前证明。读路径证明允许其他 Demo 行保留，但本次主市场和每个真实子 SKU 当前选中的指标必须链接到本次运行；证明失败时不会创建验收 Job。默认连接本机 `127.0.0.1:8787`，单次请求最长等待两小时；可用 `--base-url http://127.0.0.1:<port>` 和 `--timeout-ms <milliseconds>` 指定其他本机 API 与 1 秒到 4 小时的边界。只连接可信的本机 API，不跟随 HTTP 重定向；当前 Admin/Viewer 不是真实部署身份认证。输出只有布尔状态、计数、服务端 `runId` 和安全规范化后的 schema 合同 SHA-256，不输出端点、原始 schema、ASIN、标题、文件路径、远端错误或 Secret。`dashboardOwnedProducts` 是页面实际行数，`verifiedDashboardOwnedProducts` 是本次运行 roster 中通过读路径证明的真实 SKU 数；保留 Demo 时两者可以不同。`acceptanceScope=critical_market_and_owned_skus` 限定 `ok` 的含义，`manualCompetitorReview=not_checked` 表示该命令不证明人工竞品审核；`competitorCandidates=0` 或 `directCompetitors=0` 时不能宣称首条含竞品的真实验收链完成。失败返回非零退出码。该命令不会预览/备份/清理 Demo、切换 Live、确认或拒绝竞品候选，也不会替代产品身份和市场节点的人工核实。
+该命令按固定顺序执行预检、连接、关键同步与本次 fresh `listTools` schema 指纹检查、候选发现和直接竞品 secondary coverage 校验、该运行捕获的真实子 SKU roster 对应的数据库驾驶舱读取及同 `runId` 指标读路径证明、市场/产品 Research Job、同 `runId` Evidence 及 Go Live 清理前证明。读路径证明允许其他 Demo 行保留，但本次主市场和每个真实子 SKU 当前选中的指标必须链接到本次运行；证明失败时不会创建验收 Job。默认连接本机 `127.0.0.1:8787`，单次请求最长等待两小时；可用 `--base-url http://127.0.0.1:<port>` 和 `--timeout-ms <milliseconds>` 指定其他本机 API 与 1 秒到 4 小时的边界。只连接可信的本机 API，不跟随 HTTP 重定向；当前 Admin/Viewer 不是真实部署身份认证。输出只有布尔状态、计数、服务端 `runId` 和安全规范化后的 schema 合同 SHA-256，不输出端点、原始 schema、ASIN、标题、文件路径、远端错误或 Secret。`dashboardOwnedProducts` 是页面实际行数，`verifiedDashboardOwnedProducts` 是本次运行 roster 中通过读路径证明的真实 SKU 数；保留 Demo 时两者可以不同。`acceptanceScope=critical_market_and_owned_skus` 限定 `ok` 的含义，`manualCompetitorReview=confirmed` 仅在数据库中有已人工确认的真实直接竞品时出现，缺少时为 `missing`；`competitorCandidates=0` 或 `directCompetitors=0` 时不能宣称首条含竞品的真实验收链完成。失败返回非零退出码。该命令不会预览/备份/清理 Demo、切换 Live、确认或拒绝竞品候选，也不会替代产品身份和市场节点的人工核实。
 
 ## 先验证真实链路
 
 1. 保留现有 Demo。打开“设置 -> 数据源”，执行“连接测试”。检查认证、工具数量、必需能力及延迟；能力列表来自实际 `listTools`。诊断不应显示密钥。
-2. 确认当前 Marketplace 和“默认市场节点”属于目标站点。在“设置 -> 数据源”输入并核对 SellerSprite 数字节点路径，勾选站点/类目范围确认后保存为 `market_nodes.category_id`；未映射的市场会拒绝同步，不退用本地节点 ID。不能因为名称包含 pillow 就把宽泛 Bed Pillows 类目当成已验证的 Memory Foam Pillow 细分市场。
-3. 打开“数据任务 -> 审核文件导入”，选取 `examples/owned-product-master-template.csv` 结构的真实产品主数据文件。预览识别类型、新增/更新/重复/错误计数、字段映射、样例行和拒绝原因；未知类型先人工选择，再用新预览确认。模板列为 `marketplace,asin,sku,internalName,brand,title,productType,parentAsin,variationTheme,marketNode,monitoringEnabled,status`。按真实父子 ASIN 填写 `parentAsin`/`variationTheme`，不要把父体销量与子 SKU 销量相加；被拒绝的行需明确确认只导入有效行。
+2. 确认当前 Marketplace 和“默认市场节点”属于目标站点。在“设置 -> 数据源”输入并核对 SellerSprite 数字节点路径，勾选站点/类目范围确认后保存为 `market_nodes.sellersprite_confirmed_node_path`；未映射的市场会拒绝同步，不退用本地节点 ID。不能因为名称包含 pillow 就把宽泛 Bed Pillows 类目当成已验证的 Memory Foam Pillow 细分市场。
+3. 打开“数据任务 -> 审核文件导入”，选取 `examples/owned-product-master-template.csv` 结构的真实产品主数据文件。预览识别类型、新增/更新/重复/错误计数、字段映射、样例行和拒绝原因；未知类型先人工选择，再用新预览确认。模板列为 `marketplace,asin,sku,internalName,brand,title,productType,parentAsin,variationFamilyKey,parentLookupStatus,variationTheme,marketNode,monitoringEnabled,status`。未确认的父体保留空值；已知同族但父体未知时可用稳定的内部 `variationFamilyKey` 与 `pending` 标记，真实父体经核验后才填 `parentAsin` 与 `verified`。独立单品用 `standalone`。不能推断兄弟关系或编造 Variation Theme，也不要把父体销量与子 SKU 销量相加。Product Master 批次是全有或全无：有任何无效行就禁止确认，修正后必须重新预览。
 4. 在“设置 -> 数据源”选观察月份后执行“同步关键数据”。服务端先创建唯一 `runId` 和运行中的 `critical_sync` DataTask；本次 `listTools`/能力快照、主市场及每个当前真实自有 SKU 所在 distinct 子市场的当前月与上月统计/集中度、当前站点全部 active 且非 Mock 的自有 ASIN 趋势、候选发现、已确认直接竞品刷新、Snapshot、metric fact、coverage 和后续 Evidence 都用该 `runId` 关联。所有市场节点的两个月份须由本次运行分别请求、校验和链接，不能拼接两次历史运行；关键市场工具必须在本次发现的 schema 中声明 `month` 参数，统计和集中度响应也必须回显与请求一致的月份，否则本次运行按契约失败处理，不能把无月份响应认证为对应历史月份。主市场、所需子市场双月与全部真实自有 SKU 是原子关键批次：任一关键调用失败时不写本批业务观察，只留下脱敏失败任务和不完整 coverage，并继续展示上一次合法真实 Snapshot，不回退 Mock。相同周期只有在标准化结果完全一致时才可通过 run-to-observation 链接复用；Snapshot 和 fact 的首次来源不被改写，Evidence 继承最近一次完整复核运行，值发生修订则拒绝认证。
 5. 关键批次成功后，候选发现和已确认 `direct` 竞品作为非阻断 secondary 阶段继续运行并分别记录 coverage；单个竞品失败会形成 `partial`，不会推翻关键批次。候选只写入待审核池，不会自动成为直接竞品。到自有产品详情的“竞品”页按价格、形态、功能、人群及相似度人工核对，填写纳入理由并确认或拒绝；也可从该页再次发现候选或单独刷新已确认竞品。关系被撤销或远端 ASIN/站点不一致时拒绝落库。`observationDate` 采用业务月份或趋势点日期，`collectedAt` 是抓取时间。
 6. 查看“数据任务”的真实数据覆盖，以及市场、自有产品和驾驶舱上的来源、日期与缺失值。页面读取数据库 Snapshot，刷新页面不会触发 MCP。历史不足时继续通过已验证的 MCP 趋势和文件补数；为主市场及每个当前 active 自有 SKU 分别运行非 Demo Research Job，检查 Rule/Evidence 是否指向本次 `runId` 的真实来源记录，并确认工作流进入 monitoring、最终 Insight 引用了 Evidence、分析和报告步骤均完成。SKU 与市场相对增长只比较同一组基线月和当前月；两者都是 MCP 时还必须属于同一个完整 `runId`，否则进入 `needs_data`。直接竞品和 TOP100 的错位月份或跨运行 MCP 数据不进入均值，不得拼接成相对结论。Amazon 实际值与 MCP 市场值可形成明确标记为混合来源的人工派生结论，但不冒充同运行 MCP Evidence。Go Live 面板中的“运行 Evidence”必须达到“主市场 + 当前全部自有 SKU”的覆盖数。竞品关系仍需人工审核。
@@ -39,7 +38,7 @@ npm run --silent acceptance:real -- --month 202609
 
 走“数据任务 -> 审核文件导入”：选择文件 -> 审核类型、字段映射、样例行和拒绝原因 -> 未知类型人工选择并重新预览 -> 确认导入 -> 查看任务记录。样例最多展示 20 行，未展开行仍会随整个文件处理；对重要批次还应检查原文件或在隔离库验证，不能仅凭样例批准。产品、市场和评论模板分别见 `examples/product-snapshots.csv`、`examples/market-snapshots.csv`、`examples/reviews.csv`。快照文件需要业务日期及模板要求的指标；缺字段的行报错，不会用零填补。预览令牌短期有效，过期需重新预览；同来源/日期/周期的重复记录不会因重复上传而翻倍。旧直传 API 已关闭。
 
-优先核对市场 12 个月（最低约 90 天）、自有 SKU 90–180 天、核心竞品约 90 天。Amazon Business Report 支持已验证的 `(Child) ASIN`、`SKU`、`Units Ordered`、`Ordered Product Sales` 等字段组合，必须明确报表日期范围；其他未知布局仍会拒绝，不能把任意报表当成已兼容结构。导入后检查 `observationDate` 与 `collectedAt` 是否分离、站点/ASIN/Variation 身份是否正确，并查看是否有部分失败。原始文件只留在受控的本地/服务器数据目录，不提交公开仓库。
+优先核对市场 12 个月（至少 90 天）、自有 SKU 90–180 天、核心竞品约 90 天。完整真实验收还要求主市场达到 90 天有效历史、人工确认至少一个真实直接竞品；Live 门禁不会把候选发现当成人工确认。Amazon Business Report 支持已验证的 `(Child) ASIN`、`SKU`、`Units Ordered`、`Ordered Product Sales` 等字段组合，必须明确报表日期范围；其他未知布局仍会拒绝，不能把任意报表当成已兼容结构。导入后检查 `observationDate` 与 `collectedAt` 是否分离、站点/ASIN/Variation 身份是否正确，并查看是否有部分失败。原始文件只留在受控的本地/服务器数据目录，不提交公开仓库。
 
 ## Demo 清理与 Live 激活
 
@@ -56,7 +55,7 @@ npm run --silent acceptance:real -- --month 202609
 
 ## 当前验收边界与检查
 
-已用真实 MCP 对公开类目/公开 ASIN 做过只读能力验证；公开竞品 ASIN **不是自有 ASIN**，宽泛 Bed Pillows 节点**不是已确认的记忆棉细分市场**。在拿到并授权验证真实自有 ASIN、核实正确市场节点以及完成隔离数据库的真实写入/驾驶舱/Evidence 检查前，不宣称 V2.2 的两条真实验收链或 Live 切换已完成。Amazon SP-API 和 Ads API 不在本版正式接入范围。
+本机已完成真实 MCP 初始化、认证、fresh `listTools`、必需 schema 指纹和真实 `product_node` 路径核验，并确认颈椎/Contour 与 Lumbar/Body Positioner 使用不同末级节点。真实 Product Master 仍只处于预览阶段：当前五项业务 SKU 中三项有可用趋势，一项只有身份/类目而无趋势，一项被 provider 标为无效且缺少身份/类目/趋势。全量关键批次必须覆盖当前全部 SKU，因此不能把这部分成功宣称为完整 Critical Sync，也不能用兄弟变体、Mock 或人工猜测补齐。完成五项身份修正/补数以及隔离数据库的真实 Snapshot、Dashboard、ResearchJob/Evidence 检查前，不宣称 V2.2 的两条真实验收链或 Live 切换完成。Amazon SP-API 和 Ads API 不在本版正式接入范围。
 
 代码交付前运行，并以当次输出为准：
 

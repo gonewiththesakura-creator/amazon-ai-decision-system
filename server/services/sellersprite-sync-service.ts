@@ -104,7 +104,7 @@ export interface SellerSpriteSyncPort {
 interface MarketRow {
   id: string;
   marketplace: string;
-  categoryId: string | null;
+  sellerSpriteNodePath: string;
 }
 
 interface ProductRow {
@@ -198,7 +198,8 @@ export class SellerSpriteSyncService {
       const prepared = await this.prepareMarket(input, runId);
       return () => {
         const current = this.requireMarket(market.id);
-        if (current.marketplace !== market.marketplace || current.categoryId !== market.categoryId) {
+        if (current.marketplace !== market.marketplace
+          || current.sellerSpriteNodePath !== market.sellerSpriteNodePath) {
           throw new Error('市场节点在同步期间发生变化，请重新运行。');
         }
         return this.persistMarket(prepared, runId);
@@ -412,7 +413,8 @@ export class SellerSpriteSyncService {
   } {
     const owned = this.requireOwnedProduct(input.ownedProductId);
     const candidate = this.database.prepare(`
-      SELECT id, asin, marketplace, payload_json AS payloadJson, status
+      SELECT id, asin, marketplace, payload_json AS payloadJson,
+        sync_run_id AS syncRunId, status
       FROM competitor_candidates
       WHERE id = ? AND source_product_id = ?
     `).get(input.candidateId, owned.id) as {
@@ -420,6 +422,7 @@ export class SellerSpriteSyncService {
       asin: string;
       marketplace: string;
       payloadJson: string;
+      syncRunId: string | null;
       status: string;
     } | undefined;
     if (!candidate) throw new Error('竞争候选不存在。');
@@ -437,6 +440,8 @@ export class SellerSpriteSyncService {
         marketplace: owned.marketplace,
         asin: candidate.asin,
         parentAsin: existing ? undefined : stringOrNull(payload.parentAsin) ?? undefined,
+        sourceType: 'mcp',
+        syncRunId: candidate.syncRunId ?? undefined,
       });
       if (!resolution.productId) throw new Error('竞争候选产品身份创建失败。');
       if (resolution.disposition === 'created') {
@@ -490,9 +495,9 @@ export class SellerSpriteSyncService {
     const runId = randomUUID();
     const startedAt = new Date().toISOString();
     const scope = {
-      marketId: market.id, nodeIdPath: market.categoryId, month, baselineMonth,
+      marketId: market.id, nodeIdPath: market.sellerSpriteNodePath, month, baselineMonth,
       marketMonths: [baselineMonth, month],
-      marketNodes: marketNodes.map((node) => ({ id: node.id, nodeIdPath: node.categoryId })),
+      marketNodes: marketNodes.map((node) => ({ id: node.id, nodeIdPath: node.sellerSpriteNodePath })),
       ownedProducts: products.map(({ id, asin, marketNodeId }) => ({ id, asin, marketNodeId })),
     };
     this.database.prepare(`
@@ -517,7 +522,8 @@ export class SellerSpriteSyncService {
 
       primary = transaction(this.database, () => {
         const currentMarket = this.requireMarket(market.id);
-        if (currentMarket.marketplace !== market.marketplace || currentMarket.categoryId !== market.categoryId
+        if (currentMarket.marketplace !== market.marketplace
+          || currentMarket.sellerSpriteNodePath !== market.sellerSpriteNodePath
           || JSON.stringify(this.activeOwnedProducts(market.marketplace, market.id)) !== JSON.stringify(products)
           || JSON.stringify(this.criticalMarketNodes(currentMarket, products)) !== JSON.stringify(marketNodes)) {
           throw new Error('关键同步期间市场节点或自有 SKU 范围发生变化，请重新运行。');
@@ -709,13 +715,13 @@ export class SellerSpriteSyncService {
     requireObservationMonth = false,
   ): Promise<PreparedMarketObservation> {
     const market = this.requireMarket(input.marketId);
-    if (!market.categoryId || !/^\d+(?::\d+)*$/.test(market.categoryId)) {
-      throw new Error('请先确认并映射 SellerSprite 市场节点路径 category_id。');
+    if (!/^\d+(?::\d+)*$/.test(market.sellerSpriteNodePath)) {
+      throw new Error('请先确认并映射 SellerSprite 市场节点路径。');
     }
     const observationDate = monthEnd(input.month);
     const request = {
       marketplace: market.marketplace,
-      nodeIdPath: market.categoryId,
+      nodeIdPath: market.sellerSpriteNodePath,
       month: compactMonth(input.month),
     };
     const [statistics, concentration] = await Promise.all([
@@ -877,6 +883,8 @@ export class SellerSpriteSyncService {
         marketplace: prepared.product.marketplace,
         asin: prepared.product.asin,
         parentAsin: prepared.parentAsin,
+        sourceType: 'mcp',
+        syncRunId: runId,
       });
     }
     let inserted = 0;
@@ -1046,25 +1054,26 @@ export class SellerSpriteSyncService {
     const rows = this.database.prepare(`
       WITH RECURSIVE market_scope(id) AS (
         SELECT id FROM market_nodes
-        WHERE id = ? AND marketplace = ? AND status = 'active' AND source_type <> 'mock'
+        WHERE id = ? AND marketplace = ? AND source_type <> 'mock'
         UNION
         SELECT child.id FROM market_nodes child
         JOIN market_scope parent ON child.parent_id = parent.id
-        WHERE child.marketplace = ? AND child.status = 'active' AND child.source_type <> 'mock'
+        WHERE child.marketplace = ? AND child.source_type <> 'mock'
       )
       SELECT product.id, product.asin, product.marketplace,
         product.market_node_id AS marketNodeId
       FROM products product
       JOIN market_nodes market ON market.id = product.market_node_id
         AND market.marketplace = product.marketplace
-        AND market.status = 'active' AND market.source_type <> 'mock'
+        AND market.source_type <> 'mock'
+        AND market.sellersprite_confirmed_node_path IS NOT NULL
       JOIN market_scope scope ON scope.id = product.market_node_id
       WHERE product.marketplace = ? AND product.is_owned = 1 AND product.is_parent = 0
         AND product.status = 'active' AND product.source_type <> 'mock'
       ORDER BY product.id
     `).all(rootMarketId, marketplace, marketplace, marketplace) as unknown as ProductRow[];
     if (rows.length !== total.count) {
-      throw new Error('关键同步前置条件失败：全部真实自有 SKU 必须映射到主市场或其启用中的真实子节点。');
+      throw new Error('关键同步前置条件失败：全部真实自有 SKU 必须映射到主市场范围内已确认的 SellerSprite 节点。');
     }
     return rows;
   }
@@ -1108,11 +1117,17 @@ export class SellerSpriteSyncService {
 
   private requireMarket(marketId: string): MarketRow {
     const row = this.database.prepare(`
-      SELECT id, marketplace, category_id AS categoryId
-      FROM market_nodes WHERE id = ? AND status = 'active' AND source_type <> 'mock'
-    `).get(marketId) as MarketRow | undefined;
+      SELECT id, marketplace,
+        sellersprite_confirmed_node_path AS sellerSpriteNodePath
+      FROM market_nodes WHERE id = ? AND source_type <> 'mock'
+    `).get(marketId) as (Omit<MarketRow, 'sellerSpriteNodePath'> & {
+      sellerSpriteNodePath: string | null;
+    }) | undefined;
     if (!row) throw new Error(`市场不存在：${marketId}`);
-    return row;
+    if (!row.sellerSpriteNodePath) {
+      throw new Error(`市场尚未确认 SellerSprite 节点路径：${marketId}`);
+    }
+    return { ...row, sellerSpriteNodePath: row.sellerSpriteNodePath };
   }
 
   private requireOwnedProduct(productId: string): ProductRow {
@@ -1122,7 +1137,8 @@ export class SellerSpriteSyncService {
       FROM products product
       JOIN market_nodes market ON market.id = product.market_node_id
         AND market.marketplace = product.marketplace
-        AND market.status = 'active' AND market.source_type <> 'mock'
+        AND market.source_type <> 'mock'
+        AND market.sellersprite_confirmed_node_path IS NOT NULL
       WHERE product.id = ? AND product.is_owned = 1
         AND product.status = 'active' AND product.source_type <> 'mock'
     `).get(productId) as ProductRow | undefined;

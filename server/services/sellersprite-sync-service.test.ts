@@ -75,10 +75,11 @@ function fixtureDatabase(): AppDatabase {
   const connection = openDatabase(':memory:');
   connection.exec(`
     INSERT INTO market_nodes (
-      id, name, parent_id, level, marketplace, category_id, keywords_json, status,
-      source_type, created_at
+      id, name, parent_id, level, marketplace, category_id,
+      sellersprite_confirmed_node_path, keywords_json, status, source_type, created_at
     ) VALUES (
-      'market-1', 'Bed Pillows', NULL, 1, 'US', '1055398:1063252:1199122:10671043011', '["memory foam pillow"]',
+      'market-1', 'Bed Pillows', NULL, 1, 'US', '1055398:1063252:1199122:10671043011',
+      '1055398:1063252:1199122:10671043011', '["memory foam pillow"]',
       'active', 'import', '2026-09-01T00:00:00.000Z'
     );
     INSERT INTO products (
@@ -99,13 +100,22 @@ function count(table: 'market_snapshots' | 'product_snapshots' | 'competitor_can
 }
 
 describe('SellerSprite real-data sync', () => {
-  it('requires an explicit SellerSprite category path before market sync', async () => {
+  it('requires an explicit confirmed SellerSprite path before market sync', async () => {
     database = fixtureDatabase();
-    database.prepare(`UPDATE market_nodes SET category_id = NULL WHERE id = 'market-1'`).run();
+    database.prepare(`UPDATE market_nodes SET sellersprite_confirmed_node_path = NULL
+      WHERE id = 'market-1'`).run();
     await expect(new SellerSpriteSyncService(database, fixturePort())
       .syncMarket({ marketId: 'market-1', month: '202608' }))
       .rejects.toThrow(/category|节点路径|映射/i);
     expect(count('market_snapshots')).toBe(0);
+  });
+  it('does not let historical analysis status changes disable a confirmed market sync', async () => {
+    database = fixtureDatabase();
+    database.prepare(`UPDATE market_nodes SET status = '等待30D对照' WHERE id = 'market-1'`).run();
+
+    await expect(new SellerSpriteSyncService(database, fixturePort())
+      .syncMarket({ marketId: 'market-1', month: '202608' }))
+      .resolves.toMatchObject({ inserted: 1 });
   });
   it('persists a market observation with real source and nullable missing metrics', async () => {
     database = fixtureDatabase();
@@ -134,6 +144,22 @@ describe('SellerSprite real-data sync', () => {
       .toEqual([{ runId: result.runId }]);
     expect(database.prepare(`SELECT DISTINCT sync_run_id AS runId FROM metric_facts`).all())
       .toEqual([{ runId: result.runId }]);
+  });
+
+  it('records provider-confirmed parent identity with MCP run lineage', async () => {
+    database = fixtureDatabase();
+    const service = new SellerSpriteSyncService(database, fixturePort());
+    const result = await service.syncOwnedProduct({ productId: 'owned-1' });
+
+    expect(database.prepare(`
+      SELECT product_id AS productId, old_lookup_status AS oldStatus,
+        new_lookup_status AS newStatus, source_type AS sourceType,
+        sync_run_id AS syncRunId, import_batch_id AS importBatchId
+      FROM product_identity_events WHERE product_id = 'owned-1'
+    `).get()).toEqual({
+      productId: 'owned-1', oldStatus: 'unknown', newStatus: 'verified',
+      sourceType: 'mcp', syncRunId: result.runId, importBatchId: null,
+    });
   });
 
   it('records a sanitized failed standalone run without writing observations', async () => {
@@ -391,6 +417,13 @@ describe('SellerSprite real-data sync', () => {
     expect((database.prepare(`
       SELECT COUNT(*) AS count FROM competitor_relations WHERE owned_product_id = 'owned-1'
     `).get() as { count: number }).count).toBe(1);
+    expect(database.prepare(`
+      SELECT event.source_type AS sourceType, event.sync_run_id AS syncRunId
+      FROM product_identity_events event
+      WHERE event.product_id = ?
+    `).get(confirmed.competitorProductId)).toEqual({
+      sourceType: 'mcp', syncRunId: result.runId,
+    });
   });
 
   it('tracks standalone candidate discovery and preserves the same candidate across runs', async () => {
@@ -583,7 +616,15 @@ describe('SellerSprite real-data sync', () => {
 
   it('selects a confirmed competitor MCP fact over a later same-date import with fact lineage', async () => {
     database = fixtureDatabase();
-    const service = new SellerSpriteSyncService(database, fixturePort());
+    const original = fixturePort();
+    const service = new SellerSpriteSyncService(database, fixturePort({
+      async fetchAsinSalesTrend(input, context) {
+        const result = await original.fetchAsinSalesTrend(input, context);
+        return { ...result, data: {
+          ...result.data, asin: { ...result.data.asin, parent: 'B0PARENT03' },
+        } };
+      },
+    }));
     await service.discoverCompetitors({ ownedProductId: 'owned-1' });
     const { competitorProductId } = service.confirmCompetitorCandidate({
       ownedProductId: 'owned-1', candidateId: service.listCompetitorCandidates('owned-1')[0]!.id,
@@ -898,9 +939,9 @@ describe('SellerSprite real-data sync', () => {
     database = fixtureDatabase();
     database.exec(`
       INSERT INTO market_nodes (
-        id, name, parent_id, level, marketplace, category_id, keywords_json, status,
-        source_type, created_at
-      ) VALUES ('other-market', 'Other', NULL, 1, 'US', '999', '[]', 'active',
+        id, name, parent_id, level, marketplace, category_id,
+        sellersprite_confirmed_node_path, keywords_json, status, source_type, created_at
+      ) VALUES ('other-market', 'Other', NULL, 1, 'US', '999', '999', '[]', 'active',
         'import', '2026-09-01T00:00:00Z');
       UPDATE products SET market_node_id = 'other-market' WHERE id = 'owned-1';
     `);
@@ -1066,8 +1107,10 @@ describe('SellerSprite real-data sync', () => {
     database = fixtureDatabase();
     database.exec(`
       INSERT INTO market_nodes (
-        id, name, parent_id, level, marketplace, category_id, status, source_type, created_at
+        id, name, parent_id, level, marketplace, category_id,
+        sellersprite_confirmed_node_path, status, source_type, created_at
       ) VALUES ('child-market', 'Child pillows', 'market-1', 2, 'US',
+        '1055398:1063252:1199122:10671043011:999',
         '1055398:1063252:1199122:10671043011:999', 'active', 'import', '2026-09-01');
       INSERT INTO products (
         id, asin, sku, brand, title, image_url, marketplace, product_type,
@@ -1133,8 +1176,10 @@ describe('SellerSprite real-data sync', () => {
     database = fixtureDatabase();
     database.exec(`
       INSERT INTO market_nodes (
-        id, name, parent_id, level, marketplace, category_id, status, source_type, created_at
+        id, name, parent_id, level, marketplace, category_id,
+        sellersprite_confirmed_node_path, status, source_type, created_at
       ) VALUES ('child-market', 'Child pillows', 'market-1', 2, 'US',
+        '1055398:1063252:1199122:10671043011:999',
         '1055398:1063252:1199122:10671043011:999', 'active', 'import', '2026-09-01');
       UPDATE products SET market_node_id = 'child-market' WHERE id = 'owned-1';
     `);
@@ -1161,8 +1206,10 @@ describe('SellerSprite real-data sync', () => {
     database = fixtureDatabase();
     database.exec(`
       INSERT INTO market_nodes (
-        id, name, parent_id, level, marketplace, category_id, status, source_type, created_at
+        id, name, parent_id, level, marketplace, category_id,
+        sellersprite_confirmed_node_path, status, source_type, created_at
       ) VALUES ('child-market', 'Child pillows', 'market-1', 2, 'US',
+        '1055398:1063252:1199122:10671043011:999',
         '1055398:1063252:1199122:10671043011:999', 'active', 'import', '2026-09-01');
       UPDATE products SET market_node_id = 'child-market' WHERE id = 'owned-1';
     `);
@@ -1176,8 +1223,9 @@ describe('SellerSprite real-data sync', () => {
       },
       async fetchMarketConcentration() { return { data: [], provenance }; },
       async fetchAsinSalesTrend(input, context) {
-        database!.prepare(`UPDATE market_nodes SET category_id = ? WHERE id = 'child-market'`)
-          .run(`${NODE_PATH}:changed`);
+        database!.prepare(`UPDATE market_nodes SET category_id = ?,
+          sellersprite_confirmed_node_path = ? WHERE id = 'child-market'`)
+          .run(`${NODE_PATH}:888`, `${NODE_PATH}:888`);
         return base.fetchAsinSalesTrend(input, context);
       },
     });

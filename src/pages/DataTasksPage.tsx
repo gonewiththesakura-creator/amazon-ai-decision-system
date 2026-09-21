@@ -83,6 +83,7 @@ function isRunManagedTask(task: DataTask): boolean {
 function canRetryTask(task: DataTask): boolean {
   return (task.status === 'failed' || task.status === 'partial')
     && !task.researchJobId
+    && task.taskType !== 'post_import_analysis'
     && !isRunManagedTask(task);
 }
 
@@ -277,7 +278,11 @@ export default function DataTasksPage() {
               ['主市场', coverageQuery.data.primaryMarket],
               ['活跃自有产品', coverageQuery.data.activeOwnedProducts],
               ['核心竞品', coverageQuery.data.coreCompetitors],
-              ['90 天历史', coverageQuery.data.history90d],
+              ['主市场 90 天历史', coverageQuery.data.primaryMarketHistory90d],
+              ['自有 SKU 90 天历史', coverageQuery.data.ownedProductHistory90d],
+              ['自有 SKU 180 天历史', coverageQuery.data.ownedProductHistory180d],
+              ['核心竞品 90 天历史', coverageQuery.data.coreCompetitorHistory90d],
+              ['人工确认 Direct 竞品目标（每 SKU 3-5）', coverageQuery.data.coreDirectCompetitorTarget],
               ['Amazon 实际数据', coverageQuery.data.amazonActual],
             ] as Array<[string, DataCoverageCounter]>).map(([label, counter]) => (
               <li key={label} aria-label={`${label}覆盖：${counter.covered} / ${counter.total}，${counter.label}`}>
@@ -335,7 +340,9 @@ export default function DataTasksPage() {
               {importPreview.errorCount > 0 && <section aria-labelledby="import-errors-title">
                 <h3 id="import-errors-title">拒绝明细（{importPreview.errorCount} 行）</h3>
                 <div className="alert alert-warning"><ul>{importPreview.errors.map((reason, index) => <li key={`${index}-${reason}`}>{reason}</li>)}</ul></div>
-                {importPreview.newCount + (importPreview.updateCount ?? 0) > 0 && <label className="field"><span><input type="checkbox" checked={acceptPartialImport} onChange={(event) => setAcceptPartialImport(event.target.checked)} /> 只导入有效行；我已查看拒绝原因，错误行不会写入。</span></label>}
+                {importPreview.entityType === 'owned_product_master'
+                  ? <p className="muted">产品主数据必须整批通过校验；请修正拒绝行后重新预览。</p>
+                  : importPreview.newCount + (importPreview.updateCount ?? 0) > 0 && <label className="field"><span><input type="checkbox" checked={acceptPartialImport} onChange={(event) => setAcceptPartialImport(event.target.checked)} /> 只导入有效行；我已查看拒绝原因，错误行不会写入。</span></label>}
               </section>}
               {importPreview.duplicateCount > 0 && <p className="muted">{importPreview.duplicateCount} 行重复记录不会再次写入。</p>}
             </div>

@@ -4,7 +4,9 @@ import type {
   DataCoverageStatus,
 } from '../../shared/types.js';
 import type { AppDatabase } from '../database/database.js';
+import { confirmedDirectCompetitors } from './confirmed-direct-competitor-coverage.js';
 import { isLiveObservationReadable } from './live-observation-readability.js';
+import { validMarketHistorySpan, validProductHistorySpans } from './real-history-coverage.js';
 
 interface CountRow {
   count: number;
@@ -86,6 +88,7 @@ export class DataCoverageService {
         AND product.is_parent = 0
         AND ${productEvidence('product.id', true)}
     `, marketplace);
+    const supplemental = this.supplementalCoverage(marketplace, primaryMarketId);
 
     return {
       generatedAt: new Date().toISOString(),
@@ -113,6 +116,7 @@ export class DataCoverageService {
       activeOwnedProducts: counter(activeOwnedCovered, activeOwnedTotal),
       coreCompetitors: counter(coreCompetitorCovered, coreCompetitorTotal),
       history90d: counter(history90dCovered, activeOwnedTotal),
+      ...supplemental,
       amazonActual: counter(amazonActualCovered, activeOwnedTotal),
     };
   }
@@ -144,14 +148,18 @@ export class DataCoverageService {
     const eligibleOwned = this.database.prepare(`
       WITH RECURSIVE market_scope(id) AS (
         SELECT id FROM market_nodes
-        WHERE id = ? AND marketplace = ? AND status = 'active' AND source_type <> 'mock'
+        WHERE id = ? AND marketplace = ? AND source_type <> 'mock'
         UNION
         SELECT child.id FROM market_nodes child
         JOIN market_scope parent ON child.parent_id = parent.id
-        WHERE child.marketplace = ? AND child.status = 'active' AND child.source_type <> 'mock'
+        WHERE child.marketplace = ? AND child.source_type <> 'mock'
       )
       SELECT product.id FROM products product
       JOIN market_scope scope ON scope.id = product.market_node_id
+      JOIN market_nodes assigned ON assigned.id = product.market_node_id
+        AND assigned.marketplace = product.marketplace
+        AND assigned.source_type <> 'mock'
+        AND assigned.sellersprite_confirmed_node_path IS NOT NULL
       WHERE product.marketplace = ? AND product.is_owned = 1 AND product.status = 'active'
         AND product.is_parent = 0
         AND product.source_type <> 'mock'
@@ -160,16 +168,20 @@ export class DataCoverageService {
     const competitors = this.database.prepare(`
       WITH RECURSIVE market_scope(id) AS (
         SELECT id FROM market_nodes
-        WHERE id = ? AND marketplace = ? AND status = 'active' AND source_type <> 'mock'
+        WHERE id = ? AND marketplace = ? AND source_type <> 'mock'
         UNION
         SELECT child.id FROM market_nodes child
         JOIN market_scope parent ON child.parent_id = parent.id
-        WHERE child.marketplace = ? AND child.status = 'active' AND child.source_type <> 'mock'
+        WHERE child.marketplace = ? AND child.source_type <> 'mock'
       )
       SELECT DISTINCT relation.competitor_product_id AS id
       FROM competitor_relations relation
       JOIN products owned ON owned.id = relation.owned_product_id
       JOIN market_scope scope ON scope.id = owned.market_node_id
+      JOIN market_nodes assigned ON assigned.id = owned.market_node_id
+        AND assigned.marketplace = owned.marketplace
+        AND assigned.source_type <> 'mock'
+        AND assigned.sellersprite_confirmed_node_path IS NOT NULL
       JOIN products competitor ON competitor.id = relation.competitor_product_id
       WHERE owned.marketplace = ? AND owned.is_owned = 1 AND owned.status = 'active' AND owned.is_parent = 0
         AND owned.source_type <> 'mock' AND relation.relation_type = 'direct'
@@ -182,7 +194,6 @@ export class DataCoverageService {
     const trackedIds = new Set([...eligibleOwnedIds, ...competitors.map((product) => product.id)]);
     const coveredProducts = new Set<string>();
     const amazonActualProducts = new Set<string>();
-    const history = new Map<string, { oldest: number; newest: number }>();
 
     const snapshots = this.database.prepare(`
       SELECT snapshot.id, snapshot.product_id AS productId,
@@ -204,13 +215,6 @@ export class DataCoverageService {
       coveredProducts.add(snapshot.productId);
       if (snapshot.sourceType === 'amazon' && snapshot.isEstimated === 0) {
         amazonActualProducts.add(snapshot.productId);
-      }
-      if (eligibleOwnedIds.has(snapshot.productId) && snapshot.observationDay !== null) {
-        const dates = history.get(snapshot.productId);
-        history.set(snapshot.productId, dates ? {
-          oldest: Math.min(dates.oldest, snapshot.observationDay),
-          newest: Math.max(dates.newest, snapshot.observationDay),
-        } : { oldest: snapshot.observationDay, newest: snapshot.observationDay });
       }
     }
 
@@ -239,9 +243,14 @@ export class DataCoverageService {
       const marketSnapshots = this.database.prepare(`
         SELECT snapshot.id, snapshot.source_type AS sourceType, snapshot.sync_run_id AS syncRunId
         FROM market_snapshots snapshot
+        JOIN market_nodes market ON market.id = snapshot.market_node_id
+          AND market.marketplace = ? AND market.source_type <> 'mock'
+          AND market.sellersprite_confirmed_node_path IS NOT NULL
         WHERE snapshot.market_node_id = ? AND snapshot.source_type IN (${REAL_SOURCE_TYPES})
           AND ${MARKET_METRICS}
-      `).all(primaryMarketId) as Array<{ id: string; sourceType: string; syncRunId: string | null }>;
+      `).all(marketplace, primaryMarketId) as Array<{
+        id: string; sourceType: string; syncRunId: string | null;
+      }>;
       primaryMarketCovered = marketSnapshots.some((snapshot) => isLiveObservationReadable(
         this.database, 'market', snapshot.id, snapshot.sourceType, snapshot.syncRunId,
       ));
@@ -249,6 +258,9 @@ export class DataCoverageService {
         const marketFacts = this.database.prepare(`
           SELECT fact.id, fact.source_type AS sourceType, fact.sync_run_id AS syncRunId
           FROM metric_facts fact
+          JOIN market_nodes market ON market.id = fact.entity_id
+            AND market.marketplace = fact.marketplace AND market.source_type <> 'mock'
+            AND market.sellersprite_confirmed_node_path IS NOT NULL
           WHERE fact.entity_type = 'market' AND fact.entity_id = ? AND fact.marketplace = ?
             AND fact.source_type IN (${REAL_SOURCE_TYPES}) AND fact.numeric_value IS NOT NULL
         `).all(primaryMarketId, marketplace) as Array<{
@@ -260,15 +272,86 @@ export class DataCoverageService {
       }
     }
 
+    const supplemental = this.supplementalCoverage(marketplace, primaryMarketId);
     return {
       generatedAt: new Date().toISOString(), marketplace,
       primaryMarket: counter(primaryMarketCovered ? 1 : 0, 1),
       activeOwnedProducts: counter(owned.filter((product) => coveredProducts.has(product.id)).length, owned.length),
       coreCompetitors: counter(competitors.filter((product) => coveredProducts.has(product.id)).length,
         competitors.length),
-      history90d: counter([...history.values()].filter((dates) => dates.newest - dates.oldest >= 90).length,
-        owned.length),
+      history90d: supplemental.ownedProductHistory90d,
+      ...supplemental,
       amazonActual: counter(owned.filter((product) => amazonActualProducts.has(product.id)).length, owned.length),
+    };
+  }
+
+  private supplementalCoverage(
+    marketplace: string,
+    primaryMarketId: string | null,
+  ): Pick<DataCoverageReport,
+    'primaryMarketHistory90d' | 'ownedProductHistory90d' | 'ownedProductHistory180d'
+    | 'coreCompetitorHistory90d' | 'coreDirectCompetitorTarget'> {
+    const owned = this.database.prepare(`
+      SELECT id FROM products
+      WHERE marketplace = ? AND is_owned = 1 AND is_parent = 0
+        AND status = 'active' AND source_type <> 'mock'
+      ORDER BY id
+    `).all(marketplace) as Array<{ id: string }>;
+    const competitors = this.database.prepare(`
+      SELECT DISTINCT competitor.id
+      FROM competitor_relations relation
+      JOIN products owned ON owned.id = relation.owned_product_id
+      JOIN products competitor ON competitor.id = relation.competitor_product_id
+      WHERE relation.relation_type = 'direct'
+        AND owned.marketplace = ? AND owned.is_owned = 1 AND owned.is_parent = 0
+        AND owned.status = 'active' AND owned.source_type <> 'mock'
+        AND competitor.marketplace = owned.marketplace AND competitor.is_owned = 0
+        AND competitor.is_parent = 0 AND competitor.status = 'active'
+        AND competitor.source_type <> 'mock'
+      ORDER BY competitor.id
+    `).all(marketplace) as Array<{ id: string }>;
+    const ownedSpans = validProductHistorySpans(
+      this.database, marketplace, owned.map((product) => product.id),
+    );
+    const competitorSpans = validProductHistorySpans(
+      this.database, marketplace, competitors.map((product) => product.id),
+    );
+    const confirmed = confirmedDirectCompetitors(this.database, marketplace);
+    const confirmedByOwned = new Map<string, Set<string>>();
+    for (const relation of confirmed) {
+      const competitorsForOwned = confirmedByOwned.get(relation.ownedProductId) ?? new Set<string>();
+      competitorsForOwned.add(relation.competitorProductId);
+      confirmedByOwned.set(relation.ownedProductId, competitorsForOwned);
+    }
+    const confirmedMarket = primaryMarketId ? this.database.prepare(`
+      SELECT id FROM market_nodes WHERE id = ? AND marketplace = ?
+        AND source_type <> 'mock' AND sellersprite_confirmed_node_path IS NOT NULL
+    `).get(primaryMarketId, marketplace) as { id: string } | undefined : undefined;
+    const primaryMarketHistory = validMarketHistorySpan(
+      this.database, marketplace, confirmedMarket?.id ?? null,
+    );
+    return {
+      primaryMarketHistory90d: counter(primaryMarketHistory.days >= 90 ? 1 : 0, 1),
+      ownedProductHistory90d: counter(
+        owned.filter((product) => (ownedSpans.get(product.id)?.days ?? 0) >= 90).length,
+        owned.length,
+      ),
+      ownedProductHistory180d: counter(
+        owned.filter((product) => (ownedSpans.get(product.id)?.days ?? 0) >= 180).length,
+        owned.length,
+      ),
+      coreCompetitorHistory90d: counter(
+        competitors.filter((product) => (competitorSpans.get(product.id)?.days ?? 0) >= 90).length,
+        competitors.length,
+      ),
+      coreDirectCompetitorTarget: {
+        ...counter(
+          owned.filter((product) => (confirmedByOwned.get(product.id)?.size ?? 0) >= 3).length,
+          owned.length,
+        ),
+        minimumPerOwnedProduct: 3,
+        preferredMaximumPerOwnedProduct: 5,
+      },
     };
   }
 

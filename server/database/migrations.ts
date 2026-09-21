@@ -1,5 +1,32 @@
 import type { DatabaseSync } from 'node:sqlite';
 
+function assertVariationFamilyIntegrity(database: DatabaseSync, version: number): void {
+  const orphan = database.prepare(`
+    SELECT product.id FROM products product
+    LEFT JOIN variation_families family ON family.id = product.variation_family_id
+    WHERE product.variation_family_id IS NOT NULL
+      AND (family.id IS NULL OR family.marketplace <> product.marketplace)
+    LIMIT 1
+  `).get() as { id: string } | undefined;
+  if (orphan) {
+    throw new Error(`V${version} found missing/cross-market variation family for product ${orphan.id}; review legacy identity before migration.`);
+  }
+
+  const inconsistentParent = database.prepare(`
+    SELECT product.id FROM products product
+    LEFT JOIN variation_families family ON family.id = product.variation_family_id
+    WHERE (product.variation_family_id IS NULL
+        AND product.parent_asin IS NOT NULL AND TRIM(product.parent_asin) <> '')
+      OR (product.variation_family_id IS NOT NULL
+        AND UPPER(TRIM(COALESCE(product.parent_asin, '')))
+          <> UPPER(TRIM(COALESCE(family.parent_asin, ''))))
+    LIMIT 1
+  `).get() as { id: string } | undefined;
+  if (inconsistentParent) {
+    throw new Error(`V${version} found parent ASIN inconsistent with variation family for product ${inconsistentParent.id}; review legacy identity before migration.`);
+  }
+}
+
 const migrations = [
   {
     version: 1,
@@ -1910,6 +1937,232 @@ const migrations = [
         database.exec(`CREATE INDEX IF NOT EXISTS idx_mcp_call_logs_run_market_month
           ON mcp_call_logs(sync_run_id, capability, entity_id, observation_month)`);
       }
+    },
+  },
+  {
+    version: 27,
+    apply(database: DatabaseSync) {
+      const table = database.prepare(`SELECT 1 AS found FROM sqlite_master
+        WHERE type = 'table' AND name = 'market_nodes'`).get() as { found: number } | undefined;
+      if (!table) return;
+      const columns = database.prepare('PRAGMA table_info(market_nodes)').all()
+        .map((column) => String(column.name));
+      if (!columns.includes('sellersprite_confirmed_node_path')) {
+        database.exec(`ALTER TABLE market_nodes
+          ADD COLUMN sellersprite_confirmed_node_path TEXT CHECK (
+            sellersprite_confirmed_node_path IS NULL OR (
+              sellersprite_confirmed_node_path <> ''
+              AND sellersprite_confirmed_node_path NOT GLOB '*[^0-9:]*'
+              AND substr(sellersprite_confirmed_node_path, 1, 1) <> ':'
+              AND substr(sellersprite_confirmed_node_path, -1, 1) <> ':'
+              AND instr(sellersprite_confirmed_node_path, '::') = 0
+            )
+          )`);
+      }
+      if (columns.includes('category_id') && columns.includes('source_type')) {
+        database.exec(`UPDATE market_nodes
+          SET sellersprite_confirmed_node_path = category_id
+          WHERE source_type = 'mcp'
+            AND sellersprite_confirmed_node_path IS NULL
+            AND category_id IS NOT NULL
+            AND category_id <> ''
+            AND category_id NOT GLOB '*[^0-9:]*'
+            AND substr(category_id, 1, 1) <> ':'
+            AND substr(category_id, -1, 1) <> ':'
+            AND instr(category_id, '::') = 0`);
+      }
+    },
+  },
+  {
+    version: 28,
+    apply(database: DatabaseSync) {
+      const tables = new Set((database.prepare(`
+        SELECT name FROM sqlite_master WHERE type = 'table'
+          AND name IN ('products', 'variation_families')
+      `).all() as Array<{ name: string }>).map((row) => row.name));
+      if (!tables.has('products') || !tables.has('variation_families')) return;
+
+      const familyColumns = database.prepare('PRAGMA table_info(variation_families)').all()
+        .map((column) => String(column.name));
+      if (!familyColumns.includes('family_key')) {
+        const invalidFamily = database.prepare(`
+          SELECT id, parent_asin AS parentAsin FROM variation_families
+          WHERE LENGTH(TRIM(parent_asin)) <> 10
+            OR UPPER(TRIM(parent_asin)) GLOB '*[^A-Z0-9]*'
+          LIMIT 1
+        `).get() as { id: string; parentAsin: string } | undefined;
+        if (invalidFamily) {
+          throw new Error(`V28 requires a verified parent ASIN for legacy family ${invalidFamily.id}; review its placeholder/invalid value before migration.`);
+        }
+        const duplicateParent = database.prepare(`
+          SELECT marketplace, UPPER(TRIM(parent_asin)) AS parentAsin,
+            COUNT(*) AS count FROM variation_families
+          GROUP BY marketplace, UPPER(TRIM(parent_asin)) HAVING COUNT(*) > 1 LIMIT 1
+        `).get() as { marketplace: string; parentAsin: string; count: number } | undefined;
+        if (duplicateParent) {
+          throw new Error(`V28 found duplicate normalized parent ASIN ${duplicateParent.parentAsin} in ${duplicateParent.marketplace}; review legacy families before migration.`);
+        }
+        assertVariationFamilyIntegrity(database, 28);
+        const invalidProductParent = database.prepare(`
+          SELECT id FROM products WHERE parent_asin IS NOT NULL
+            AND TRIM(parent_asin) <> ''
+            AND (LENGTH(TRIM(parent_asin)) <> 10
+              OR UPPER(TRIM(parent_asin)) GLOB '*[^A-Z0-9]*')
+          LIMIT 1
+        `).get() as { id: string } | undefined;
+        if (invalidProductParent) {
+          throw new Error(`V28 found invalid parent ASIN for product ${invalidProductParent.id}; review legacy identity before migration.`);
+        }
+        database.exec(`
+          DROP INDEX IF EXISTS idx_variation_families_market_parent;
+          ALTER TABLE variation_families RENAME TO variation_families_v27;
+          CREATE TABLE variation_families (
+            id TEXT PRIMARY KEY,
+            marketplace TEXT NOT NULL,
+            parent_asin TEXT,
+            family_key TEXT NOT NULL CHECK (TRIM(family_key) <> ''),
+            variation_theme TEXT,
+            attributes_json TEXT NOT NULL DEFAULT '{}',
+            status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'inactive')),
+            identity_status TEXT NOT NULL CHECK (identity_status IN ('pending', 'verified')),
+            source_type TEXT NOT NULL CHECK (TRIM(source_type) <> ''),
+            verified_at TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            CHECK (
+              (identity_status = 'pending' AND parent_asin IS NULL AND verified_at IS NULL)
+              OR
+              (identity_status = 'verified' AND parent_asin IS NOT NULL
+                AND TRIM(parent_asin) <> '' AND verified_at IS NOT NULL)
+            )
+          );
+          INSERT INTO variation_families (
+            id, marketplace, parent_asin, family_key, variation_theme,
+            attributes_json, status, identity_status, source_type, verified_at,
+            created_at, updated_at
+          )
+          SELECT legacy.id, legacy.marketplace, UPPER(TRIM(legacy.parent_asin)),
+            UPPER(TRIM(legacy.parent_asin)),
+            legacy.variation_theme, legacy.attributes_json, legacy.status,
+            'verified', 'import', legacy.updated_at,
+            legacy.created_at, legacy.updated_at
+          FROM variation_families_v27 legacy;
+          DROP TABLE variation_families_v27;
+          CREATE UNIQUE INDEX idx_variation_families_market_family_key
+            ON variation_families(marketplace, UPPER(TRIM(family_key)));
+          CREATE UNIQUE INDEX idx_variation_families_market_parent
+            ON variation_families(marketplace, UPPER(TRIM(parent_asin)))
+            WHERE parent_asin IS NOT NULL AND TRIM(parent_asin) <> '';
+        `);
+      }
+
+      const productColumns = database.prepare('PRAGMA table_info(products)').all()
+        .map((column) => String(column.name));
+      if (!productColumns.includes('parent_lookup_status')) {
+        database.exec(`
+          ALTER TABLE products ADD COLUMN parent_lookup_status TEXT NOT NULL DEFAULT 'unknown'
+            CHECK (parent_lookup_status IN ('unknown', 'pending', 'verified', 'standalone'));
+          UPDATE products SET parent_asin = UPPER(TRIM(parent_asin))
+            WHERE parent_asin IS NOT NULL AND TRIM(parent_asin) <> '';
+          UPDATE products SET parent_lookup_status = CASE
+            WHEN parent_asin IS NOT NULL AND TRIM(parent_asin) <> '' THEN 'verified'
+            WHEN variation_family_id IS NOT NULL THEN 'pending'
+            ELSE 'unknown'
+          END;
+        `);
+      }
+
+      database.exec(`
+        CREATE TABLE IF NOT EXISTS product_identity_events (
+          id TEXT PRIMARY KEY,
+          product_id TEXT NOT NULL REFERENCES products(id),
+          old_family_id TEXT REFERENCES variation_families(id),
+          new_family_id TEXT REFERENCES variation_families(id),
+          old_parent_asin TEXT,
+          new_parent_asin TEXT,
+          old_lookup_status TEXT CHECK (old_lookup_status IS NULL OR old_lookup_status IN (
+            'unknown', 'pending', 'verified', 'standalone'
+          )),
+          new_lookup_status TEXT NOT NULL CHECK (new_lookup_status IN (
+            'unknown', 'pending', 'verified', 'standalone'
+          )),
+          source_type TEXT NOT NULL CHECK (TRIM(source_type) <> ''),
+          sync_run_id TEXT REFERENCES data_tasks(id),
+          import_batch_id TEXT REFERENCES import_batches(id),
+          created_at TEXT NOT NULL,
+          CHECK (
+            old_family_id IS NOT new_family_id
+            OR old_parent_asin IS NOT new_parent_asin
+            OR old_lookup_status IS NOT new_lookup_status
+          )
+        );
+        CREATE INDEX IF NOT EXISTS idx_product_identity_events_product
+          ON product_identity_events(product_id, created_at, id);
+        CREATE INDEX IF NOT EXISTS idx_product_identity_events_family
+          ON product_identity_events(new_family_id, created_at, id);
+        CREATE TRIGGER IF NOT EXISTS trg_product_identity_events_immutable_update
+        BEFORE UPDATE ON product_identity_events
+        BEGIN
+          SELECT RAISE(ABORT, 'product_identity_events are immutable; append a new event');
+        END;
+        CREATE TRIGGER IF NOT EXISTS trg_product_identity_events_immutable_delete
+        BEFORE DELETE ON product_identity_events
+        BEGIN
+          SELECT RAISE(ABORT, 'product_identity_events are immutable; append a new event');
+        END;
+      `);
+    },
+  },
+  {
+    version: 29,
+    apply(database: DatabaseSync) {
+      const tables = new Set((database.prepare(`
+        SELECT name FROM sqlite_master WHERE type = 'table'
+          AND name IN ('products', 'variation_families')
+      `).all() as Array<{ name: string }>).map((row) => row.name));
+      if (!tables.has('products') || !tables.has('variation_families')) return;
+      assertVariationFamilyIntegrity(database, 29);
+      database.exec(`
+        CREATE TRIGGER trg_products_variation_family_insert
+        BEFORE INSERT ON products
+        WHEN NEW.variation_family_id IS NOT NULL AND NOT EXISTS (
+          SELECT 1 FROM variation_families family
+          WHERE family.id = NEW.variation_family_id AND family.marketplace = NEW.marketplace
+        )
+        BEGIN
+          SELECT RAISE(ABORT, 'variation family must exist in product marketplace');
+        END;
+
+        CREATE TRIGGER trg_products_variation_family_update
+        BEFORE UPDATE OF variation_family_id, marketplace ON products
+        WHEN NEW.variation_family_id IS NOT NULL AND NOT EXISTS (
+          SELECT 1 FROM variation_families family
+          WHERE family.id = NEW.variation_family_id AND family.marketplace = NEW.marketplace
+        )
+        BEGIN
+          SELECT RAISE(ABORT, 'variation family must exist in product marketplace');
+        END;
+
+        CREATE TRIGGER trg_variation_families_marketplace_update
+        BEFORE UPDATE OF id, marketplace ON variation_families
+        WHEN EXISTS (
+          SELECT 1 FROM products product
+          WHERE product.variation_family_id = OLD.id
+            AND (NEW.id <> OLD.id OR product.marketplace <> NEW.marketplace)
+        )
+        BEGIN
+          SELECT RAISE(ABORT, 'variation family must remain in product marketplace');
+        END;
+
+        CREATE TRIGGER trg_variation_families_referenced_delete
+        BEFORE DELETE ON variation_families
+        WHEN EXISTS (
+          SELECT 1 FROM products product WHERE product.variation_family_id = OLD.id
+        )
+        BEGIN
+          SELECT RAISE(ABORT, 'variation family is still referenced by products');
+        END;
+      `);
     },
   },
 ];

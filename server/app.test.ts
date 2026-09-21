@@ -354,10 +354,11 @@ describe('V2.2 real-data administration routes', () => {
     database = openDatabase(':memory:');
     database.exec(`
       INSERT INTO market_nodes (
-        id, name, parent_id, level, marketplace, category_id, keywords_json, status,
-        source_type, created_at
+        id, name, parent_id, level, marketplace, category_id,
+        sellersprite_confirmed_node_path, keywords_json, status, source_type, created_at
       ) VALUES (
-        'market-live', 'Bed Pillows', NULL, 1, 'US', '1055398:1063252:1199122:10671043011', '[]',
+        'market-live', 'Bed Pillows', NULL, 1, 'US', '1055398:1063252:1199122:10671043011',
+        '1055398:1063252:1199122:10671043011', '[]',
         'active', 'import', '2026-09-01T00:00:00.000Z'
       );
       INSERT INTO products (
@@ -400,8 +401,9 @@ describe('V2.2 real-data administration routes', () => {
   it('requires an admin-confirmed numeric SellerSprite market path before market sync', async () => {
     database = openDatabase(':memory:');
     database.prepare(`INSERT INTO market_nodes (
-      id, name, level, marketplace, status, source_type, created_at
-    ) VALUES ('unmapped', 'Memory Foam Pillow', 1, 'US', 'active', 'import', '2026-09-19')`).run();
+      id, name, level, marketplace, category_id, status, source_type, created_at
+    ) VALUES ('unmapped', 'Memory Foam Pillow', 1, 'US',
+      '1055398:1063252:1199122:10671043011', '值得研究', 'import', '2026-09-19')`).run();
     const app = createApp({ database, sellerSpritePort: liveSyncPort() });
     await request(app).post('/api/integrations/sellersprite/sync/market')
       .send({ marketId: 'unmapped', month: '202608' }).expect(400);
@@ -411,16 +413,25 @@ describe('V2.2 real-data administration routes', () => {
       .send({ nodeIdPath: '1055398:1063252:1199122:10671043011' }).expect(400);
     await request(app).patch('/api/markets/unmapped/sellersprite-node')
       .send({ nodeIdPath: '1055398:1063252:1199122:10671043011', confirmed: true }).expect(200);
-    expect(database.prepare(`SELECT category_id AS path FROM market_nodes WHERE id = 'unmapped'`).get())
-      .toEqual({ path: '1055398:1063252:1199122:10671043011' });
+    expect(database.prepare(`SELECT category_id AS path,
+      sellersprite_confirmed_node_path AS confirmedPath, status
+      FROM market_nodes WHERE id = 'unmapped'`).get()).toEqual({
+      path: '1055398:1063252:1199122:10671043011',
+      confirmedPath: '1055398:1063252:1199122:10671043011',
+      status: '值得研究',
+    });
+    await request(app).post('/api/integrations/sellersprite/sync/market')
+      .send({ marketId: 'unmapped', month: '202608' }).expect(201);
   });
 
   it('requires human confirmation before a discovered competitor becomes a relation', async () => {
     database = openDatabase(':memory:');
     database.exec(`
       INSERT INTO market_nodes (
-        id, name, level, marketplace, status, source_type, created_at
-      ) VALUES ('market-live', 'Bed Pillows', 1, 'US', 'active', 'import', '2026-09-01T00:00:00.000Z');
+        id, name, level, marketplace, category_id, sellersprite_confirmed_node_path,
+        status, source_type, created_at
+      ) VALUES ('market-live', 'Bed Pillows', 1, 'US', '1055398:1063252',
+        '1055398:1063252', 'active', 'import', '2026-09-01T00:00:00.000Z');
       INSERT INTO products (
         id, asin, brand, title, image_url, marketplace, product_type, is_owned,
         market_node_id, source_type, created_at
@@ -844,23 +855,61 @@ describe('workflow mutations', () => {
     expect(watchlist.body.data.filter((item: { itemType: string }) => item.itemType === 'owned_product')).toHaveLength(1);
   });
 
-  it('never cascades away historical snapshots through the owned-product delete API', async () => {
+  it('deactivates an owned product without cascading away historical or audit records', async () => {
     const app = testApp();
     await request(app).post('/api/settings/demo').send({ enabled: true }).expect(200);
+    await request(app).post('/api/watchlist').send({
+      itemType: 'owned_product', itemId: 'owned-sku-01', name: 'SKU-01 history',
+    }).expect(201);
+    database?.prepare(`
+      INSERT INTO decisions (
+        id, entity_type, entity_id, decision, reason, ai_insight_id,
+        data_version, decided_by, decided_at
+      ) VALUES (
+        'decision-owned-sku-01-history', 'owned_product', 'owned-sku-01', 'watch',
+        'Retained deactivation history', 'insight-owned-sku-01',
+        'demo-2026-09-09', 'test-owner', '2026-09-10T00:00:00.000Z'
+      )
+    `).run();
     const before = database?.prepare(`
-      SELECT COUNT(*) AS count FROM product_snapshots WHERE product_id = 'owned-sku-01'
-    `).get() as { count: number };
-    expect(before.count).toBeGreaterThan(0);
+      SELECT
+        (SELECT COUNT(*) FROM product_snapshots WHERE product_id = 'owned-sku-01') AS snapshots,
+        (SELECT COUNT(*) FROM competitor_relations WHERE owned_product_id = 'owned-sku-01') AS relations,
+        (SELECT COUNT(*) FROM ai_insights
+          WHERE entity_type = 'owned_product' AND entity_id = 'owned-sku-01') AS insights,
+        (SELECT COUNT(*) FROM decisions
+          WHERE entity_type = 'owned_product' AND entity_id = 'owned-sku-01') AS decisions,
+        (SELECT COUNT(*) FROM watchlist_items
+          WHERE item_type = 'owned_product' AND item_id = 'owned-sku-01') AS watchlist
+    `).get() as { snapshots: number; relations: number; insights: number; decisions: number; watchlist: number };
+    expect(before).toMatchObject({ snapshots: 4, relations: 3, insights: 1, decisions: 1, watchlist: 1 });
 
-    await request(app).delete('/api/owned-products/owned-sku-01').expect(409);
-    expect(database?.prepare(`SELECT 1 AS found FROM products WHERE id = 'owned-sku-01'`).get())
-      .toMatchObject({ found: 1 });
+    const result = await request(app).delete('/api/owned-products/owned-sku-01').expect(200);
+    expect(result.body.data).toEqual({ id: 'owned-sku-01', deactivated: true });
     expect(database?.prepare(`
-      SELECT COUNT(*) AS count FROM product_snapshots WHERE product_id = 'owned-sku-01'
-    `).get()).toMatchObject({ count: before.count });
+      SELECT status, monitoring_enabled AS monitoringEnabled
+      FROM products WHERE id = 'owned-sku-01'
+    `).get()).toMatchObject({ status: 'inactive', monitoringEnabled: 0 });
+    expect(database?.prepare(`
+      SELECT
+        (SELECT COUNT(*) FROM product_snapshots WHERE product_id = 'owned-sku-01') AS snapshots,
+        (SELECT COUNT(*) FROM competitor_relations WHERE owned_product_id = 'owned-sku-01') AS relations,
+        (SELECT COUNT(*) FROM ai_insights
+          WHERE entity_type = 'owned_product' AND entity_id = 'owned-sku-01') AS insights,
+        (SELECT COUNT(*) FROM decisions
+          WHERE entity_type = 'owned_product' AND entity_id = 'owned-sku-01') AS decisions,
+        (SELECT COUNT(*) FROM watchlist_items
+          WHERE item_type = 'owned_product' AND item_id = 'owned-sku-01') AS watchlist
+    `).get()).toEqual({ ...before, watchlist: 0 });
+    expect(await request(app).get('/api/owned-products').then((response) => response.body.data))
+      .not.toContainEqual(expect.objectContaining({ id: 'owned-sku-01' }));
+    await request(app).get('/api/owned-products/owned-sku-01').expect(404);
+    await request(app).get('/api/owned-products/owned-sku-01/snapshots').expect(404);
+    await request(app).get('/api/owned-products/owned-sku-01/competitors').expect(404);
+    await request(app).get('/api/owned-products/owned-sku-01/insights').expect(404);
   });
 
-  it('still allows deleting a newly configured owned product that has no snapshot history', async () => {
+  it('retains a newly configured owned-product master when it is deactivated', async () => {
     const app = testApp();
     const created = await request(app).post('/api/owned-products').send({
       asin: 'B0DELETEEMPTY', sku: 'DELETE-EMPTY', brand: 'Own Brand',
@@ -868,9 +917,11 @@ describe('workflow mutations', () => {
       marketNodeId: 'mkt-delete-empty', monitoringEnabled: false,
     }).expect(201);
 
-    await request(app).delete(`/api/owned-products/${created.body.data.id as string}`).expect(200);
-    expect(database?.prepare('SELECT 1 AS found FROM products WHERE id = ?')
-      .get(created.body.data.id as string)).toBeUndefined();
+    const id = created.body.data.id as string;
+    const result = await request(app).delete(`/api/owned-products/${id}`).expect(200);
+    expect(result.body.data).toEqual({ id, deactivated: true });
+    expect(database?.prepare(`SELECT status FROM products WHERE id = ?`).get(id))
+      .toMatchObject({ status: 'inactive' });
   });
 
   it('creates development research and monitoring atomically in the current marketplace', async () => {

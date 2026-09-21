@@ -14,6 +14,7 @@ const marketSchema = z.object({
   id: z.string().min(1),
   marketplace: z.string().min(1),
   categoryId: z.string().optional(),
+  sellerSpriteNodePath: z.string().optional(),
   status: z.string(),
 });
 const connectionSchema = z.object({
@@ -76,6 +77,10 @@ const verificationSchema = z.object({
   sellerSpriteCriticalRunId: z.string().uuid().nullable(),
   verifiedEvidenceEntities: z.number().int().nonnegative(),
   requiredEvidenceEntities: z.number().int().nonnegative(),
+  primaryMarketHistoryDays: z.number().int().nonnegative(),
+  hasPrimaryMarketHistory90d: z.boolean(),
+  runLinkedCandidateGroups: z.number().int().nonnegative(),
+  confirmedDirectCompetitors: z.number().int().nonnegative(),
   readyForDemoCleanup: z.boolean(),
   hasMinimumRealCoverage: z.boolean(),
 });
@@ -94,7 +99,7 @@ interface AcceptanceArguments {
 interface AcceptanceSummary {
   ok: boolean;
   acceptanceScope: 'critical_market_and_owned_skus';
-  manualCompetitorReview: 'not_checked';
+  manualCompetitorReview: 'not_checked' | 'confirmed' | 'missing';
   checks: {
     preflight: boolean;
     connection: boolean;
@@ -117,6 +122,9 @@ interface AcceptanceSummary {
     directCompetitors: number;
     refreshedDirectCompetitors: number;
     failedDirectCompetitors: number;
+    primaryMarketHistoryDays: number;
+    runLinkedCandidateGroups: number;
+    confirmedDirectCompetitors: number;
     marketSnapshots: number;
     productSnapshots: number;
     jobs: number;
@@ -147,9 +155,8 @@ export async function runAcceptanceCli(
     const markets = z.array(marketSchema).parse(await request('/api/markets'));
     const market = markets.find((item) => item.id === settings.defaultMarketId);
     requireCondition(market?.marketplace === settings.marketplace
-      && market.status === 'active'
-      && typeof market.categoryId === 'string'
-      && /^\d+(?::\d+)*$/.test(market.categoryId));
+      && typeof market.sellerSpriteNodePath === 'string'
+      && /^\d+(?::\d+)*$/.test(market.sellerSpriteNodePath));
     summary.checks.preflight = true;
 
     const connection = connectionSchema.parse(await request(
@@ -188,7 +195,8 @@ export async function runAcceptanceCli(
     requireCondition(candidate.status === 'success'
       && candidate.total === roster.ownedProductIds.length
       && candidate.success === candidate.total && candidate.failed === 0
-      && (competitor.total === 0 || competitor.success > 0));
+      && candidate.candidates > 0
+      && competitor.total > 0 && competitor.success > 0);
     summary.checks.secondaryCoverage = true;
 
     const capabilities = capabilitiesSchema.parse(await request(
@@ -259,8 +267,17 @@ export async function runAcceptanceCli(
     summary.checks.evidence = true;
 
     const verification = verificationSchema.parse(await request('/api/go-live/verify'));
+    summary.counts.primaryMarketHistoryDays = verification.primaryMarketHistoryDays;
+    summary.counts.runLinkedCandidateGroups = verification.runLinkedCandidateGroups;
+    summary.counts.confirmedDirectCompetitors = verification.confirmedDirectCompetitors;
+    summary.manualCompetitorReview = verification.confirmedDirectCompetitors > 0
+      ? 'confirmed' : 'missing';
     requireCondition(verification.sellerSpriteCriticalRunId === critical.runId
       && verification.readyForDemoCleanup
+      && verification.hasPrimaryMarketHistory90d
+      && verification.primaryMarketHistoryDays >= 90
+      && verification.runLinkedCandidateGroups > 0
+      && verification.confirmedDirectCompetitors > 0
       && verification.verifiedEvidenceEntities === jobs.length
       && verification.requiredEvidenceEntities === jobs.length);
     summary.counts.verifiedEvidenceEntities = verification.verifiedEvidenceEntities;
@@ -396,6 +413,9 @@ function emptySummary(): AcceptanceSummary {
       directCompetitors: 0,
       refreshedDirectCompetitors: 0,
       failedDirectCompetitors: 0,
+      primaryMarketHistoryDays: 0,
+      runLinkedCandidateGroups: 0,
+      confirmedDirectCompetitors: 0,
       marketSnapshots: 0,
       productSnapshots: 0,
       jobs: 0,

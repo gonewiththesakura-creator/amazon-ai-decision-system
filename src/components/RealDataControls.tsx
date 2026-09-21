@@ -47,6 +47,10 @@ interface GoLiveVerification {
   sellerSpriteCriticalRunId: string | null;
   verifiedEvidenceEntities: number;
   requiredEvidenceEntities: number;
+  primaryMarketHistoryDays: number;
+  hasPrimaryMarketHistory90d: boolean;
+  runLinkedCandidateGroups: number;
+  confirmedDirectCompetitors: number;
   readyForDemoCleanup: boolean;
   hasMinimumRealCoverage: boolean;
 }
@@ -125,12 +129,14 @@ export default function RealDataControls({
       return;
     }
     let active = true;
-    api.get<{ node: { categoryId?: string } }>(`/api/markets/${encodeURIComponent(marketId)}`)
+    api.get<{ node: { categoryId?: string; sellerSpriteNodePath?: string } }>(
+      `/api/markets/${encodeURIComponent(marketId)}`,
+    )
       .then((market) => {
         if (!active) return;
-        const path = market.node?.categoryId ?? '';
-        setNodePath(path);
-        setMappedPath(path);
+        const confirmedPath = market.node?.sellerSpriteNodePath ?? '';
+        setNodePath(market.node?.categoryId ?? confirmedPath);
+        setMappedPath(confirmedPath);
       }).catch(() => { if (active) setError('市场节点读取失败。'); });
     return () => { active = false; };
   }, [marketId]);
@@ -276,6 +282,9 @@ export default function RealDataControls({
               <br />SellerSprite 连接 {verification.sellerSpriteConnectionVerified ? '已验证' : '未验证'} · 市场 {verification.sellerSpriteMarketSnapshots} · 自有 SKU {verification.sellerSpriteOwnedProductSnapshots} ·
               {' '}能力 {verification.sellerSpriteCapabilitiesAvailable ? '已发现' : '未验证'} · 市场调用 {verification.sellerSpriteMarketCalls} · ASIN 调用 {verification.sellerSpriteAsinCalls}
               <br />运行 Evidence {verification.verifiedEvidenceEntities} / {verification.requiredEvidenceEntities} ·
+              {' '}候选组 {verification.runLinkedCandidateGroups} ·
+              {' '}主市场历史 {verification.primaryMarketHistoryDays} 天 ·
+              {' '}人工确认 Direct {verification.confirmedDirectCompetitors} ·
               {' '}<span className="real-data-run-id">关键运行 {verification.sellerSpriteCriticalRunId ?? '尚无完整运行'}</span></span>
           </div>
         )}

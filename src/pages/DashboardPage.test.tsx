@@ -29,7 +29,16 @@ const dashboard = {
 
 function report(status: 'complete' | 'partial' | 'missing'): DataCoverageReport {
   const counter = { covered: status === 'missing' ? 0 : 1, total: status === 'complete' ? 1 : 2, status, label: status === 'complete' ? '完整' : status === 'partial' ? '部分覆盖' : '缺失' } as const;
-  return { generatedAt: '', marketplace: 'US', primaryMarket: counter, activeOwnedProducts: counter, coreCompetitors: counter, history90d: counter, amazonActual: counter };
+  return {
+    generatedAt: '', marketplace: 'US', primaryMarket: counter,
+    activeOwnedProducts: counter, coreCompetitors: counter, history90d: counter,
+    primaryMarketHistory90d: counter, ownedProductHistory90d: counter,
+    ownedProductHistory180d: counter, coreCompetitorHistory90d: counter,
+    coreDirectCompetitorTarget: {
+      ...counter, minimumPerOwnedProduct: 3, preferredMaximumPerOwnedProduct: 5,
+    },
+    amazonActual: counter,
+  };
 }
 
 afterEach(() => { cleanup(); vi.clearAllMocks(); });

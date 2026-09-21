@@ -268,18 +268,26 @@ export function createApp(options: CreateAppOptions = {}): express.Express {
     const market = requireMarket(repository, id);
     const input = z.object({ nodeIdPath: z.string().trim().regex(/^\d+(?::\d+)*$/), confirmed: z.literal(true) })
       .parse(request.body ?? {});
-    const current = database.prepare(`SELECT category_id AS categoryId FROM market_nodes WHERE id = ?`)
-      .get(id) as { categoryId: string | null };
-    if (current.categoryId !== input.nodeIdPath) {
+    const current = database.prepare(`SELECT category_id AS categoryId,
+      sellersprite_confirmed_node_path AS confirmedPath FROM market_nodes WHERE id = ?`)
+      .get(id) as { categoryId: string | null; confirmedPath: string | null };
+    const canonicalPath = current.confirmedPath ?? current.categoryId;
+    if (canonicalPath !== input.nodeIdPath) {
       const existing = database.prepare(`
         SELECT EXISTS(SELECT 1 FROM market_snapshots
           WHERE market_node_id = ? AND source_type = 'mcp') AS found
       `).get(id) as { found: number };
       if (existing.found) throw httpError(409, '该市场已有 SellerSprite 历史观察；变更节点路径需要新建市场。');
-      database.prepare(`UPDATE market_nodes SET category_id = ? WHERE id = ? AND marketplace = ?`)
-        .run(input.nodeIdPath, id, market.node.marketplace);
     }
-    sendData(response, { marketId: id, nodeIdPath: input.nodeIdPath }, repository);
+    database.prepare(`UPDATE market_nodes
+      SET category_id = ?, sellersprite_confirmed_node_path = ?
+      WHERE id = ? AND marketplace = ?`)
+      .run(input.nodeIdPath, input.nodeIdPath, id, market.node.marketplace);
+    sendData(response, {
+      marketId: id,
+      nodeIdPath: input.nodeIdPath,
+      sellerSpriteNodePath: input.nodeIdPath,
+    }, repository);
   });
   app.get('/api/markets/:id/snapshots', (request, response) => {
     requireMarket(repository, request.params.id);
@@ -312,8 +320,8 @@ export function createApp(options: CreateAppOptions = {}): express.Express {
   });
   app.delete('/api/owned-products/:id', adminOnly, (request, response) => {
     const id = routeParam(request, 'id');
-    service.deleteOwnedProduct(id);
-    sendData(response, { id, deleted: true }, repository);
+    service.deactivateOwnedProduct(id);
+    sendData(response, { id, deactivated: true }, repository);
   });
   app.get('/api/owned-products/:id/snapshots', (request, response) => {
     requireOwnedProduct(repository, request.params.id);

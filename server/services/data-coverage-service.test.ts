@@ -60,9 +60,10 @@ function insertNullOnlyProductSnapshot(
 function insertLiveCoverageFixture(): void {
   database!.prepare(`
     INSERT INTO market_nodes (
-      id, name, parent_id, level, marketplace, keywords_json, status, source_type, created_at
-    ) VALUES ('coverage-market', 'Coverage Market', NULL, 1, 'US', '[]', 'active', 'import',
-      '2026-09-19T00:00:00.000Z')
+      id, name, parent_id, level, marketplace, category_id,
+      sellersprite_confirmed_node_path, keywords_json, status, source_type, created_at
+    ) VALUES ('coverage-market', 'Coverage Market', NULL, 1, 'US', '1055398:1063252',
+      '1055398:1063252', '[]', 'active', 'import', '2026-09-19T00:00:00.000Z')
   `).run();
   database!.prepare(`UPDATE app_settings SET mode = 'live', marketplace = 'US',
     default_market_id = 'coverage-market' WHERE id = 1`).run();
@@ -100,6 +101,21 @@ function insertRunMarketSnapshot(id: string, runId: string, collectedAt: string)
     .run(id, collectedAt, id, runId);
 }
 
+function insertMarketSnapshot(
+  id: string,
+  date: string,
+  sourceType: 'mcp' | 'import' | 'amazon' | 'mock',
+  monthlySales: number | null = 10_000,
+  syncRunId: string | null = null,
+): void {
+  database!.prepare(`INSERT INTO market_snapshots (
+    id, market_node_id, date, monthly_sales, source, source_type, collected_at,
+    period, is_estimated, confidence, observation_date, dedup_key, sync_run_id
+  ) VALUES (?, 'coverage-market', ?, ?, ?, ?, ?, '30D', 1, 0.9, ?, ?, ?)`)
+    .run(id, date, monthlySales, `${sourceType} history fixture`, sourceType,
+      `${date}T08:00:00.000Z`, date, id, syncRunId);
+}
+
 function insertRunProductSnapshot(
   id: string, productId: string, date: string, runId: string, collectedAt: string,
 ): void {
@@ -111,6 +127,71 @@ function insertRunProductSnapshot(
 }
 
 describe('DataCoverageService', () => {
+  it('counts the primary market only at the 90-day boundary and ignores invalid observations', () => {
+    database = openDatabase(':memory:');
+    insertLiveCoverageFixture();
+    insertMarketSnapshot('market-latest', '2026-09-19', 'import');
+    insertMarketSnapshot('market-89-days', '2026-06-22', 'import');
+    insertMarketSnapshot('market-mock-old', '2026-05-01', 'mock');
+    insertMarketSnapshot('market-null-old', '2026-04-01', 'import', null);
+    insertCriticalRun('run-failed-history', 'failed');
+    insertMarketSnapshot('market-failed-old', '2026-03-01', 'mcp', 10_000, 'run-failed-history');
+    insertCriticalRun('run-running-history', 'running');
+    insertMarketSnapshot('market-running-old', '2026-02-01', 'mcp', 10_000, 'run-running-history');
+
+    expect(new DataCoverageService(database).getCoverage('US').primaryMarketHistory90d)
+      .toMatchObject({ covered: 0, total: 1, status: 'missing' });
+
+    insertMarketSnapshot('market-90-days', '2026-06-21', 'import');
+
+    expect(new DataCoverageService(database).getCoverage('US').primaryMarketHistory90d)
+      .toMatchObject({ covered: 1, total: 1, status: 'complete' });
+  });
+
+  it('reports owned, competitor, and 3-5 direct-competitor targets without making them one gate', () => {
+    database = openDatabase(':memory:');
+    insertLiveCoverageFixture();
+    insertMarketSnapshot('market-history-old', '2026-06-21', 'import');
+    insertMarketSnapshot('market-history-new', '2026-09-19', 'import');
+    insertProductSnapshot('owned-live', '2026-03-20', 'import');
+    insertProductSnapshot('owned-live', '2026-09-19', 'import');
+    insertProductSnapshot('competitor-live', '2026-06-21', 'import');
+    insertProductSnapshot('competitor-live', '2026-09-19', 'import');
+
+    const coverage = new DataCoverageService(database).getCoverage('US');
+
+    expect(coverage.primaryMarketHistory90d).toMatchObject({ covered: 1, total: 1 });
+    expect(coverage.ownedProductHistory90d).toMatchObject({ covered: 1, total: 1 });
+    expect(coverage.ownedProductHistory180d).toMatchObject({ covered: 1, total: 1 });
+    expect(coverage.coreCompetitorHistory90d).toMatchObject({ covered: 1, total: 1 });
+    expect(coverage.coreDirectCompetitorTarget).toMatchObject({
+      covered: 0,
+      total: 1,
+      status: 'missing',
+      minimumPerOwnedProduct: 3,
+      preferredMaximumPerOwnedProduct: 5,
+    });
+  });
+
+  it('excludes Demo masters and unconfirmed market nodes from real-history targets', () => {
+    database = openDatabase(':memory:');
+    insertLiveCoverageFixture();
+    insertProduct('owned-demo', true);
+    database.prepare("UPDATE products SET source_type = 'mock' WHERE id = 'owned-demo'").run();
+    insertProductSnapshot('owned-demo', '2026-06-01', 'import');
+    insertProductSnapshot('owned-demo', '2026-09-19', 'import');
+    insertMarketSnapshot('market-old', '2026-06-01', 'import');
+    insertMarketSnapshot('market-new', '2026-09-19', 'import');
+    database.prepare(`UPDATE market_nodes SET sellersprite_confirmed_node_path = NULL
+      WHERE id = 'coverage-market'`).run();
+
+    const report = new DataCoverageService(database).getCoverage('US');
+    expect(report.ownedProductHistory90d).toMatchObject({ covered: 0, total: 1 });
+    expect(report.ownedProductHistory180d).toMatchObject({ covered: 0, total: 1 });
+    expect(report.coreDirectCompetitorTarget).toMatchObject({ covered: 0, total: 1 });
+    expect(report.primaryMarketHistory90d).toMatchObject({ covered: 0, total: 1 });
+  });
+
   it('excludes failed and running critical MCP observations from every Live coverage counter', () => {
     database = openDatabase(':memory:');
     insertLiveCoverageFixture();
@@ -151,6 +232,8 @@ describe('DataCoverageService', () => {
     insertRunMarketSnapshot('failed-market', 'run-failed', '2026-09-19T09:00:00.000Z');
     insertRunProductSnapshot('failed-owned', 'owned-live', '2026-06-19',
       'run-failed', '2026-09-19T09:00:00.000Z');
+    database.prepare(`UPDATE market_nodes SET status = '等待30D对照'
+      WHERE id = 'coverage-market'`).run();
 
     const coverage = new DataCoverageService(database).getCoverage('US');
     const freshness = new DashboardFreshnessService(database).getStatus({

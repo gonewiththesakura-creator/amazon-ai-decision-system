@@ -91,9 +91,10 @@ function openFixture(options: {
   const db = openDatabase(':memory:');
   database = db;
   db.prepare(`INSERT INTO market_nodes (
-    id, name, level, marketplace, category_id, status, source_type, created_at
-  ) VALUES (?, 'Real market', 1, 'US', ?, 'active', 'import', ?)`)
-    .run(MARKET_ID, NODE_ID_PATH, COLLECTED_AT);
+    id, name, level, marketplace, category_id, sellersprite_confirmed_node_path,
+    status, source_type, created_at
+  ) VALUES (?, 'Real market', 1, 'US', ?, ?, 'active', 'import', ?)`)
+    .run(MARKET_ID, NODE_ID_PATH, NODE_ID_PATH, COLLECTED_AT);
   db.prepare(`UPDATE app_settings SET mode = 'demo', default_market_id = ? WHERE id = 1`)
     .run(MARKET_ID);
   for (const productId of OWNED_IDS) {
@@ -142,6 +143,7 @@ function openFixture(options: {
 describe('dashboard run read-path proof', () => {
   it('proves the selected market and exact owned children while retaining unrelated Demo rows', () => {
     const db = openFixture({ retainedDemo: true });
+    db.prepare(`UPDATE market_nodes SET status = '值得研究' WHERE id = ?`).run(MARKET_ID);
     expect(new IntelligenceRepository(db).getOwnedProducts().map((product) => product.id))
       .toContain('demo-owned');
 
@@ -182,9 +184,10 @@ describe('dashboard run read-path proof', () => {
   it('rejects unlinked child-market growth shown for a real owned SKU', () => {
     const db = openFixture();
     db.prepare(`INSERT INTO market_nodes (
-      id, name, parent_id, level, marketplace, category_id, status, source_type, created_at
+      id, name, parent_id, level, marketplace, category_id,
+      sellersprite_confirmed_node_path, status, source_type, created_at
     ) VALUES ('child-market', 'Real child market', ?, 2, 'US', '1055398:1063252:999',
-      'active', 'import', ?)`)
+      '1055398:1063252:999', 'active', 'import', ?)`)
       .run(MARKET_ID, COLLECTED_AT);
     db.prepare(`UPDATE products SET market_node_id = 'child-market' WHERE id = ?`)
       .run(OWNED_IDS[0]);
@@ -482,9 +485,10 @@ describe('dashboard run read-path proof', () => {
   it('rejects a run after an owned child moves to another node in the market tree', () => {
     const db = openFixture();
     db.prepare(`INSERT INTO market_nodes (
-      id, name, parent_id, level, marketplace, category_id, status, source_type, created_at
+      id, name, parent_id, level, marketplace, category_id,
+      sellersprite_confirmed_node_path, status, source_type, created_at
     ) VALUES ('market-child', 'Real child market', ?, 2, 'US', '1055398:1063252:999',
-      'active', 'import', ?)`)
+      '1055398:1063252:999', 'active', 'import', ?)`)
       .run(MARKET_ID, COLLECTED_AT);
     db.prepare(`UPDATE products SET market_node_id = 'market-child' WHERE id = ?`).run(OWNED_IDS[0]);
 
@@ -496,9 +500,10 @@ describe('dashboard run read-path proof', () => {
     });
   });
 
-  it('rejects a run after the selected market category path changes', () => {
+  it('rejects a run after the selected confirmed SellerSprite path changes', () => {
     const db = openFixture();
-    db.prepare(`UPDATE market_nodes SET category_id = '1055398:9999999' WHERE id = ?`)
+    db.prepare(`UPDATE market_nodes SET category_id = '1055398:9999999',
+      sellersprite_confirmed_node_path = '1055398:9999999' WHERE id = ?`)
       .run(MARKET_ID);
 
     expect(proveDashboardRunReadPath(db, {

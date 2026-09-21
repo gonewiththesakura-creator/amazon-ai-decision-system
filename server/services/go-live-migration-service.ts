@@ -2,6 +2,8 @@ import { backup as sqliteBackup } from 'node:sqlite';
 import { createHash } from 'node:crypto';
 import type { AppDatabase } from '../database/database.js';
 import { transaction } from '../database/database.js';
+import { confirmedDirectCompetitors } from './confirmed-direct-competitor-coverage.js';
+import { validMarketHistorySpan } from './real-history-coverage.js';
 
 interface CountRow {
   count: number;
@@ -35,6 +37,10 @@ export interface GoLiveVerification {
   sellerSpriteCriticalRunId: string | null;
   verifiedEvidenceEntities: number;
   requiredEvidenceEntities: number;
+  primaryMarketHistoryDays: number;
+  hasPrimaryMarketHistory90d: boolean;
+  runLinkedCandidateGroups: number;
+  confirmedDirectCompetitors: number;
   readyForDemoCleanup: boolean;
   hasMinimumRealCoverage: boolean;
 }
@@ -315,30 +321,36 @@ export class GoLiveMigrationService {
       WHERE provider_id = 'sellersprite' AND status = 'success'
         AND capability IN ('MARKET_RESEARCH', 'MARKET_STATISTICS', 'PRODUCT_CONCENTRATION')
         AND entity_type = 'market' AND entity_id = (
-          SELECT category_id FROM market_nodes WHERE id = ? AND marketplace = ?)
+          SELECT sellersprite_confirmed_node_path FROM market_nodes
+          WHERE id = ? AND marketplace = ?)
         AND result_count > 0
     `, false, settings.default_market_id, settings.marketplace);
     const marketNode = this.database.prepare(`
-      SELECT category_id, status, source_type FROM market_nodes
+      SELECT sellersprite_confirmed_node_path AS nodeIdPath, source_type AS sourceType
+      FROM market_nodes
       WHERE id = ? AND marketplace = ?
     `).get(settings.default_market_id, settings.marketplace) as {
-      category_id: string | null; status: string; source_type: string;
+      nodeIdPath: string | null; sourceType: string;
     } | undefined;
-    const verifiedMarketPath = /^\d+(?::\d+)*$/.test(marketNode?.category_id ?? '')
-      && marketNode?.status === 'active' && marketNode.source_type !== 'mock';
+    const verifiedMarketPath = /^\d+(?::\d+)*$/.test(marketNode?.nodeIdPath ?? '')
+      && marketNode?.sourceType !== 'mock';
     const sellerSpriteAsinCalls = this.count(`
       WITH RECURSIVE market_scope(id) AS (
         SELECT id FROM market_nodes WHERE id = ? AND marketplace = ?
-          AND status = 'active' AND source_type <> 'mock'
+          AND source_type <> 'mock'
         UNION
         SELECT child.id FROM market_nodes child
         JOIN market_scope parent ON child.parent_id = parent.id
-        WHERE child.marketplace = ? AND child.status = 'active' AND child.source_type <> 'mock'
+        WHERE child.marketplace = ? AND child.source_type <> 'mock'
       )
       SELECT COUNT(*) AS count FROM mcp_call_logs log
       JOIN products product ON product.asin = log.entity_id
         AND product.is_owned = 1 AND product.is_parent = 0 AND product.status = 'active'
         AND product.source_type <> 'mock' AND product.marketplace = ?
+      JOIN market_nodes assigned ON assigned.id = product.market_node_id
+        AND assigned.marketplace = product.marketplace
+        AND assigned.source_type <> 'mock'
+        AND assigned.sellersprite_confirmed_node_path IS NOT NULL
       JOIN market_scope scope ON scope.id = product.market_node_id
       WHERE log.provider_id = 'sellersprite' AND log.status = 'success'
         AND log.capability = 'ASIN_SALES_TREND' AND log.entity_type = 'product'
@@ -349,13 +361,24 @@ export class GoLiveMigrationService {
     `, false, settings.default_market_id, settings.marketplace,
       settings.marketplace, settings.marketplace);
     const criticalProof = verifiedMarketPath
-      ? this.completeCriticalRun(settings.marketplace, settings.default_market_id, marketNode!.category_id!)
-      : { runId: null, verifiedEvidenceEntities: 0, requiredEvidenceEntities: activeOwnedProducts + 1 };
+      ? this.completeCriticalRun(settings.marketplace, settings.default_market_id, marketNode!.nodeIdPath!)
+      : {
+        runId: null, verifiedEvidenceEntities: 0,
+        requiredEvidenceEntities: activeOwnedProducts + 1, runLinkedCandidateGroups: 0,
+      };
     const sellerSpriteCriticalRunId = criticalProof.runId;
+    const primaryMarketHistory = validMarketHistorySpan(
+      this.database, settings.marketplace, settings.default_market_id,
+    );
+    const hasPrimaryMarketHistory90d = primaryMarketHistory.days >= 90;
+    const confirmedDirectCompetitorCount = new Set(confirmedDirectCompetitors(
+      this.database, settings.marketplace,
+    ).map((relation) => relation.competitorProductId)).size;
     const readyForDemoCleanup = verifiedMarketPath
       && sellerSpriteConnectionVerified
       && sellerSpriteCapabilitiesAvailable
-      && sellerSpriteCriticalRunId !== null;
+      && sellerSpriteCriticalRunId !== null
+      && criticalProof.runLinkedCandidateGroups > 0;
     return {
       mockObservations,
       realMarketSnapshots,
@@ -370,6 +393,10 @@ export class GoLiveMigrationService {
       sellerSpriteCriticalRunId,
       verifiedEvidenceEntities: criticalProof.verifiedEvidenceEntities,
       requiredEvidenceEntities: criticalProof.requiredEvidenceEntities,
+      primaryMarketHistoryDays: primaryMarketHistory.days,
+      hasPrimaryMarketHistory90d,
+      runLinkedCandidateGroups: criticalProof.runLinkedCandidateGroups,
+      confirmedDirectCompetitors: confirmedDirectCompetitorCount,
       readyForDemoCleanup,
       hasMinimumRealCoverage: mockObservations === 0
         && activeOwnedProducts > 0
@@ -377,6 +404,8 @@ export class GoLiveMigrationService {
         && realMarketSnapshots > 0
         && realOwnedProductSnapshots === activeOwnedProducts
         && sellerSpriteOwnedProductSnapshots > 0
+        && hasPrimaryMarketHistory90d
+        && confirmedDirectCompetitorCount > 0
         && readyForDemoCleanup,
     };
   }
@@ -385,36 +414,47 @@ export class GoLiveMigrationService {
     runId: string | null;
     verifiedEvidenceEntities: number;
     requiredEvidenceEntities: number;
+    runLinkedCandidateGroups: number;
   } {
     const owned = this.database.prepare(`
       WITH RECURSIVE market_scope(id) AS (
         SELECT id FROM market_nodes
-        WHERE id = ? AND marketplace = ? AND status = 'active' AND source_type <> 'mock'
+        WHERE id = ? AND marketplace = ? AND source_type <> 'mock'
         UNION
         SELECT child.id FROM market_nodes child
         JOIN market_scope parent ON child.parent_id = parent.id
-        WHERE child.marketplace = ? AND child.status = 'active' AND child.source_type <> 'mock'
+        WHERE child.marketplace = ? AND child.source_type <> 'mock'
       )
       SELECT product.id, product.asin, product.market_node_id AS marketNodeId,
-        CASE WHEN scope.id IS NOT NULL THEN 1 ELSE 0 END AS inScope
+        CASE WHEN scope.id IS NOT NULL THEN 1 ELSE 0 END AS inScope,
+        CASE WHEN assigned.sellersprite_confirmed_node_path IS NOT NULL
+          THEN 1 ELSE 0 END AS confirmed
       FROM products product
       LEFT JOIN market_scope scope ON scope.id = product.market_node_id
+      LEFT JOIN market_nodes assigned ON assigned.id = product.market_node_id
+        AND assigned.marketplace = product.marketplace AND assigned.source_type <> 'mock'
       WHERE product.marketplace = ? AND product.is_owned = 1 AND product.is_parent = 0
         AND product.status = 'active'
         AND product.source_type <> 'mock' ORDER BY product.id
     `).all(marketId, marketplace, marketplace, marketplace) as Array<{
-      id: string; asin: string; marketNodeId: string; inScope: number;
+      id: string; asin: string; marketNodeId: string; inScope: number; confirmed: number;
     }>;
     const requiredEvidenceEntities = owned.length + 1;
-    const incomplete = { runId: null, verifiedEvidenceEntities: 0, requiredEvidenceEntities };
-    if (owned.length === 0 || owned.some((product) => product.inScope !== 1)) return incomplete;
+    const incomplete = {
+      runId: null, verifiedEvidenceEntities: 0, requiredEvidenceEntities,
+      runLinkedCandidateGroups: 0,
+    };
+    if (owned.length === 0
+      || owned.some((product) => product.inScope !== 1 || product.confirmed !== 1)) return incomplete;
     const marketNodes = [{ id: marketId, nodeIdPath }];
     for (const id of [...new Set(owned.map((product) => product.marketNodeId))]
       .filter((id) => id !== marketId).sort()) {
-      const child = this.database.prepare(`SELECT category_id AS nodeIdPath FROM market_nodes
-        WHERE id = ? AND marketplace = ? AND status = 'active' AND source_type <> 'mock'`)
+      const child = this.database.prepare(`
+        SELECT sellersprite_confirmed_node_path AS nodeIdPath FROM market_nodes
+        WHERE id = ? AND marketplace = ? AND source_type <> 'mock'
+      `)
         .get(id, marketplace) as { nodeIdPath: string | null } | undefined;
-      if (!child?.nodeIdPath) return incomplete;
+      if (!child?.nodeIdPath || !/^\d+(?::\d+)*$/.test(child.nodeIdPath)) return incomplete;
       marketNodes.push({ id, nodeIdPath: child.nodeIdPath });
     }
     const directCompetitorRoster = this.currentDirectCompetitorRoster(marketplace);
@@ -476,9 +516,14 @@ export class GoLiveMigrationService {
       const competitorPartition = coveragePartition(competitorSummary, directCompetitorRoster);
       if (candidateSummary.status !== 'success' || candidateSummary.success !== owned.length
         || candidateSummary.failed !== 0
+        || !Number.isSafeInteger(candidateSummary.candidates)
+        || (candidateSummary.candidates as number) <= 0
         || !candidatePartition || !competitorPartition
         || !this.candidateLinksMatchRun(candidateSummary, owned, run.id)
         || (directCompetitorRoster.length > 0 && competitorSummary.success === 0)) continue;
+      const runLinkedCandidateGroups = (candidateSummary.covered as Array<Record<string, unknown>>)
+        .filter((entry) => typeof entry.candidates === 'number' && entry.candidates > 0).length;
+      if (runLinkedCandidateGroups === 0) continue;
       const marketDates = marketMonths.map(marketDateForMonth);
       const runCapabilitiesAvailable = this.count(`
         SELECT CASE WHEN
@@ -602,7 +647,10 @@ export class GoLiveMigrationService {
       )).length;
       latestEvidenceCount ??= verifiedEvidenceEntities;
       if (verifiedEvidenceEntities === requiredEvidenceEntities) {
-        return { runId: run.id, verifiedEvidenceEntities, requiredEvidenceEntities };
+        return {
+          runId: run.id, verifiedEvidenceEntities, requiredEvidenceEntities,
+          runLinkedCandidateGroups,
+        };
       }
     }
     return { ...incomplete, verifiedEvidenceEntities: latestEvidenceCount ?? 0 };

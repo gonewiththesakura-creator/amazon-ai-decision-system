@@ -60,7 +60,7 @@ describe('real SellerSprite acceptance runner', () => {
     expect(summary).toEqual({
       ok: true,
       acceptanceScope: 'critical_market_and_owned_skus',
-      manualCompetitorReview: 'not_checked',
+      manualCompetitorReview: 'confirmed',
       checks: {
         preflight: true,
         connection: true,
@@ -79,10 +79,13 @@ describe('real SellerSprite acceptance runner', () => {
         ownedProducts: 2,
         candidateDiscoveryProducts: 2,
         candidateDiscoveryFailures: 0,
-        competitorCandidates: 0,
-        directCompetitors: 0,
-        refreshedDirectCompetitors: 0,
+        competitorCandidates: 1,
+        directCompetitors: 1,
+        refreshedDirectCompetitors: 1,
         failedDirectCompetitors: 0,
+        primaryMarketHistoryDays: 92,
+        runLinkedCandidateGroups: 1,
+        confirmedDirectCompetitors: 1,
         marketSnapshots: 2,
         productSnapshots: 4,
         jobs: 3,
@@ -95,7 +98,7 @@ describe('real SellerSprite acceptance runner', () => {
       runId: RUN_ID,
       schemaHashes: HASHES,
     });
-    const safeLabels = new Set([RUN_ID, 'critical_market_and_owned_skus', 'not_checked']);
+    const safeLabels = new Set([RUN_ID, 'critical_market_and_owned_skus', 'confirmed']);
     expect(allStringValues(summary).every((value) => (
       safeLabels.has(value) || /^[a-f0-9]{64}$/.test(value)
     ))).toBe(true);
@@ -140,7 +143,7 @@ describe('real SellerSprite acceptance runner', () => {
     expect(JSON.parse(output[0]!)).toMatchObject({
       ok: true,
       acceptanceScope: 'critical_market_and_owned_skus',
-      manualCompetitorReview: 'not_checked',
+      manualCompetitorReview: 'confirmed',
       checks: { secondaryCoverage: true },
       counts: {
         candidateDiscoveryProducts: 2,
@@ -152,6 +155,26 @@ describe('real SellerSprite acceptance runner', () => {
       },
     });
     expect(api.requests.join('\n')).not.toMatch(/competitor-candidates\/.*\/(?:confirm|reject)/);
+  });
+
+  it('rejects a successful discovery run that produced no run-linked candidates', async () => {
+    const api = await startApi({
+      candidateCoverage: { status: 'success', total: 2, success: 2, failed: 0, candidates: 0 },
+    });
+    const output: string[] = [];
+
+    const exitCode = await runAcceptanceCli([
+      '--base-url', api.baseUrl, '--month', '202609',
+    ], { writeOutput: (value) => output.push(value) });
+
+    expect(exitCode).toBe(1);
+    expect(JSON.parse(output[0]!)).toMatchObject({
+      ok: false,
+      checks: { criticalSync: true, secondaryCoverage: false, dashboard: false },
+      counts: { competitorCandidates: 0 },
+    });
+    expect(api.requests).not.toContain('GET /api/dashboard/executive?range=30D');
+    expect(api.requests).not.toContain('POST /api/research-jobs');
   });
 
   it('rejects candidate coverage for a different owned-SKU roster before dashboard or jobs', async () => {
@@ -170,6 +193,50 @@ describe('real SellerSprite acceptance runner', () => {
     });
     expect(api.requests).not.toContain('GET /api/dashboard/executive?range=30D');
     expect(api.requests).not.toContain('POST /api/research-jobs');
+  });
+
+  it('rejects a full acceptance run without a current direct-competitor roster', async () => {
+    const api = await startApi({
+      competitorCoverage: { status: 'success', total: 0, success: 0, failed: 0 },
+    });
+    const output: string[] = [];
+
+    const exitCode = await runAcceptanceCli([
+      '--base-url', api.baseUrl, '--month', '202609',
+    ], { writeOutput: (value) => output.push(value) });
+
+    expect(exitCode).toBe(1);
+    expect(JSON.parse(output[0]!)).toMatchObject({
+      ok: false,
+      checks: { criticalSync: true, secondaryCoverage: false, dashboard: false },
+      counts: { directCompetitors: 0 },
+    });
+  });
+
+  it.each([
+    ['89 days of primary-market history', {
+      primaryMarketHistoryDays: 89,
+      hasPrimaryMarketHistory90d: false,
+      confirmedDirectCompetitors: 1,
+    }],
+    ['no human-confirmed active direct competitor', {
+      primaryMarketHistoryDays: 92,
+      hasPrimaryMarketHistory90d: true,
+      confirmedDirectCompetitors: 0,
+    }],
+  ])('rejects otherwise complete acceptance with %s', async (_case, verification) => {
+    const api = await startApi({ verification });
+    const output: string[] = [];
+
+    const exitCode = await runAcceptanceCli([
+      '--base-url', api.baseUrl, '--month', '202609',
+    ], { writeOutput: (value) => output.push(value) });
+
+    expect(exitCode).toBe(1);
+    expect(JSON.parse(output[0]!)).toMatchObject({
+      ok: false,
+      checks: { verification: false },
+    });
   });
 
   it('keeps observed secondary failure counts when the run cannot be accepted', async () => {
@@ -379,6 +446,12 @@ interface ApiOptions {
     verifiedOwnedProducts: number;
     requiredOwnedProducts: number;
   };
+  verification?: Partial<{
+    primaryMarketHistoryDays: number;
+    hasPrimaryMarketHistory90d: boolean;
+    runLinkedCandidateGroups: number;
+    confirmedDirectCompetitors: number;
+  }>;
   redirectPath?: string;
   redirectLocation?: string;
 }
@@ -416,7 +489,8 @@ async function startApi(options: ApiOptions = {}): Promise<{
       respondData(response, [
         {
           id: 'market-1', name: PRIVATE_CANARY, parentId: null, level: 1,
-          marketplace: 'US', categoryId: '100:200', keywords: [], status: 'active', children: [],
+          marketplace: 'US', categoryId: '100:200', sellerSpriteNodePath: '100:200',
+          keywords: [], status: '等待30D对照', children: [],
         },
         {
           id: 'archived-unmapped', name: PRIVATE_CANARY, parentId: null, level: 1,
@@ -449,9 +523,9 @@ async function startApi(options: ApiOptions = {}): Promise<{
       respondData(response, {
         runId: RUN_ID, taskId: RUN_ID, marketSnapshots: 2, productSnapshots: 4,
         candidateCoverage: options.candidateCoverage
-          ?? { status: 'success', total: 2, success: 2, failed: 0, candidates: 0 },
+          ?? { status: 'success', total: 2, success: 2, failed: 0, candidates: 1 },
         competitorCoverage: options.competitorCoverage
-          ?? { status: 'success', total: 0, success: 0, failed: 0 },
+          ?? { status: 'success', total: 1, success: 1, failed: 0 },
         private: PRIVATE_CANARY,
       }, 201);
       return;
@@ -517,6 +591,11 @@ async function startApi(options: ApiOptions = {}): Promise<{
         requiredEvidenceEntities: 3,
         readyForDemoCleanup: true,
         hasMinimumRealCoverage: false,
+        primaryMarketHistoryDays: 92,
+        hasPrimaryMarketHistory90d: true,
+        runLinkedCandidateGroups: 1,
+        confirmedDirectCompetitors: 1,
+        ...options.verification,
         private: PRIVATE_CANARY,
       });
       return;

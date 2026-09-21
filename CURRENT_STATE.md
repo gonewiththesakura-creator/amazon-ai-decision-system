@@ -38,6 +38,7 @@
 - Opportunity Lab 在空/live 模式只保留待采集研究计划和 pending DataTask；无真实数据时不落零值 MarketNode，也不创建 Opportunity。
 - V16-V19 后，空/live 模式的待开发项目将市场规模、30D 增长、竞争分、机会分和评分拆解保存为 `null`；空市场节点的评分同样为 `null`。对应 DataTask 保持 pending，只有存在合法 Snapshot 基线时才重算。
 - V2.2 增加 Product Master 生命周期、Variation Family、Marketplace 级身份解析、`observationDate`/`collectedAt` 分离、稳定去重键和多来源 Metric Authority；相同事实不会因重复导入而翻倍，也不会让 SellerSprite 估算覆盖 Amazon actual。
+- 自有 Product Master 的移除操作是软停用：设置 `status='inactive'`、关闭当前监控并从活动清单隐藏，主档、Snapshot、竞品关系和审计记录继续保留。
 - SellerSprite MCP 使用服务端 Streamable HTTP Client；运行时 `listTools` 建立 Capability Registry，远端响应经 schema、Marketplace、节点、ASIN 和月份校验后才能标准化并写 Snapshot。调用账本、缓存、限流、超时、重试和错误脱敏均位于服务端。
 - `critical_sync` 为每次运行创建唯一 `runId`。fresh `listTools`、能力快照、当前月与上月市场数据、全部 active 真实自有 SKU、候选/直接竞品 coverage、Snapshot、Fact 和后续 Evidence 都关联该运行；Go Live 不允许跨运行拼证据。
 - Live 读取拒绝 Mock 及 failed/running MCP 观察；失败批次保留上一份合法真实 Snapshot 并显示“部分未更新”。主市场与全部自有 SKU 是原子批次，直接竞品为可部分失败的 secondary batch。
@@ -75,7 +76,9 @@
 ## 当前边界
 
 - TOP100 商品数据尚无可信的上架/首见日期；“新品”排序已禁用，不根据销量、Review 或标签推断新品身份。
-- SellerSprite MCP 真实 Transport、Capability Registry、同步与 Go Live 证明链已实现，不再是 Stub；但本机尚未配置 `.env`，也没有经核实的真实市场节点和真实自有 ASIN，因此真实 provider schema、Market/Product Snapshot、Dashboard 与 Evidence 链仍未完成现场验收。
+- SellerSprite MCP 真实 Transport、Capability Registry、同步与 Go Live 证明链已实现，不再是 Stub。本机已通过 `.env` 完成一次脱敏连接验收：初始化、认证和 fresh `listTools` 成功，发现 49 个工具，5 项必需能力均有实际工具及 schema 指纹；Secret 未写入仓库、日志或验收输出。
+- 当前本地数据库已保存一个经真实 `product_node` 核验的主市场路径和两个不同的末级节点，颈椎/Contour 与 Lumbar/Body Positioner 没有混为同一 MarketNode。五行真实 Product Master 仍只处于本地忽略文件的预览阶段：四行结构有效，一行因 provider 无标题且 ASIN 状态无效而被必填校验阻断；尚未确认导入。
+- 真实 ASIN 只读核验中，三项颈椎产品取得真实身份、节点和趋势；一项腰枕取得身份、父体和节点但趋势为空；另一项腰枕被 SellerSprite 标记为无效且身份/节点/趋势均为空。因此尚未产生包含当前五项 SKU 的完整 `critical_sync`，也没有真实 Market/Product Snapshot、同运行 Dashboard/Evidence 验收。缺失项不会以 Mock、兄弟变体或人工猜测补齐。
 - 当前本地数据库仍为 Demo：真实链成功前不会清除 Mock，不会切换 Live。Dry Run 会单独列出两项需人工确认的 Demo/manual 历史；清理与激活继续受备份、覆盖和明确确认文本保护。
 - 外部 LLM 尚未接入，当前解释完全可重复；确定性指标始终由代码计算。
 - 常驻 scheduler/worker 尚未启用，监控和 DataTask 当前由人工触发。
@@ -91,8 +94,8 @@
 - Review Gap、Reverse Review、Approval、Decision：已覆盖。
 - 灰色 SKU 与 U 型枕两个 V2 端到端任务：已覆盖。
 - 动态 SKU `0/1/4/5/12/50`、父子体、历史导入幂等、MCP 模拟契约、运行级追溯、Live no-Mock 与 Demo 清理门禁：已由自动化测试覆盖。
-- 2026-09-21 的本地交付验证为 lint、typecheck、54 个测试文件共 619 项和 production build 全部通过；额外在 `TZ=America/Los_Angeles` 下验证 XLSX 业务日期。公开 PR 的上一提交两个 CI `verify` 均成功；本次变更需在推送后重新确认 CI。
-- 真实验收仍未完成：Connection/Auth/listTools、真实 Tool Schema、真实市场/ASIN/竞品候选、真实历史回填、同运行 Dashboard/Evidence、Demo Cleanup 与 Live 激活均等待本机凭据和业务主数据，不能以模拟测试替代。
+- 2026-09-21 的本地交付验证为 lint、typecheck、54 个测试文件共 695 项和 production build 全部通过；额外在 `TZ=America/Los_Angeles` 下验证 XLSX 业务日期。本地业务库已备份并迁移至 V29，五行预览为四行有效、一行缺少真实标题；未确认导入。本次变更需在推送后重新确认公开 PR 的 CI。
+- 真实验收部分完成：Connection/Auth/fresh listTools、必需 Tool Schema、三个市场节点及部分 ASIN 身份已由真实 provider 核验。当前阻断项是五项 SKU 中两项没有合法 ASIN Trend，且其中一项没有可验证标题/类目；因此全量 Critical Sync、候选入库、真实 Snapshot、同运行 Dashboard/Evidence、历史回填、Demo Cleanup 与 Live 激活均未完成，不能以部分成功或模拟测试替代。
 
 ## V2.1 视觉验收
 

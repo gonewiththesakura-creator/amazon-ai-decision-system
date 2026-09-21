@@ -1,1 +1,1 @@
-marketplace,asin,sku,internalName,brand,title,productType,parentAsin,variationTheme,marketNode,monitoringEnabled,status
+marketplace,asin,sku,internalName,brand,title,productType,parentAsin,variationFamilyKey,parentLookupStatus,variationTheme,marketNode,monitoringEnabled,status

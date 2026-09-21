@@ -64,15 +64,46 @@ describe('SellerSpriteMCPAdapter', () => {
     try {
       database.exec(`
         INSERT INTO market_nodes (
-          id, name, level, marketplace, category_id, status, source_type, created_at
+          id, name, level, marketplace, category_id, sellersprite_confirmed_node_path,
+          status, source_type, created_at
         ) VALUES ('market-live', 'Memory Foam Pillows', 1, 'US', '1055398:1063252',
-          'active', 'import', '2026-09-20T00:00:00Z');
+          '1055398:1063252', 'active', 'import', '2026-09-20T00:00:00Z');
         INSERT INTO products (
           id, asin, sku, brand, title, image_url, marketplace, product_type,
           is_owned, market_node_id, status, source_type, created_at
         ) VALUES ('owned-live', 'B000TEST01', 'LIVE-01', 'Own', 'Owned Pillow', '',
           'US', 'memory_foam_pillow', 1, 'market-live', 'active', 'import',
           '2026-09-20T00:00:00Z');
+        INSERT INTO products (
+          id, asin, sku, brand, title, image_url, marketplace, product_type,
+          is_owned, market_node_id, status, source_type, created_at
+        ) VALUES ('competitor-live', 'B000TEST02', NULL, 'Peer', 'Candidate', '',
+          'US', 'memory_foam_pillow', 0, 'market-live', 'active', 'import',
+          '2026-09-20T00:00:00Z');
+        INSERT INTO competitor_candidates (
+          id, marketplace, asin, source_product_id, source, source_type, payload_json,
+          status, created_at, reviewed_at
+        ) VALUES (
+          'candidate-live-direct', 'US', 'B000TEST02', 'owned-live', 'SellerSprite MCP', 'mcp',
+          '{"asin":"B000TEST02","parentAsin":null,"title":"Candidate","brand":null,"price":null,"units":300,"revenue":null,"rating":null,"ratings":null}',
+          'confirmed', '2026-09-20T00:00:00Z', '2026-09-20T00:05:00Z'
+        );
+        INSERT INTO competitor_relations (
+          id, owned_product_id, competitor_product_id, relation_type, similarity_score,
+          reason, ai_tags_json, created_at, last_verified_at
+        ) VALUES (
+          'relation-live-direct', 'owned-live', 'competitor-live', 'direct', 90,
+          'Human-confirmed integration fixture', '[]',
+          '2026-09-20T00:05:00Z', '2026-09-20T00:05:00Z'
+        );
+        INSERT INTO market_snapshots (
+          id, market_node_id, date, monthly_sales, source, source_type, collected_at,
+          period, is_estimated, confidence, observation_date, dedup_key
+        ) VALUES (
+          'market-live-history', 'market-live', '2026-05-31', 1000,
+          'Historical import fixture', 'import', '2026-06-01T00:00:00Z',
+          '1M', 0, 1, '2026-05-31', 'market-live|2026-05-31|import'
+        );
         UPDATE app_settings
         SET mode = 'live', marketplace = 'US', default_market_id = 'market-live'
         WHERE id = 1;
@@ -145,8 +176,8 @@ describe('SellerSpriteMCPAdapter', () => {
 
       expect(run).toMatchObject({
         taskId: run.runId, marketSnapshots: 2, productSnapshots: 8,
-        candidateCoverage: { status: 'success', total: 4 },
-        competitorCoverage: { status: 'success', total: 0 },
+        candidateCoverage: { status: 'success', total: 4, candidates: 4 },
+        competitorCoverage: { status: 'success', total: 1, success: 1 },
       });
       expect(marketResult).toMatchObject({ status: 'monitoring', latestInsight: {
         researchJobId: marketJob.id, evidenceIds: expect.arrayContaining([expect.any(String)]),
@@ -168,6 +199,9 @@ describe('SellerSpriteMCPAdapter', () => {
         sellerSpriteCriticalRunId: run.runId,
         verifiedEvidenceEntities: 5,
         requiredEvidenceEntities: 5,
+        hasPrimaryMarketHistory90d: true,
+        runLinkedCandidateGroups: 4,
+        confirmedDirectCompetitors: 1,
         readyForDemoCleanup: true,
         hasMinimumRealCoverage: true,
       });
@@ -180,7 +214,7 @@ describe('SellerSpriteMCPAdapter', () => {
         WHERE sync_run_id = ? GROUP BY capability ORDER BY capability
       `).all(run.runId)).toEqual(expect.arrayContaining([
         { capability: 'ASIN_COMPETITOR_DISCOVERY', count: 4 },
-        { capability: 'ASIN_SALES_TREND', count: 4 },
+        { capability: 'ASIN_SALES_TREND', count: 5 },
         { capability: 'LIST_TOOLS', count: expect.any(Number) },
         { capability: 'MARKET_STATISTICS', count: 2 },
         { capability: 'PRODUCT_CONCENTRATION', count: 2 },

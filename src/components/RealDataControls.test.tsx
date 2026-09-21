@@ -43,7 +43,9 @@ const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => 
     } as unknown as Response;
   }
   const data = url.endsWith('/api/go-live/preview') ? currentPreview
-    : url.endsWith('/api/markets/market-1') ? { node: { categoryId: '' } }
+    : url.endsWith('/api/markets/market-1') ? {
+      node: { categoryId: '1055398:1063252:1199122:10671043011' },
+    }
       : url.endsWith('/api/markets/market-1/sellersprite-node')
         ? { marketId: 'market-1', nodeIdPath: '1055398:1063252:1199122:10671043011' }
     : url.endsWith('/api/go-live/verify') ? currentVerification
@@ -187,9 +189,6 @@ describe('real-data administration controls', () => {
     render(<RealDataControls isViewer={false} marketId="market-1" />);
     await screen.findByText('Market Snapshots: 2');
     expect(screen.getByRole('button', { name: '同步关键数据' })).toBeDisabled();
-    fireEvent.change(screen.getByLabelText('SellerSprite 节点路径'), {
-      target: { value: '1055398:1063252:1199122:10671043011' },
-    });
     expect(screen.getByRole('button', { name: '保存映射' })).toBeDisabled();
     fireEvent.click(screen.getByLabelText('已核对站点和类目范围'));
     fireEvent.click(screen.getByRole('button', { name: '保存映射' }));

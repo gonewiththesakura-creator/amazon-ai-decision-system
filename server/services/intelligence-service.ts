@@ -227,29 +227,19 @@ export class IntelligenceService {
     });
   }
 
-  deleteOwnedProduct(id: string): boolean {
+  deactivateOwnedProduct(id: string): boolean {
     if (!this.repository.getOwnedProduct(id)) throw new Error('自有产品不存在。');
     const marketplace = this.repository.getSettings().marketplace;
-    const snapshotCount = this.database.prepare(`
-      SELECT COUNT(*) AS count FROM product_snapshots WHERE product_id = ?
-    `).get(id) as { count: number };
-    if (Number(snapshotCount.count) > 0) {
-      throw new Error('该 SKU 存在历史 Snapshot，不能删除；可关闭监控并保留审计记录。');
-    }
     return transaction(this.database, () => {
       this.database.prepare(`
         DELETE FROM watchlist_items WHERE marketplace = ? AND item_type = 'owned_product' AND item_id = ?
       `).run(marketplace, id);
-      this.database.prepare(`
-        DELETE FROM ai_insights WHERE entity_type = 'owned_product' AND entity_id = ?
-      `).run(id);
-      this.database.prepare(`
-        DELETE FROM decisions WHERE entity_type = 'owned_product' AND entity_id = ?
-      `).run(id);
-      const deleted = this.database.prepare(`
-        DELETE FROM products WHERE id = ? AND is_owned = 1 AND marketplace = ?
-      `).run(id, marketplace);
-      return Number(deleted.changes) > 0;
+      const deactivated = this.database.prepare(`
+        UPDATE products
+        SET status = 'inactive', monitoring_enabled = 0, updated_at = ?
+        WHERE id = ? AND is_owned = 1 AND marketplace = ? AND status = 'active'
+      `).run(new Date().toISOString(), id, marketplace);
+      return Number(deactivated.changes) > 0;
     });
   }
 
@@ -830,12 +820,18 @@ export class IntelligenceService {
       if (previous.taskType === 'file_import') {
         throw new Error('文件导入任务不能无文件重试，请重新上传原 CSV/XLSX 文件。');
       }
+      if (previous.taskType === 'post_import_analysis') {
+        throw new Error('导入后分析需要按原批次单独复核，不能通过通用数据任务接口重试。');
+      }
       if (isRunManagedTask(previous)) throw runManagedTaskError();
       taskType = previous.taskType;
       target = previous.target;
       sourcePreference = previous.sourceId ?? previous.source;
     }
     if (RUN_MANAGED_TASK_TYPES.has(taskType)) throw runManagedTaskError();
+    if (taskType === 'post_import_analysis') {
+      throw new Error('导入后分析需要按原批次单独复核，不能通过通用数据任务接口运行。');
+    }
     let watchItem: WatchlistItem | undefined;
     if (input.watchlistId) {
       watchItem = this.repository.getWatchlist().find((candidate) => candidate.id === input.watchlistId);
@@ -1215,7 +1211,8 @@ export class IntelligenceService {
     if (normalizedTaskType === 'file_import') return 'file_import';
     if (this.repository.getMarket(target)) return 'market';
     const product = this.database.prepare(`
-      SELECT is_owned FROM products WHERE id = ? AND marketplace = ?
+      SELECT is_owned FROM products
+      WHERE id = ? AND marketplace = ? AND (is_owned = 0 OR status = 'active')
     `).get(target, this.repository.getSettings().marketplace) as { is_owned: number } | undefined;
     if (product) return product.is_owned === 1 ? 'owned_product' : 'competitor';
     return undefined;
@@ -1250,7 +1247,8 @@ export class IntelligenceService {
         refreshed = await this.appendMarketSnapshot(watchItem.itemId, adapter);
       } else if (['owned_product', 'competitor'].includes(watchItem.itemType)) {
         const product = this.database.prepare(`
-          SELECT id FROM products WHERE id = ? AND marketplace = ?
+          SELECT id FROM products
+          WHERE id = ? AND marketplace = ? AND (is_owned = 0 OR status = 'active')
         `).get(watchItem.itemId, this.repository.getSettings().marketplace);
         if (!product) throw new Error('监控产品不存在于当前站点。');
         refreshed = await this.appendProductSnapshot(watchItem.itemId, adapter);
@@ -1315,7 +1313,8 @@ export class IntelligenceService {
       refreshed = await this.appendMarketSnapshot(target, adapter);
     } else {
       const product = this.database.prepare(`
-        SELECT id FROM products WHERE id = ? AND marketplace = ?
+        SELECT id FROM products
+        WHERE id = ? AND marketplace = ? AND (is_owned = 0 OR status = 'active')
       `).get(target, this.repository.getSettings().marketplace);
       if (product) refreshed += await this.appendProductSnapshot(target, adapter);
       else if (target === 'owned-products' || target === 'all') {
@@ -1371,15 +1370,18 @@ export class IntelligenceService {
       ? await this.prepareMarketSnapshot(settings.defaultMarketId, adapter)
       : null;
     const productIds = this.database.prepare(`
-      SELECT id FROM products WHERE is_owned = 1 AND is_parent = 0 AND marketplace = ?
+      SELECT id FROM products
+      WHERE is_owned = 1 AND is_parent = 0 AND status = 'active' AND marketplace = ?
       UNION
       SELECT relation.competitor_product_id AS id
       FROM competitor_relations relation
       JOIN products owned ON owned.id = relation.owned_product_id
       JOIN products competitor ON competitor.id = relation.competitor_product_id
       WHERE relation.relation_type = 'direct'
-        AND owned.marketplace = ? AND owned.is_parent = 0
-        AND competitor.marketplace = ? AND competitor.is_parent = 0
+        AND owned.marketplace = ? AND owned.is_owned = 1 AND owned.is_parent = 0
+        AND owned.status = 'active' AND competitor.marketplace = ?
+        AND competitor.is_owned = 0 AND competitor.is_parent = 0
+        AND competitor.status = 'active'
       ORDER BY id
     `).all(settings.marketplace, settings.marketplace, settings.marketplace) as Array<{ id: string }>;
     const products: PreparedProductSnapshot[] = [];
@@ -1438,7 +1440,8 @@ export class IntelligenceService {
   ): Promise<PreparedProductSnapshot | null> {
     const product = this.database.prepare(`
       SELECT asin, marketplace, is_owned AS isOwned
-      FROM products WHERE id = ? AND marketplace = ?
+      FROM products
+      WHERE id = ? AND marketplace = ? AND (is_owned = 0 OR status = 'active')
     `).get(productId, this.repository.getSettings().marketplace) as LocalProductIdentity | undefined;
     if (!product) return null;
     const detail = await adapter.fetchProductDetail({
@@ -1482,7 +1485,8 @@ export class IntelligenceService {
     this.ai.analyze({ entityType: 'market', entityId: marketId });
     const ownedRows = this.database.prepare(`
       SELECT id FROM products
-      WHERE is_owned = 1 AND is_parent = 0 AND market_node_id = ? AND marketplace = ?
+      WHERE is_owned = 1 AND is_parent = 0 AND status = 'active'
+        AND market_node_id = ? AND marketplace = ?
     `).all(marketId, this.repository.getSettings().marketplace) as Array<{ id: string }>;
     ownedRows.forEach((row) => this.ai.analyze({ entityType: 'owned_product', entityId: row.id }));
     const projectRows = this.database.prepare(`
@@ -1522,6 +1526,7 @@ export class IntelligenceService {
         FROM competitor_relations relation
         JOIN products owned ON owned.id = relation.owned_product_id
         WHERE relation.competitor_product_id = ? AND owned.marketplace = ?
+          AND owned.is_owned = 1 AND owned.is_parent = 0 AND owned.status = 'active'
       `).all(productId, this.repository.getSettings().marketplace) as Array<{ id: string }>;
       owners.forEach((owner) => this.ai.analyze({ entityType: 'owned_product', entityId: owner.id }));
     }

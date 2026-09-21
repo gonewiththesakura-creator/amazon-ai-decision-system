@@ -25,8 +25,10 @@ function setupFamily(): AppDatabase {
   const connection = openDatabase(':memory:');
   connection.exec(`
     INSERT INTO market_nodes (
-      id, name, parent_id, level, marketplace, category_id, keywords_json, status, source_type, created_at
-    ) VALUES ('market-1', 'Memory foam pillows', NULL, 1, 'US', '101:202', '[]', 'active', 'import', '2026-09-20');
+      id, name, parent_id, level, marketplace, category_id,
+      sellersprite_confirmed_node_path, keywords_json, status, source_type, created_at
+    ) VALUES ('market-1', 'Memory foam pillows', NULL, 1, 'US', '101:202', '101:202',
+      '[]', 'active', 'import', '2026-09-20');
     UPDATE app_settings SET mode = 'live', marketplace = 'US', default_market_id = 'market-1' WHERE id = 1;
     INSERT INTO products (
       id, asin, sku, internal_name, brand, title, image_url, marketplace, product_type, is_owned,
@@ -72,7 +74,26 @@ function legacyImportAdapter(calls: string[]): MarketDataAdapter {
     id: 'source-sellersprite-import',
     name: 'SellerSprite reviewed import',
     sourceType: 'import',
-    async fetchMarketOverview() { throw new Error('not used'); },
+    async fetchMarketOverview(input) {
+      const previous = input.previousSnapshot;
+      return {
+        productCount: previous?.productCount ?? 20,
+        sellerCount: previous?.sellerCount ?? 10,
+        brandCount: previous?.brandCount ?? 5,
+        monthlySales: (previous?.monthlySales ?? 10_000) + 100,
+        monthlyRevenue: (previous?.monthlyRevenue ?? 400_000) + 4_000,
+        avgPrice: previous?.avgPrice ?? 40,
+        medianPrice: previous?.medianPrice ?? 39,
+        avgRating: previous?.avgRating ?? 4.4,
+        medianReviews: previous?.medianReviews ?? 100,
+        top10Share: previous?.top10Share ?? 30,
+        top20Share: previous?.top20Share ?? 45,
+        newProductShare: previous?.newProductShare ?? 10,
+        priceBands: previous?.priceBands ?? [],
+        concentration: previous?.concentration ?? [],
+        provenance,
+      };
+    },
     async fetchMarketProducts() { return []; },
     async fetchKeywordData() { return []; },
     async fetchProductDetail(input: ProductInput) {
@@ -255,5 +276,120 @@ describe('sellable child SKU roster', () => {
 
     expect(task.status).toBe('success');
     expect(calls).toEqual(['B0RIVAL001']);
+  });
+
+  it.each([
+    ['manual refresh', { taskType: 'manual_refresh', target: 'child' }],
+    ['owned SKU batch', { taskType: 'owned_sku_refresh', target: 'all' }],
+    ['product batch', { taskType: 'product_refresh', target: 'all' }],
+    ['competitor batch', { taskType: 'competitor_refresh', target: 'all' }],
+    ['dashboard core batch', { taskType: 'dashboard_core_refresh', target: 'all' }],
+  ])('does not refresh a deactivated owned SKU through %s', async (_label, taskInput) => {
+    database = setupFamily();
+    const calls: string[] = [];
+    const adapter = legacyImportAdapter(calls);
+    const service = new IntelligenceService(
+      database, new DataSourceRouter(new AdapterRegistry([adapter])),
+    );
+    expect(service.deactivateOwnedProduct('child')).toBe(true);
+    const before = database.prepare(`
+      SELECT
+        (SELECT COUNT(*) FROM product_snapshots WHERE product_id = 'child') AS snapshots,
+        (SELECT COUNT(*) FROM ai_insights
+          WHERE entity_type = 'owned_product' AND entity_id = 'child') AS insights
+    `).get();
+
+    await service.runDataTask({ ...taskInput, sourcePreference: adapter.id });
+
+    expect(calls).toEqual([]);
+    expect(database.prepare(`
+      SELECT
+        (SELECT COUNT(*) FROM product_snapshots WHERE product_id = 'child') AS snapshots,
+        (SELECT COUNT(*) FROM ai_insights
+          WHERE entity_type = 'owned_product' AND entity_id = 'child') AS insights
+    `).get()).toEqual(before);
+  });
+
+  it('does not refresh a deactivated owned SKU through a stale watchlist item', async () => {
+    database = setupFamily();
+    const calls: string[] = [];
+    const adapter = legacyImportAdapter(calls);
+    const service = new IntelligenceService(
+      database, new DataSourceRouter(new AdapterRegistry([adapter])),
+    );
+    expect(service.deactivateOwnedProduct('child')).toBe(true);
+    database.prepare(`
+      INSERT INTO watchlist_items (
+        id, item_type, item_id, name, marketplace, frequency, status,
+        latest_finding, anomaly, created_at
+      ) VALUES ('stale-child-watch', 'owned_product', 'child', 'Stale child', 'US',
+        'manual', 'active', '', 0, '2026-09-21T00:00:00.000Z')
+    `).run();
+    const before = database.prepare(`
+      SELECT
+        (SELECT COUNT(*) FROM product_snapshots WHERE product_id = 'child') AS snapshots,
+        (SELECT COUNT(*) FROM ai_insights
+          WHERE entity_type = 'owned_product' AND entity_id = 'child') AS insights
+    `).get();
+
+    const task = await service.runDataTask({
+      taskType: 'watchlist_refresh', target: 'child', watchlistId: 'stale-child-watch',
+      sourcePreference: adapter.id,
+    });
+
+    expect(task.status).toBe('failed');
+    expect(calls).toEqual([]);
+    expect(database.prepare(`
+      SELECT
+        (SELECT COUNT(*) FROM product_snapshots WHERE product_id = 'child') AS snapshots,
+        (SELECT COUNT(*) FROM ai_insights
+          WHERE entity_type = 'owned_product' AND entity_id = 'child') AS insights
+    `).get()).toEqual(before);
+  });
+
+  it('does not analyze an inactive owner when a shared competitor batch refreshes', async () => {
+    database = setupFamily();
+    database.exec(`
+      INSERT INTO products (
+        id, asin, sku, internal_name, brand, title, image_url, marketplace, product_type, is_owned,
+        market_node_id, keywords_json, monitoring_enabled, source_type, created_at, status, is_parent
+      ) VALUES ('active-peer', 'B0ACTIVE02', 'ACTIVE-02', 'Active peer', 'Owned', 'Active peer', '',
+        'US', 'pillow', 1, 'market-1', '[]', 1, 'import', '2026-09-20', 'active', 0);
+      INSERT INTO product_snapshots (
+        id, product_id, date, price, estimated_sales, estimated_revenue, source, source_type,
+        collected_at, period, is_estimated, confidence, observation_date, dedup_key
+      ) VALUES ('active-peer-history', 'active-peer', '2026-08-31', 40, 110, 4400,
+        'Historical import', 'import', '2026-09-01', '1M', 1, 0.9, '2026-08-31', 'active-peer-history');
+      INSERT INTO competitor_relations (
+        id, owned_product_id, competitor_product_id, relation_type, similarity_score,
+        reason, ai_tags_json, created_at
+      ) VALUES ('active-peer-rival', 'active-peer', 'competitor', 'direct', 90,
+        'shared competitor', '[]', '2026-09-20');
+    `);
+    const calls: string[] = [];
+    const adapter = legacyImportAdapter(calls);
+    const service = new IntelligenceService(
+      database, new DataSourceRouter(new AdapterRegistry([adapter])),
+    );
+    expect(service.deactivateOwnedProduct('child')).toBe(true);
+    const inactiveInsightsBefore = database.prepare(`
+      SELECT COUNT(*) AS count FROM ai_insights
+      WHERE entity_type = 'owned_product' AND entity_id = 'child'
+    `).get();
+
+    const task = await service.runDataTask({
+      taskType: 'competitor_refresh', target: 'all', sourcePreference: adapter.id,
+    });
+
+    expect(task.status).toBe('success');
+    expect(calls).toEqual(['B0RIVAL001']);
+    expect(database.prepare(`
+      SELECT COUNT(*) AS count FROM ai_insights
+      WHERE entity_type = 'owned_product' AND entity_id = 'child'
+    `).get()).toEqual(inactiveInsightsBefore);
+    expect(database.prepare(`
+      SELECT COUNT(*) AS count FROM ai_insights
+      WHERE entity_type = 'owned_product' AND entity_id = 'active-peer'
+    `).get()).toEqual({ count: 1 });
   });
 });

@@ -68,9 +68,10 @@ function insertObservationFixture(
 function addChildMarketCriticalFixture(db: AppDatabase): string {
   insertObservationFixture(db, 'mcp', 'mcp');
   db.prepare(`INSERT INTO market_nodes (
-    id, name, parent_id, level, marketplace, category_id, status, source_type, created_at
+    id, name, parent_id, level, marketplace, category_id,
+    sellersprite_confirmed_node_path, status, source_type, created_at
   ) VALUES ('child-market', 'Child market', 'market-us', 2, 'US',
-    '1055398:1063252:999', 'active', 'import', '2026-09-19')`).run();
+    '1055398:1063252:999', '1055398:1063252:999', 'active', 'import', '2026-09-19')`).run();
   db.prepare(`UPDATE products SET market_node_id = 'child-market'
     WHERE id = 'owned-product'`).run();
   addVerifiedMcpCoverage(db, 'market-us', 'owned-product');
@@ -208,8 +209,66 @@ describe('GoLiveMigrationService', () => {
       WHERE id = 'mkt-cervical'`).run();
     database.prepare(`UPDATE products SET market_node_id = 'mkt-cervical' WHERE id = 'verified-owned'`).run();
     expect(service.verify()).toMatchObject({ readyForDemoCleanup: false });
-    database.prepare(`UPDATE market_nodes SET category_id = 'unverified-path' WHERE id = 'mkt-memory-foam'`).run();
+    database.prepare(`UPDATE market_nodes SET sellersprite_confirmed_node_path = NULL
+      WHERE id = 'mkt-memory-foam'`).run();
     expect(service.verify()).toMatchObject({ readyForDemoCleanup: false });
+  });
+
+  it('keeps cleanup ready but blocks Live below 90 days of valid primary-market history', () => {
+    database = openDatabase(':memory:');
+    insertObservationFixture(database, 'mcp', 'mcp');
+    addVerifiedMcpCoverage(database, 'market-us', 'owned-product');
+    database.prepare(`DELETE FROM market_snapshots
+      WHERE source = 'Historical import fixture'`).run();
+    const service = new GoLiveMigrationService(database);
+
+    expect(service.verify()).toMatchObject({
+      primaryMarketHistoryDays: 30,
+      hasPrimaryMarketHistory90d: false,
+      confirmedDirectCompetitors: 1,
+      readyForDemoCleanup: true,
+      hasMinimumRealCoverage: false,
+    });
+    expect(() => service.activateLiveMode()).toThrow(/真实数据覆盖/);
+  });
+
+  it('requires a reviewed candidate behind an active real direct relation only for Live', () => {
+    database = openDatabase(':memory:');
+    insertObservationFixture(database, 'mcp', 'mcp');
+    database.exec(`
+      INSERT INTO products (
+        id, asin, sku, brand, title, image_url, marketplace, product_type,
+        is_owned, market_node_id, source_type, created_at, status
+      ) VALUES ('manual-direct', 'B0MANUAL01', 'MANUAL-1', 'Brand', 'Manual direct', '',
+        'US', 'competitor', 0, 'market-us', 'import', '2026-09-19', 'active');
+      INSERT INTO competitor_relations (
+        id, owned_product_id, competitor_product_id, relation_type,
+        similarity_score, reason, ai_tags_json
+      ) VALUES ('manual-direct-relation', 'owned-product', 'manual-direct', 'direct',
+        90, 'Manually selected relation', '[]');
+    `);
+    addVerifiedMcpCoverage(database, 'market-us', 'owned-product', undefined, {
+      includeConfirmedDirectCompetitor: false,
+    });
+    const service = new GoLiveMigrationService(database);
+
+    expect(service.verify()).toMatchObject({
+      confirmedDirectCompetitors: 0,
+      readyForDemoCleanup: true,
+      hasMinimumRealCoverage: false,
+    });
+
+    database.prepare(`INSERT INTO competitor_candidates (
+      id, marketplace, asin, source_product_id, source, source_type, payload_json,
+      status, created_at, reviewed_at
+    ) VALUES ('manual-direct-candidate', 'US', 'B0MANUAL01', 'owned-product',
+      'SellerSprite MCP', 'mcp', '{}', 'confirmed', '2026-09-19', '2026-09-20')`).run();
+
+    expect(service.verify()).toMatchObject({
+      confirmedDirectCompetitors: 1,
+      readyForDemoCleanup: true,
+      hasMinimumRealCoverage: true,
+    });
   });
 
   it('invalidates a complete run when an owned SKU market node is Mock, cross-site, or out of scope', () => {
@@ -264,9 +323,12 @@ describe('GoLiveMigrationService', () => {
     ]);
   });
 
-  it('accepts a complete root and child market run for an owned SKU on the child node', () => {
+  it('accepts a complete root and child run after market analysis statuses are reconciled', () => {
     database = openDatabase(':memory:');
     const runId = addChildMarketCriticalFixture(database);
+    database.prepare(`UPDATE market_nodes SET status = CASE id
+      WHEN 'market-us' THEN '等待30D对照' ELSE '值得研究' END
+      WHERE id IN ('market-us', 'child-market')`).run();
 
     expect(new GoLiveMigrationService(database).verify()).toMatchObject({
       sellerSpriteCriticalRunId: runId,
@@ -610,7 +672,7 @@ describe('GoLiveMigrationService', () => {
     });
   });
 
-  it('reconciles claimed candidate counts with candidate links from the same run', () => {
+  it('rejects a complete current run whose candidate group is empty', () => {
     database = openDatabase(':memory:');
     insertObservationFixture(database, 'mcp', 'mcp');
     addVerifiedMcpCoverage(database, 'market-us', 'owned-product');
@@ -622,9 +684,11 @@ describe('GoLiveMigrationService', () => {
     };
     const coverage = JSON.parse(run.coverageJson) as Record<string, Record<string, unknown>>;
     const candidate = coverage.candidateDiscovery!;
-    candidate.candidates = 1;
+    candidate.candidates = 0;
     candidate.covered = (candidate.covered as Array<Record<string, unknown>>)
-      .map((item) => ({ ...item, candidates: 1 }));
+      .map((item) => ({ ...item, candidates: 0 }));
+    database.prepare(`DELETE FROM competitor_candidate_run_links WHERE sync_run_id = ?`).run(run.id);
+    database.prepare(`DELETE FROM competitor_candidates WHERE sync_run_id = ?`).run(run.id);
     database.prepare(`UPDATE data_coverage_runs SET coverage_json = ? WHERE id = ?`)
       .run(JSON.stringify(coverage), run.id);
 
@@ -808,7 +872,7 @@ describe('GoLiveMigrationService', () => {
     expect(service.verify().sellerSpriteCriticalRunId).toBeNull();
   });
 
-  it('rejects a fully failed direct-competitor batch when it omits current competitors', () => {
+  it('allows partial direct-competitor coverage but rejects a fully failed current roster', () => {
     database = openDatabase(':memory:');
     insertObservationFixture(database, 'mcp', 'mcp');
     database.exec(`
@@ -827,7 +891,9 @@ describe('GoLiveMigrationService', () => {
         ('direct-relation-one', 'owned-product', 'direct-one', 'direct', 90, 'confirmed', '[]'),
         ('direct-relation-two', 'owned-product', 'direct-two', 'direct', 85, 'confirmed', '[]');
     `);
-    addVerifiedMcpCoverage(database, 'market-us', 'owned-product');
+    addVerifiedMcpCoverage(database, 'market-us', 'owned-product', undefined, {
+      includeConfirmedDirectCompetitor: false,
+    });
     const service = new GoLiveMigrationService(database);
     const run = database.prepare(`
       SELECT id, coverage_json AS coverageJson FROM data_coverage_runs
@@ -836,6 +902,26 @@ describe('GoLiveMigrationService', () => {
     `).get() as { id: string; coverageJson: string };
     const coverage = JSON.parse(run.coverageJson) as Record<string, Record<string, unknown>>;
     const taskId = coverage.secondaryCompetitors!.taskId as string;
+    database.prepare(`
+      UPDATE data_tasks SET status = 'partial', total = 2, success = 1, failed = 1
+      WHERE id = ? AND sync_run_id = ?
+    `).run(taskId, run.id);
+    coverage.secondaryCompetitors = {
+      taskId, status: 'partial', total: 2, success: 1, failed: 1,
+      roster: [
+        { id: 'direct-one', asin: 'B0DIRECT01' },
+        { id: 'direct-two', asin: 'B0DIRECT02' },
+      ],
+      covered: [{ id: 'direct-one', asin: 'B0DIRECT01', snapshots: 1 }],
+      failures: [{ id: 'direct-two', asin: 'B0DIRECT02', status: 'failed' }],
+    };
+    database.prepare(`UPDATE data_coverage_runs SET coverage_json = ? WHERE id = ?`)
+      .run(JSON.stringify(coverage), run.id);
+    expect(service.verify()).toMatchObject({
+      sellerSpriteCriticalRunId: run.id,
+      readyForDemoCleanup: true,
+    });
+
     database.prepare(`
       UPDATE data_tasks SET status = 'failed', total = 2, success = 0, failed = 2
       WHERE id = ? AND sync_run_id = ?
@@ -955,9 +1041,11 @@ describe('GoLiveMigrationService', () => {
     insertObservationFixture(database, 'mcp', 'mcp');
     database.exec(`
       INSERT INTO market_nodes (
-        id, name, parent_id, level, marketplace, category_id, status, source_type, created_at
+        id, name, parent_id, level, marketplace, category_id,
+        sellersprite_confirmed_node_path, status, source_type, created_at
       ) VALUES ('secondary-node', 'Secondary owned category', 'market-us', 2, 'US',
-        '1055398:1063252:888', 'active', 'import', '2026-09-19T00:00:00.000Z');
+        '1055398:1063252:888', '1055398:1063252:888', 'active', 'import',
+        '2026-09-19T00:00:00.000Z');
       INSERT INTO products (
         id, asin, sku, brand, title, image_url, marketplace, product_type, is_owned,
         market_node_id, source_type, created_at
@@ -983,7 +1071,7 @@ describe('GoLiveMigrationService', () => {
     expect(() => service.clearDemoObservations()).toThrow(/真实.*MCP/);
     addVerifiedMcpCoverage(database, 'market-us');
     service.clearDemoObservations();
-    expect(database.prepare('SELECT COUNT(*) AS count FROM products').get()).toMatchObject({ count: 2 });
+    expect(database.prepare('SELECT COUNT(*) AS count FROM products').get()).toMatchObject({ count: 3 });
     expect(service.verify()).toMatchObject({ mockObservations: 0, hasMinimumRealCoverage: false });
     expect(() => service.activateLiveMode()).toThrow(/真实数据覆盖/);
     temporaryDirectory = mkdtempSync(join(tmpdir(), 'go-live-backup-'));

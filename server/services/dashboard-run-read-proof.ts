@@ -91,8 +91,8 @@ function hasCurrentRunRoster(
 ): boolean {
   const coverage = parseCriticalRunCoverage(coverageJson);
   const market = database.prepare(`
-    SELECT category_id AS nodeIdPath FROM market_nodes
-    WHERE id = ? AND marketplace = ? AND status = 'active' AND source_type <> 'mock'
+    SELECT sellersprite_confirmed_node_path AS nodeIdPath FROM market_nodes
+    WHERE id = ? AND marketplace = ? AND source_type <> 'mock'
     LIMIT 1
   `).get(input.marketId, marketplace) as { nodeIdPath: string | null } | undefined;
   if (!coverage || !market?.nodeIdPath || coverage.marketId !== input.marketId
@@ -105,17 +105,18 @@ function hasCurrentRunRoster(
   const current = database.prepare(`
     WITH RECURSIVE market_scope(id) AS (
       SELECT id FROM market_nodes
-      WHERE id = ? AND marketplace = ? AND status = 'active' AND source_type <> 'mock'
+      WHERE id = ? AND marketplace = ? AND source_type <> 'mock'
       UNION
       SELECT child.id FROM market_nodes child
       JOIN market_scope parent ON child.parent_id = parent.id
-      WHERE child.marketplace = ? AND child.status = 'active' AND child.source_type <> 'mock'
+      WHERE child.marketplace = ? AND child.source_type <> 'mock'
     )
     SELECT product.id, product.asin, product.market_node_id AS marketNodeId
     FROM products product
     JOIN market_nodes market ON market.id = product.market_node_id
       AND market.marketplace = product.marketplace
-      AND market.status = 'active' AND market.source_type <> 'mock'
+      AND market.source_type <> 'mock'
+      AND market.sellersprite_confirmed_node_path IS NOT NULL
     JOIN market_scope scope ON scope.id = product.market_node_id
     WHERE product.marketplace = ? AND product.is_owned = 1 AND product.is_parent = 0
       AND product.status = 'active' AND product.source_type <> 'mock'
@@ -126,8 +127,8 @@ function hasCurrentRunRoster(
     .filter((id) => id !== input.marketId).sort();
   const currentMarketNodes = [input.marketId, ...childNodeIds].map((id) => {
     const node = database.prepare(`
-      SELECT category_id AS nodeIdPath FROM market_nodes
-      WHERE id = ? AND marketplace = ? AND status = 'active' AND source_type <> 'mock'
+      SELECT sellersprite_confirmed_node_path AS nodeIdPath FROM market_nodes
+      WHERE id = ? AND marketplace = ? AND source_type <> 'mock'
     `).get(id, marketplace) as { nodeIdPath: string | null } | undefined;
     return node?.nodeIdPath ? { id, nodeIdPath: node.nodeIdPath } : null;
   });
@@ -402,7 +403,8 @@ export function proveDashboardRunReadPath(
   const market = repository.getMarket(input.marketId);
   const realMarket = database.prepare(`
     SELECT 1 FROM market_nodes
-    WHERE id = ? AND marketplace = ? AND status = 'active' AND source_type <> 'mock'
+    WHERE id = ? AND marketplace = ? AND source_type <> 'mock'
+      AND sellersprite_confirmed_node_path IS NOT NULL
     LIMIT 1
   `).get(input.marketId, settings.marketplace);
   result.marketVerified = Boolean(realMarket && market && isLinkedMarketPresentationSnapshot(

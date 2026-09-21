@@ -7,6 +7,10 @@ export function addVerifiedMcpCoverage(
   marketId = 'mkt-memory-foam',
   ownedProductId = 'verified-owned',
   productCollectedAt?: string,
+  options: {
+    includeConfirmedDirectCompetitor?: boolean;
+    includeHistoricalMarketObservation?: boolean;
+  } = {},
 ): void {
   const now = new Date().toISOString();
   const productObservationCollectedAt = productCollectedAt ?? now;
@@ -18,10 +22,10 @@ export function addVerifiedMcpCoverage(
   const candidateTaskId = randomUUID();
   const competitorTaskId = randomUUID();
   database.prepare('UPDATE app_settings SET default_market_id = ? WHERE id = 1').run(marketId);
-  database.prepare(`UPDATE market_nodes SET category_id = ?, status = 'active',
+  database.prepare(`UPDATE market_nodes SET category_id = ?, sellersprite_confirmed_node_path = ?,
     source_type = CASE WHEN source_type = 'mock' THEN 'import' ELSE source_type END
     WHERE id = ? AND marketplace = ?`)
-    .run('1055398:1063252', marketId, settings.marketplace);
+    .run('1055398:1063252', '1055398:1063252', marketId, settings.marketplace);
   if (!existingProduct) {
     database.prepare(`INSERT INTO products (
       id, asin, sku, brand, title, image_url, marketplace, product_type, is_owned,
@@ -33,11 +37,11 @@ export function addVerifiedMcpCoverage(
   const owned = database.prepare(`
     WITH RECURSIVE market_scope(id) AS (
       SELECT id FROM market_nodes
-      WHERE id = ? AND marketplace = ? AND status = 'active' AND source_type <> 'mock'
+      WHERE id = ? AND marketplace = ? AND source_type <> 'mock'
       UNION
       SELECT child.id FROM market_nodes child
       JOIN market_scope parent ON child.parent_id = parent.id
-      WHERE child.marketplace = ? AND child.status = 'active' AND child.source_type <> 'mock'
+      WHERE child.marketplace = ? AND child.source_type <> 'mock'
     )
     SELECT product.id, product.asin, product.market_node_id AS marketNodeId FROM products product
     JOIN market_scope scope ON scope.id = product.market_node_id
@@ -47,14 +51,38 @@ export function addVerifiedMcpCoverage(
   `).all(marketId, settings.marketplace, settings.marketplace, settings.marketplace) as Array<{
     id: string; asin: string; marketNodeId: string;
   }>;
+  const includeConfirmedDirectCompetitor = options.includeConfirmedDirectCompetitor ?? true;
+  const candidateFixtures = owned.map((product, index) => ({
+    id: randomUUID(),
+    asin: `B${runId.replaceAll('-', '').slice(0, 8).toUpperCase()}${index % 10}`,
+    product,
+    confirmed: includeConfirmedDirectCompetitor && index === 0,
+  }));
+  const confirmedFixture = candidateFixtures.find((candidate) => candidate.confirmed);
+  if (confirmedFixture) {
+    database.prepare(`INSERT INTO products (
+      id, asin, sku, brand, title, image_url, marketplace, product_type, is_owned,
+      market_node_id, source_type, created_at, status
+    ) VALUES (?, ?, ?, 'Verified competitor', 'Human-confirmed direct competitor', '', ?,
+      'competitor', 0, ?, 'import', ?, 'active')`)
+      .run(`verified-direct-${runId}`, confirmedFixture.asin, `DIRECT-${runId.slice(0, 8)}`,
+        settings.marketplace, confirmedFixture.product.marketNodeId, now);
+    database.prepare(`INSERT INTO competitor_relations (
+      id, owned_product_id, competitor_product_id, relation_type, similarity_score,
+      reason, ai_tags_json, created_at, last_verified_at
+    ) VALUES (?, ?, ?, 'direct', 90, 'Human-confirmed test fixture', '[]', ?, ?)`)
+      .run(randomUUID(), confirmedFixture.product.id, `verified-direct-${runId}`, now, now);
+  }
   const rootNodeIdPath = '1055398:1063252';
   const marketNodes = [{ id: marketId, nodeIdPath: rootNodeIdPath }];
   for (const id of [...new Set(owned.map((product) => product.marketNodeId))]
     .filter((id) => id !== marketId).sort()) {
-    const child = database.prepare(`SELECT category_id AS nodeIdPath FROM market_nodes
-      WHERE id = ? AND marketplace = ? AND status = 'active' AND source_type <> 'mock'`)
+    const child = database.prepare(`
+      SELECT sellersprite_confirmed_node_path AS nodeIdPath FROM market_nodes
+      WHERE id = ? AND marketplace = ? AND source_type <> 'mock'
+    `)
       .get(id, settings.marketplace) as { nodeIdPath: string | null } | undefined;
-    if (!child?.nodeIdPath) throw new Error('Synthetic child market requires a mapped category path.');
+    if (!child?.nodeIdPath) throw new Error('Synthetic child market requires a confirmed SellerSprite path.');
     marketNodes.push({ id, nodeIdPath: child.nodeIdPath });
   }
   const directCompetitors = database.prepare(`
@@ -92,6 +120,19 @@ export function addVerifiedMcpCoverage(
     ?, ?, ?, ?, 0, ?)`)
     .run(competitorTaskId, runId, settings.marketplace, now, now,
       directCompetitors.length, directCompetitors.length, now);
+  const insertCandidate = database.prepare(`INSERT INTO competitor_candidates (
+    id, marketplace, asin, source_product_id, source, source_type, payload_json,
+    status, created_at, reviewed_at, sync_run_id
+  ) VALUES (?, ?, ?, ?, 'SellerSprite MCP', 'mcp', '{}', ?, ?, ?, ?)`);
+  const insertCandidateLink = database.prepare(`INSERT INTO competitor_candidate_run_links (
+    sync_run_id, candidate_id, source_product_id, disposition, created_at
+  ) VALUES (?, ?, ?, 'inserted', ?)`);
+  for (const candidate of candidateFixtures) {
+    insertCandidate.run(candidate.id, settings.marketplace, candidate.asin, candidate.product.id,
+      candidate.confirmed ? 'confirmed' : 'pending_review', now,
+      candidate.confirmed ? now : null, runId);
+    insertCandidateLink.run(runId, candidate.id, candidate.product.id, now);
+  }
   const marketMonths = [
     { month: '202608', date: '2026-08-31' },
     { month: '202609', date: '2026-09-30' },
@@ -127,6 +168,14 @@ export function addVerifiedMcpCoverage(
       if (marketNode.id === marketId && marketMonth.month === '202609') marketSnapshotId = snapshotId;
     }
   }
+  if (options.includeHistoricalMarketObservation ?? true) {
+    database.prepare(`INSERT INTO market_snapshots (
+      id, market_node_id, date, product_count, source, source_type, collected_at,
+      period, is_estimated, confidence, observation_date, dedup_key
+    ) VALUES (?, ?, '2026-06-30', 10, 'Historical import fixture', 'import', ?,
+      '1M', 0, 1, '2026-06-30', ?)`)
+      .run(randomUUID(), marketId, now, `verified-market-history-${marketId}-${runId}`);
+  }
   addWorkflowEvidence(database, runId, settings.marketplace, 'market', marketId, marketSnapshotId, now);
   for (const product of owned) {
     const snapshotId = randomUUID();
@@ -153,6 +202,31 @@ export function addVerifiedMcpCoverage(
       sync_run_id, snapshot_kind, snapshot_id, entity_id, disposition
     ) VALUES (?, 'fact', ?, ?, 'inserted')`).run(runId, factId, product.id);
     addWorkflowEvidence(database, runId, settings.marketplace, 'owned_product', product.id, snapshotId, now);
+  }
+  for (const competitor of directCompetitors) {
+    const snapshotId = randomUUID();
+    database.prepare(`INSERT INTO product_snapshots (
+      id, product_id, date, estimated_sales, source, source_type, collected_at,
+      period, is_estimated, confidence, observation_date, dedup_key, sync_run_id
+    ) VALUES (?, ?, '2026-09-30', 10, 'SellerSprite MCP',
+      'mcp', ?, '1M', 1, 0.8, '2026-09-30', ?, ?)`)
+      .run(snapshotId, competitor.id, productObservationCollectedAt,
+        `verified-competitor-${competitor.id}-${runId}`, runId);
+    database.prepare(`INSERT INTO mcp_sync_observation_links (
+      sync_run_id, snapshot_kind, snapshot_id, entity_id, disposition
+    ) VALUES (?, 'product', ?, ?, 'inserted')`).run(runId, snapshotId, competitor.id);
+    const factId = randomUUID();
+    database.prepare(`INSERT INTO metric_facts (
+      id, entity_type, entity_id, marketplace, metric_name, numeric_value,
+      source, source_id, source_type, is_estimated, confidence, observation_date,
+      collected_at, dedup_key, sync_run_id
+    ) VALUES (?, 'competitor', ?, ?, 'estimated_sales', 10, 'SellerSprite MCP',
+      'source-sellersprite-mcp', 'mcp', 1, 0.8, '2026-09-30', ?, ?, ?)`)
+      .run(factId, competitor.id, settings.marketplace, productObservationCollectedAt,
+        `verified-competitor-fact-${competitor.id}-${runId}`, runId);
+    database.prepare(`INSERT INTO mcp_sync_observation_links (
+      sync_run_id, snapshot_kind, snapshot_id, entity_id, disposition
+    ) VALUES (?, 'fact', ?, ?, 'inserted')`).run(runId, factId, competitor.id);
   }
   database.prepare(`INSERT INTO provider_capability_snapshots (
     id, provider_id, capabilities_json, collected_at, sync_run_id
@@ -186,6 +260,10 @@ export function addVerifiedMcpCoverage(
     addCall.run(randomUUID(), 'ASIN_COMPETITOR_DISCOVERY', `candidates-${product.id}-${runId}`,
       'product', product.asin.toUpperCase(), now, runId, null);
   }
+  for (const competitor of directCompetitors) {
+    addCall.run(randomUUID(), 'ASIN_SALES_TREND', `competitor-${competitor.id}-${runId}`,
+      'product', competitor.asin.toUpperCase(), now, runId, null);
+  }
   database.prepare(`INSERT INTO data_coverage_runs (
     id, marketplace, run_type, coverage_json, is_complete, created_at
   ) VALUES (?, ?, 'critical_sync', ?, 1, ?)`).run(runId, settings.marketplace,
@@ -197,8 +275,8 @@ export function addVerifiedMcpCoverage(
       productSnapshots: owned.length, activeOwnedProducts: owned.length,
       candidateDiscovery: {
         taskId: candidateTaskId, status: 'success', total: owned.length,
-        success: owned.length, failed: 0, candidates: 0,
-        covered: owned.map(({ id, asin }) => ({ id, asin, candidates: 0 })), failures: [],
+        success: owned.length, failed: 0, candidates: candidateFixtures.length,
+        covered: owned.map(({ id, asin }) => ({ id, asin, candidates: 1 })), failures: [],
       },
       secondaryCompetitors: {
         taskId: competitorTaskId, status: 'success', total: directCompetitors.length,

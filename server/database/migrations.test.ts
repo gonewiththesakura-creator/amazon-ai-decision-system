@@ -17,6 +17,50 @@ function testDatabase(): AppDatabase {
   return database;
 }
 
+function legacyV27Database(): AppDatabase {
+  const db = legacyV28Database();
+  db.exec(`
+    DROP TRIGGER IF EXISTS trg_product_identity_events_immutable_update;
+    DROP TRIGGER IF EXISTS trg_product_identity_events_immutable_delete;
+    DROP TABLE IF EXISTS product_identity_events;
+    DROP INDEX IF EXISTS idx_variation_families_market_family_key;
+    DROP INDEX IF EXISTS idx_variation_families_market_parent;
+    ALTER TABLE variation_families RENAME TO variation_families_v28;
+    CREATE TABLE variation_families (
+      id TEXT PRIMARY KEY,
+      marketplace TEXT NOT NULL,
+      parent_asin TEXT NOT NULL,
+      variation_theme TEXT,
+      attributes_json TEXT NOT NULL DEFAULT '{}',
+      status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'inactive')),
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      UNIQUE(marketplace, parent_asin)
+    );
+    INSERT INTO variation_families (
+      id, marketplace, parent_asin, variation_theme, attributes_json,
+      status, created_at, updated_at
+    ) SELECT id, marketplace, parent_asin, variation_theme, attributes_json,
+      status, created_at, updated_at FROM variation_families_v28;
+    DROP TABLE variation_families_v28;
+    ALTER TABLE products DROP COLUMN parent_lookup_status;
+    DELETE FROM schema_migrations WHERE version = 28;
+  `);
+  return db;
+}
+
+function legacyV28Database(): AppDatabase {
+  const db = testDatabase();
+  db.exec(`
+    DROP TRIGGER IF EXISTS trg_products_variation_family_insert;
+    DROP TRIGGER IF EXISTS trg_products_variation_family_update;
+    DROP TRIGGER IF EXISTS trg_variation_families_marketplace_update;
+    DROP TRIGGER IF EXISTS trg_variation_families_referenced_delete;
+    DELETE FROM schema_migrations WHERE version = 29;
+  `);
+  return db;
+}
+
 function v13Database(): AppDatabase {
   database = new DatabaseSync(':memory:');
   database.exec(`
@@ -295,10 +339,284 @@ describe('database migrations', () => {
     `).all() as Array<{ version: number }>;
 
     expect(versions.map((row) => Number(row.version))).toEqual(
-      Array.from({ length: 26 }, (_, index) => index + 1),
+      Array.from({ length: 29 }, (_, index) => index + 1),
     );
     expect(db.prepare('PRAGMA foreign_key_check').all()).toEqual([]);
     expect(db.prepare('PRAGMA quick_check').get()).toMatchObject({ quick_check: 'ok' });
+  });
+
+  it('backfills confirmed SellerSprite paths only for valid MCP market nodes', () => {
+    const db = testDatabase();
+    const columns = db.prepare('PRAGMA table_info(market_nodes)').all()
+      .map((column) => String(column.name));
+    if (columns.includes('sellersprite_confirmed_node_path')) {
+      db.exec(`
+        ALTER TABLE market_nodes DROP COLUMN sellersprite_confirmed_node_path;
+        DELETE FROM schema_migrations WHERE version = 27;
+      `);
+    }
+    db.exec(`
+      INSERT INTO market_nodes (
+        id, name, level, marketplace, category_id, status, source_type, created_at
+      ) VALUES
+        ('v27-mcp-valid', 'MCP valid', 1, 'US', '1055398:1063252', '等待30D对照', 'mcp', '2026-09-21'),
+        ('v27-import-valid', 'Import valid', 1, 'US', '1055398:1063252', '值得研究', 'import', '2026-09-21'),
+        ('v27-mock-valid', 'Mock valid', 1, 'US', '1055398:1063252', 'active', 'mock', '2026-09-21'),
+        ('v27-mcp-invalid', 'MCP invalid', 1, 'US', 'bed-pillows', 'active', 'mcp', '2026-09-21');
+    `);
+
+    migrate(db);
+
+    expect(db.prepare(`
+      SELECT id, status, sellersprite_confirmed_node_path AS confirmedPath
+      FROM market_nodes WHERE id LIKE 'v27-%' ORDER BY id
+    `).all()).toEqual([
+      { id: 'v27-import-valid', status: '值得研究', confirmedPath: null },
+      { id: 'v27-mcp-invalid', status: 'active', confirmedPath: null },
+      { id: 'v27-mcp-valid', status: '等待30D对照', confirmedPath: '1055398:1063252' },
+      { id: 'v27-mock-valid', status: 'active', confirmedPath: null },
+    ]);
+    expect(() => db.prepare(`UPDATE market_nodes
+      SET sellersprite_confirmed_node_path = '1055398::1063252'
+      WHERE id = 'v27-import-valid'`).run()).toThrow(/CHECK constraint failed/);
+  });
+
+  it('upgrades legacy variation families to stable verified identities and adds immutable events', () => {
+    const db = legacyV27Database();
+    db.exec(`
+      INSERT INTO variation_families (
+        id, marketplace, parent_asin, variation_theme, attributes_json,
+        status, created_at, updated_at
+      ) VALUES ('legacy-family', 'US', 'B0PARENT01', 'Color', '{"legacy":true}',
+        'active', '2026-09-01', '2026-09-02');
+      INSERT INTO market_nodes (
+        id, name, level, marketplace, status, source_type, created_at
+      ) VALUES ('identity-market', 'Identity market', 1, 'US', 'active', 'import', '2026-09-01');
+      INSERT INTO products (
+        id, asin, sku, brand, title, image_url, marketplace, product_type,
+        is_owned, market_node_id, source_type, created_at, variation_family_id, parent_asin
+      ) VALUES ('identity-product', 'B0CHILD001', 'IDENTITY-1', 'Brand', 'Child', '',
+        'US', 'pillow', 1, 'identity-market', 'import', '2026-09-01',
+        'legacy-family', 'B0PARENT01');
+    `);
+
+    migrate(db);
+
+    expect(db.prepare(`SELECT id, parent_asin AS parentAsin, family_key AS familyKey,
+      identity_status AS identityStatus, source_type AS sourceType,
+      verified_at AS verifiedAt, variation_theme AS variationTheme, attributes_json AS attributesJson
+      FROM variation_families WHERE id = 'legacy-family'`).get()).toEqual({
+      id: 'legacy-family', parentAsin: 'B0PARENT01', familyKey: 'B0PARENT01',
+      identityStatus: 'verified', sourceType: 'import', verifiedAt: '2026-09-02',
+      variationTheme: 'Color', attributesJson: '{"legacy":true}',
+    });
+    expect(db.prepare(`SELECT variation_family_id AS familyId,
+      parent_lookup_status AS parentLookupStatus
+      FROM products WHERE id = 'identity-product'`).get()).toEqual({
+      familyId: 'legacy-family', parentLookupStatus: 'verified',
+    });
+    db.prepare(`INSERT INTO variation_families (
+      id, marketplace, parent_asin, family_key, identity_status, source_type,
+      attributes_json, status, created_at, updated_at
+    ) VALUES (?, 'US', NULL, ?, 'pending', 'import', '{}', 'active', '2026-09-03', '2026-09-03')`)
+      .run('provisional-one', 'CATALOG-GROUP-1');
+    db.prepare(`INSERT INTO variation_families (
+      id, marketplace, parent_asin, family_key, identity_status, source_type,
+      attributes_json, status, created_at, updated_at
+    ) VALUES (?, 'US', NULL, ?, 'pending', 'import', '{}', 'active', '2026-09-03', '2026-09-03')`)
+      .run('provisional-two', 'CATALOG-GROUP-2');
+    expect(() => db.prepare(`INSERT INTO variation_families (
+      id, marketplace, parent_asin, family_key, identity_status, source_type,
+      attributes_json, status, created_at, updated_at
+    ) VALUES ('case-duplicate-key', 'US', NULL, 'catalog-group-1', 'pending',
+      'import', '{}', 'active', '2026-09-03', '2026-09-03')`).run())
+      .toThrow(/UNIQUE constraint failed/);
+    expect(() => db.prepare(`INSERT INTO variation_families (
+      id, marketplace, parent_asin, family_key, identity_status, source_type,
+      attributes_json, status, created_at, updated_at, verified_at
+    ) VALUES ('duplicate-parent', 'US', 'B0PARENT01', 'OTHER-GROUP', 'verified',
+      'mcp', '{}', 'active', '2026-09-03', '2026-09-03', '2026-09-03')`).run())
+      .toThrow(/UNIQUE constraint failed/);
+    expect(() => db.prepare(`INSERT INTO variation_families (
+      id, marketplace, parent_asin, family_key, identity_status, source_type,
+      attributes_json, status, created_at, updated_at, verified_at
+    ) VALUES ('case-duplicate-parent', 'US', 'b0parent01', 'CASE-PARENT', 'verified',
+      'mcp', '{}', 'active', '2026-09-03', '2026-09-03', '2026-09-03')`).run())
+      .toThrow(/UNIQUE constraint failed/);
+    db.prepare(`INSERT INTO product_identity_events (
+      id, product_id, old_family_id, new_family_id, old_parent_asin, new_parent_asin,
+      old_lookup_status, new_lookup_status, source_type, created_at
+    ) VALUES ('identity-event', 'identity-product', NULL, 'legacy-family', NULL,
+      'B0PARENT01', 'unknown', 'verified', 'import', '2026-09-03')`).run();
+    expect(() => db.prepare(`UPDATE product_identity_events SET source_type = 'mcp'
+      WHERE id = 'identity-event'`).run()).toThrow(/immutable/);
+    expect(() => db.prepare(`DELETE FROM product_identity_events
+      WHERE id = 'identity-event'`).run()).toThrow(/immutable/);
+    expect(db.prepare('PRAGMA foreign_key_check').all()).toEqual([]);
+  });
+
+  it('normalizes a legacy lowercase parent without changing family or product IDs', () => {
+    const db = legacyV27Database();
+    db.exec(`
+      INSERT INTO variation_families (
+        id, marketplace, parent_asin, created_at, updated_at
+      ) VALUES ('lower-family', 'US', 'b0parent01', '2026-09-01', '2026-09-01');
+      INSERT INTO market_nodes (id, name, level, marketplace, status, source_type, created_at)
+      VALUES ('lower-market', 'Lower market', 1, 'US', 'active', 'import', '2026-09-01');
+      INSERT INTO products (id, asin, brand, title, image_url, marketplace,
+        product_type, is_owned, market_node_id, source_type, created_at,
+        variation_family_id, parent_asin)
+      VALUES ('lower-product', 'B0CHILD001', 'Brand', 'Child', '', 'US',
+        'pillow', 1, 'lower-market', 'import', '2026-09-01',
+        'lower-family', 'b0parent01');
+    `);
+    migrate(db);
+    expect(db.prepare(`SELECT id, family_key AS familyKey, parent_asin AS parentAsin
+      FROM variation_families WHERE id = 'lower-family'`).get()).toEqual({
+      id: 'lower-family', familyKey: 'B0PARENT01', parentAsin: 'B0PARENT01',
+    });
+    expect(db.prepare(`SELECT variation_family_id AS familyId, parent_asin AS parentAsin,
+      parent_lookup_status AS lookupStatus FROM products WHERE id = 'lower-product'`).get())
+      .toEqual({ familyId: 'lower-family', parentAsin: 'B0PARENT01', lookupStatus: 'verified' });
+    expect(db.prepare('PRAGMA foreign_key_check').all()).toEqual([]);
+  });
+
+  it.each([
+    ['placeholder family', `INSERT INTO variation_families (
+      id, marketplace, parent_asin, created_at, updated_at
+    ) VALUES ('bad-family', 'US', 'Pending lookup', '2026-09-01', '2026-09-01')`,
+    /verified parent ASIN/],
+    ['case-colliding parents', `INSERT INTO variation_families (
+      id, marketplace, parent_asin, created_at, updated_at
+    ) VALUES ('upper-family', 'US', 'B0PARENT01', '2026-09-01', '2026-09-01');
+    INSERT INTO variation_families (
+      id, marketplace, parent_asin, created_at, updated_at
+    ) VALUES ('lower-family', 'US', 'b0parent01', '2026-09-01', '2026-09-01')`,
+    /duplicate normalized parent ASIN/],
+    ['orphan family', `INSERT INTO market_nodes (
+      id, name, level, marketplace, status, source_type, created_at
+    ) VALUES ('orphan-market', 'Orphan', 1, 'US', 'active', 'import', '2026-09-01');
+    INSERT INTO products (id, asin, brand, title, image_url, marketplace,
+      product_type, is_owned, market_node_id, source_type, created_at, variation_family_id)
+    VALUES ('orphan-product', 'B0CHILD001', 'Brand', 'Child', '', 'US',
+      'pillow', 1, 'orphan-market', 'import', '2026-09-01', 'missing-family')`,
+      /missing\/cross-market variation family/],
+    ['different product parent', `INSERT INTO variation_families (
+      id, marketplace, parent_asin, created_at, updated_at
+    ) VALUES ('linked-family', 'US', 'B0PARENT01', '2026-09-01', '2026-09-01');
+    INSERT INTO market_nodes (id, name, level, marketplace, status, source_type, created_at)
+    VALUES ('linked-market', 'Linked', 1, 'US', 'active', 'import', '2026-09-01');
+    INSERT INTO products (id, asin, brand, title, image_url, marketplace,
+      product_type, is_owned, market_node_id, source_type, created_at,
+      variation_family_id, parent_asin)
+    VALUES ('mismatched-product', 'B0CHILD001', 'Brand', 'Child', '', 'US',
+      'pillow', 1, 'linked-market', 'import', '2026-09-01',
+      'linked-family', 'B0PARENT02')`, /parent ASIN.*variation family/],
+    ['product parent without family', `INSERT INTO market_nodes (
+      id, name, level, marketplace, status, source_type, created_at
+    ) VALUES ('unlinked-market', 'Unlinked', 1, 'US', 'active', 'import', '2026-09-01');
+    INSERT INTO products (id, asin, brand, title, image_url, marketplace,
+      product_type, is_owned, market_node_id, source_type, created_at, parent_asin)
+    VALUES ('unlinked-product', 'B0CHILD001', 'Brand', 'Child', '', 'US',
+      'pillow', 1, 'unlinked-market', 'import', '2026-09-01', 'B0PARENT01')`,
+    /parent ASIN.*variation family/],
+    ['self-parent without family', `INSERT INTO market_nodes (
+      id, name, level, marketplace, status, source_type, created_at
+    ) VALUES ('self-market', 'Self', 1, 'US', 'active', 'import', '2026-09-01');
+    INSERT INTO products (id, asin, brand, title, image_url, marketplace,
+      product_type, is_owned, market_node_id, source_type, created_at, parent_asin)
+    VALUES ('self-product', 'B0SELF0001', 'Brand', 'Parent', '', 'US',
+      'pillow', 1, 'self-market', 'import', '2026-09-01', 'B0SELF0001')`,
+    /parent ASIN.*variation family/],
+  ])('fails V28 atomically on %s', (_caseName, fixture, expected) => {
+    const db = legacyV27Database();
+    db.exec(fixture);
+    expect(() => migrate(db)).toThrow(expected);
+    expect(db.prepare(`SELECT version FROM schema_migrations WHERE version = 28`).get())
+      .toBeUndefined();
+    expect(db.prepare(`PRAGMA table_info(variation_families)`).all()
+      .some((column) => column.name === 'family_key')).toBe(false);
+  });
+
+  it('rejects inconsistent identity before upgrading an existing V28 database to V29', () => {
+    const db = legacyV28Database();
+    db.prepare(`INSERT INTO market_nodes (
+      id, name, level, marketplace, status, source_type, created_at
+    ) VALUES ('v29-market', 'V29', 1, 'US', 'active', 'import', '2026-09-01')`).run();
+    db.prepare(`INSERT INTO products (
+      id, asin, brand, title, image_url, marketplace, product_type,
+      is_owned, market_node_id, source_type, created_at, variation_family_id
+    ) VALUES ('v29-orphan', 'B0CHILD001', 'Brand', 'Child', '', 'US', 'pillow',
+      1, 'v29-market', 'import', '2026-09-01', 'missing-family')`).run();
+
+    expect(() => migrate(db)).toThrow(/missing\/cross-market variation family/);
+    expect(db.prepare('SELECT version FROM schema_migrations WHERE version = 29').get())
+      .toBeUndefined();
+    expect(db.prepare(`SELECT name FROM sqlite_master WHERE type = 'trigger'
+      AND name = 'trg_products_variation_family_insert'`).get()).toBeUndefined();
+  });
+
+  it('does not certify a V28 product whose parent differs from its linked family', () => {
+    const db = legacyV28Database();
+    db.prepare(`INSERT INTO market_nodes (
+      id, name, level, marketplace, status, source_type, created_at
+    ) VALUES ('v29-mismatch-market', 'V29 mismatch', 1, 'US', 'active', 'import', '2026-09-01')`).run();
+    db.prepare(`INSERT INTO variation_families (
+      id, marketplace, parent_asin, family_key, identity_status, source_type,
+      verified_at, created_at, updated_at
+    ) VALUES ('v29-mismatch-family', 'US', 'B0PARENT01', 'FAMILY-US', 'verified',
+      'import', '2026-09-01', '2026-09-01', '2026-09-01')`).run();
+    db.prepare(`INSERT INTO products (
+      id, asin, brand, title, image_url, marketplace, product_type,
+      is_owned, market_node_id, source_type, created_at, variation_family_id,
+      parent_asin, parent_lookup_status
+    ) VALUES ('v29-mismatch-product', 'B0CHILD001', 'Brand', 'Child', '', 'US',
+      'pillow', 1, 'v29-mismatch-market', 'import', '2026-09-01',
+      'v29-mismatch-family', 'B0PARENT02', 'verified')`).run();
+
+    expect(() => migrate(db)).toThrow(/parent ASIN.*variation family/);
+    expect(db.prepare('SELECT version FROM schema_migrations WHERE version = 29').get())
+      .toBeUndefined();
+  });
+
+  it('enforces marketplace-scoped family references after V29 while allowing bind and unbind', () => {
+    const db = legacyV28Database();
+    migrate(db);
+    const insertMarket = db.prepare(`INSERT INTO market_nodes (
+      id, name, level, marketplace, status, source_type, created_at
+    ) VALUES (?, ?, 1, ?, 'active', 'import', '2026-09-01')`);
+    insertMarket.run('v29-us', 'US market', 'US');
+    insertMarket.run('v29-ca', 'CA market', 'CA');
+    db.prepare(`INSERT INTO variation_families (
+      id, marketplace, parent_asin, family_key, identity_status, source_type,
+      verified_at, created_at, updated_at
+    ) VALUES ('v29-family', 'US', 'B0PARENT01', 'FAMILY-US', 'verified', 'import',
+      '2026-09-01', '2026-09-01', '2026-09-01')`).run();
+    const insertProduct = db.prepare(`INSERT INTO products (
+      id, asin, brand, title, image_url, marketplace, product_type,
+      is_owned, market_node_id, source_type, created_at, variation_family_id
+    ) VALUES (?, ?, 'Brand', 'Child', '', ?, 'pillow', 1, ?, 'import', '2026-09-01', ?)`);
+    insertProduct.run('v29-us-product', 'B0CHILD001', 'US', 'v29-us', null);
+    expect(() => insertProduct.run('v29-orphan', 'B0CHILD002', 'US', 'v29-us', 'missing-family'))
+      .toThrow(/variation family.*marketplace/);
+    expect(() => insertProduct.run('v29-cross-market', 'B0CHILD003', 'CA', 'v29-ca', 'v29-family'))
+      .toThrow(/variation family.*marketplace/);
+    db.prepare(`UPDATE products SET variation_family_id = 'v29-family'
+      WHERE id = 'v29-us-product'`).run();
+    expect(() => db.prepare(`UPDATE products SET variation_family_id = 'missing-family'
+      WHERE id = 'v29-us-product'`).run()).toThrow(/variation family.*marketplace/);
+    expect(() => db.prepare(`UPDATE products SET marketplace = 'CA'
+      WHERE id = 'v29-us-product'`).run()).toThrow(/variation family.*marketplace/);
+    expect(() => db.prepare(`UPDATE variation_families SET id = 'renamed-family'
+      WHERE id = 'v29-family'`).run()).toThrow(/variation family.*marketplace/);
+    expect(() => db.prepare(`UPDATE variation_families SET marketplace = 'CA'
+      WHERE id = 'v29-family'`).run()).toThrow(/variation family.*marketplace/);
+    expect(() => db.prepare(`DELETE FROM variation_families WHERE id = 'v29-family'`).run())
+      .toThrow(/variation family.*referenced/);
+    db.prepare(`UPDATE products SET variation_family_id = NULL
+      WHERE id = 'v29-us-product'`).run();
+    db.prepare(`DELETE FROM variation_families WHERE id = 'v29-family'`).run();
+    expect(db.prepare('PRAGMA foreign_key_check').all()).toEqual([]);
   });
 
   it('backfills only recognized V20 Demo rows when the registry is missing', () => {
