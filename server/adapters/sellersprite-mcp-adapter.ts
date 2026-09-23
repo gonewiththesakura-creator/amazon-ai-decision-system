@@ -18,6 +18,7 @@ import {
 import {
   SELLERSPRITE_CAPABILITIES,
   SellerSpriteToolRegistry,
+  sellerSpriteSchemaHash,
   type SellerSpriteCapability,
 } from './sellersprite-tool-registry.js';
 import type {
@@ -29,14 +30,21 @@ import { AdapterUnavailableError } from './types.js';
 const object = sellerSpriteObjectSchema;
 
 const MARKET_STATISTICS_RETURN_FIELDS = [
-  'marketplace', 'nodeIdPath', 'month', 'products', 'sellers', 'brands', 'totalUnits',
+  'marketplace', 'nodeIdPath', 'month', 'totalProducts', 'products', 'sellers', 'brands', 'totalUnits',
   'totalRevenue', 'avgPrice', 'medianPrice', 'avgRating', 'medianReviews', 'top10Share',
   'top20Share', 'newProductShare', 'newProductProportion',
 ].join(',');
 
 const PRODUCT_CONCENTRATION_RETURN_FIELDS = [
   'marketplace', 'nodeIdPath', 'month', 'asin', 'title', 'brand', 'price', 'rating',
-  'ratings', 'totalUnits', 'totalRevenue', 'totalUnitsRatio', 'totalRevenueRatio',
+  'ratings', 'reviews', 'totalUnits', 'totalRevenue', 'totalUnitsRatio', 'totalRevenueRatio',
+].join(',');
+
+const MARKET_RESEARCH_SUMMARY_RETURN_FIELDS = [
+  'marketplace', 'nodeIdPath', 'month', 'totalProducts', 'topProducts', 'totalUnits', 'totalRevenue',
+  'avgUnits', 'avgRevenue', 'avgPrice', 'avgRatings', 'avgRating', 'brands', 'sellers',
+  'top10ProductSales', 'top10ProductCrn', 'top20ProductSales', 'top20ProductCrn',
+  'newProductProportion',
 ].join(',');
 
 export interface SellerSpriteMarketRequest {
@@ -53,6 +61,10 @@ export interface SellerSpriteSyncContext {
 export type SellerSpriteData<T> = { data: T; provenance: Provenance };
 export type SellerSpriteStatistics = Record<string, unknown>;
 export type SellerSpriteConcentration = Array<Record<string, unknown>>;
+export type SellerSpriteMarketResearchSummary = Record<string, unknown> & {
+  marketplace: string;
+  nodeIdPath: string;
+};
 export type SellerSpriteAsinTrend = {
   asin: Record<string, unknown>;
   salesTrendPoints: Array<Record<string, unknown>>;
@@ -132,6 +144,30 @@ export class SellerSpriteMCPAdapter implements MarketDataAdapter {
     );
   }
 
+  async fetchMarketResearchSummary(
+    input: SellerSpriteMarketRequest, context?: SellerSpriteSyncContext,
+  ): Promise<SellerSpriteData<SellerSpriteMarketResearchSummary>> {
+    if (context?.requireObservationMonth && !context.runId) {
+      throw new SellerSpriteMcpError(
+        'INVALID_SCHEMA', 'SellerSprite MARKET_RESEARCH requires a fresh run to certify an observation month',
+      );
+    }
+    const result = await this.fetchCapability(
+      'MARKET_RESEARCH', (registry) => ({ request: {
+        marketplace: input.marketplace,
+        nodeIdPath: input.nodeIdPath,
+        ...optionalMonth(input.month),
+        ...(registry.supportsStringArgument('MARKET_RESEARCH', 'returnFields')
+          ? { returnFields: MARKET_RESEARCH_SUMMARY_RETURN_FIELDS } : {}),
+      } }), sellerSpriteMarketResearchSchema, 'market_refresh', context,
+      (data) => { uniqueMarketResearchItem(data.items, input); },
+    );
+    return {
+      data: uniqueMarketResearchItem(result.data.items, input),
+      provenance: result.provenance,
+    };
+  }
+
   async fetchAsinSalesTrend(
     input: SellerSpriteAsinRequest, context?: SellerSpriteSyncContext,
   ): Promise<SellerSpriteData<SellerSpriteAsinTrend>> {
@@ -207,13 +243,14 @@ export class SellerSpriteMCPAdapter implements MarketDataAdapter {
   }
 
   async fetchProductDetail(input: ProductInput): Promise<ProductDetailRecord> {
-    const { data, provenance } = await this.fetchAsinSalesTrend(input);
+    const request = { marketplace: input.marketplace, asin: input.asin };
+    const { data, provenance } = await this.fetchAsinSalesTrend(request);
     const latest = data.salesTrendPoints.at(-1);
     if (!latest || typeof latest.month !== 'string') {
       throw new SellerSpriteMcpError('INVALID_SCHEMA', 'SellerSprite product detail missing identity or observation period');
     }
     const info = this.registry.resolve('ASIN_DETAIL')
-      ? identityWithFallback((await this.fetchAsinIdentity(input)).data, data.asin)
+      ? identityWithFallback((await this.fetchAsinIdentity(request)).data, data.asin)
       : data.asin;
     if (typeof info.asin !== 'string' || typeof info.title !== 'string') {
       throw new SellerSpriteMcpError('INVALID_SCHEMA', 'SellerSprite product detail missing identity or observation period');
@@ -273,6 +310,7 @@ export class SellerSpriteMCPAdapter implements MarketDataAdapter {
     args: Record<string, unknown> | ((registry: SellerSpriteToolRegistry) => Record<string, unknown>),
     schema: z.ZodType<T>, operation: string,
     context?: SellerSpriteSyncContext,
+    validate?: (data: T) => void,
   ): Promise<SellerSpriteData<T>> {
     if (!this.injectedClient && !process.env.SELLERSPRITE_MCP_URL) {
       throw new AdapterUnavailableError('未配置 SELLERSPRITE_MCP_URL，请在服务端环境变量中设置。');
@@ -293,8 +331,8 @@ export class SellerSpriteMCPAdapter implements MarketDataAdapter {
     const request = resolvedArgs.request && typeof resolvedArgs.request === 'object'
       ? resolvedArgs.request as Record<string, unknown> : resolvedArgs;
     if (context?.requireObservationMonth
-      && (capability === 'MARKET_STATISTICS' || capability === 'PRODUCT_CONCENTRATION')
-      && (!registry.supportsArgument(capability, 'month') || request.month === undefined)) {
+      && isMarketObservationCapability(capability)
+      && (!registry.supportsStringArgument(capability, 'month') || !isRequestedMonth(request.month))) {
       throw new SellerSpriteMcpError(
         'INVALID_SCHEMA',
         `SellerSprite ${capability} cannot certify a requested observation month`,
@@ -307,10 +345,17 @@ export class SellerSpriteMCPAdapter implements MarketDataAdapter {
       || capability === 'ASIN_DETAIL'
       ? 'product' as const : 'market' as const;
     const entityId = entityType === 'product' ? request.asin : request.nodeIdPath;
+    const criticalMarket = context?.requireObservationMonth === true
+      && isMarketObservationCapability(capability);
+    const documentedRequest = criticalMarket && Boolean(context?.runId)
+      && ((capability === 'MARKET_STATISTICS' && tool.name === 'market_research_statistics')
+        || (capability === 'PRODUCT_CONCENTRATION' && tool.name === 'market_product_concentration')
+        || (capability === 'MARKET_RESEARCH' && tool.name === 'market_research'))
+      && registry.supportsStringArgument(capability, 'month');
     const accepted = await this.client.callTool({ tool: tool.name, arguments: toolArgs, context: {
       capability, operation, entityType,
       ...(typeof entityId === 'string' ? { entityId: entityId.toUpperCase() } : {}),
-      ...((capability === 'MARKET_STATISTICS' || capability === 'PRODUCT_CONCENTRATION')
+      ...(isMarketObservationCapability(capability)
         && typeof request.month === 'string' ? { observationMonth: request.month } : {}),
       ...(context?.runId ? { runId: context.runId } : {}),
       ...(context?.runId ? { fresh: true } : {}),
@@ -321,9 +366,15 @@ export class SellerSpriteMCPAdapter implements MarketDataAdapter {
       const parsed = schema.safeParse(payload);
       if (!parsed.success) throw new SellerSpriteMcpError('INVALID_SCHEMA', 'SellerSprite response does not match discovered capability');
       validateCapabilityScope(
-        capability, parsed.data, request, context?.requireObservationMonth === true,
+        capability, parsed.data, request, criticalMarket, documentedRequest,
       );
-      return { data: parsed.data, acquisition };
+      validate?.(parsed.data);
+      return { value: { data: parsed.data, acquisition }, ...(criticalMarket ? {
+        observationCertification: {
+          method: documentedRequest ? 'documented_request_v1' as const : 'response_echo_v1' as const,
+          schemaHash: sellerSpriteSchemaHash(tool.inputSchema),
+        },
+      } : {}) };
     });
     return {
       data: accepted.data,
@@ -352,11 +403,14 @@ function validateCapabilityScope(
   data: unknown,
   request: Record<string, unknown>,
   requireObservationMonth = false,
+  documentedRequest = false,
 ): void {
   if (capability === 'MARKET_STATISTICS') {
     assertRequestedScope(data as Record<string, unknown>, request);
     if (requireObservationMonth) {
-      assertCertifiedObservationMonth(data as Record<string, unknown>, request);
+      assertRequiredMarketScope(data as Record<string, unknown>, request);
+      if (documentedRequest) assertDocumentedMonthIfPresent(data as Record<string, unknown>, request);
+      else assertCertifiedObservationMonth(data as Record<string, unknown>, request);
     }
   } else if (capability === 'PRODUCT_CONCENTRATION' || capability === 'ASIN_COMPETITOR_DISCOVERY') {
     const items = data as Array<Record<string, unknown>>;
@@ -365,16 +419,34 @@ function validateCapabilityScope(
     }
     for (const item of items) {
       if (requireObservationMonth && capability === 'PRODUCT_CONCENTRATION') {
-        assertRequiredMarketScope(item, request);
-        assertCertifiedObservationMonth(item, request);
+        assertMeaningfulConcentrationItem(item);
+        if (documentedRequest) {
+          assertDocumentedScopeIfPresent(item, request);
+          assertDocumentedMonthIfPresent(item, request);
+        } else {
+          assertRequiredMarketScope(item, request);
+          assertCertifiedObservationMonth(item, request);
+        }
       } else {
         assertRequestedScope(item, request);
       }
     }
   } else if (capability === 'MARKET_RESEARCH') {
     const research = data as { items: Array<Record<string, unknown>> } & Record<string, unknown>;
-    assertRequestedScope(research, request);
-    for (const item of research.items) assertRequestedScope(item, request);
+    if (requireObservationMonth) {
+      if (documentedRequest) {
+        assertDocumentedScopeIfPresent(research, request);
+        assertDocumentedMonthIfPresent(research, request);
+      } else {
+        assertRequestedScope(research, request);
+      }
+      const target = uniqueMarketResearchItem(research.items, request);
+      if (documentedRequest) assertDocumentedMonthIfPresent(target, request);
+      else assertCertifiedObservationMonth(target, request);
+    } else {
+      assertRequestedScope(research, request);
+      for (const item of research.items) assertRequestedScope(item, request);
+    }
   } else if (capability === 'ASIN_SALES_TREND') {
     const trend = data as SellerSpriteAsinTrend;
     assertRequestedScope(data as Record<string, unknown>, request);
@@ -389,6 +461,69 @@ function validateCapabilityScope(
     assertRequestedScope(identity, request);
     assertRequestedAsin(identity, request);
   }
+}
+
+function assertMeaningfulConcentrationItem(item: Record<string, unknown>): void {
+  if (typeof item.asin !== 'string' || !/^[A-Z0-9]{10}$/i.test(item.asin.trim())) {
+    throw new SellerSpriteMcpError('INVALID_SCHEMA', 'SellerSprite concentration item is missing a valid ASIN');
+  }
+  if (!['totalUnits', 'totalRevenue', 'totalUnitsRatio', 'totalRevenueRatio']
+    .some((key) => typeof item[key] === 'number' && Number.isFinite(item[key]) && item[key] >= 0)) {
+    throw new SellerSpriteMcpError('INVALID_SCHEMA', 'SellerSprite concentration item has no valid metric');
+  }
+}
+
+function isMarketObservationCapability(capability: SellerSpriteCapability): boolean {
+  return capability === 'MARKET_RESEARCH'
+    || capability === 'MARKET_STATISTICS'
+    || capability === 'PRODUCT_CONCENTRATION';
+}
+
+function uniqueMarketResearchItem(
+  items: Array<Record<string, unknown>>,
+  request: Pick<SellerSpriteMarketRequest, 'marketplace' | 'nodeIdPath'> | Record<string, unknown>,
+): SellerSpriteMarketResearchSummary {
+  const expectedMarketplace = scopeString(request.marketplace);
+  const expectedNodeIdPath = scopeString(request.nodeIdPath);
+  const matches = items.filter((item) => {
+    const marketplace = scopeString(item.marketplace);
+    const nodeIdPath = scopeString(item.nodeIdPath);
+    return marketplace?.toUpperCase() === expectedMarketplace?.toUpperCase()
+      && nodeIdPath === expectedNodeIdPath;
+  });
+  if (matches.length !== 1) {
+    throw new SellerSpriteMcpError(
+      'INVALID_SCHEMA', 'SellerSprite market research must contain exactly one requested market summary',
+    );
+  }
+  return matches[0] as SellerSpriteMarketResearchSummary;
+}
+
+function assertDocumentedScopeIfPresent(
+  data: Record<string, unknown>, request: Record<string, unknown>,
+): void {
+  for (const key of ['marketplace', 'nodeIdPath'] as const) {
+    if (!Object.hasOwn(data, key) || data[key] === null || data[key] === undefined) continue;
+    const actual = scopeString(data[key]);
+    const expected = scopeString(request[key]);
+    if (!actual || !expected || (key === 'marketplace'
+      ? actual.toUpperCase() !== expected.toUpperCase() : actual !== expected)) {
+      throw new SellerSpriteMcpError('INVALID_SCHEMA', `SellerSprite response ${key} does not match request`);
+    }
+  }
+}
+
+function assertDocumentedMonthIfPresent(
+  data: Record<string, unknown>, request: Record<string, unknown>,
+): void {
+  if (!Object.hasOwn(data, 'month') || data.month === null || data.month === undefined) return;
+  if (normalizedMonth(data.month) !== normalizedMonth(request.month)) {
+    throw new SellerSpriteMcpError('INVALID_SCHEMA', 'SellerSprite response month does not match request');
+  }
+}
+
+function isRequestedMonth(value: unknown): value is string {
+  return typeof value === 'string' && /^[0-9]{4}(0[1-9]|1[0-2])$/.test(value);
 }
 
 function assertCertifiedObservationMonth(

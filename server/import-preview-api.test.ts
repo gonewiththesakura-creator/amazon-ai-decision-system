@@ -326,6 +326,196 @@ describe('import preview API', () => {
     expect(database.prepare('SELECT COUNT(*) AS count FROM import_batches').get()).toEqual({ count: 0 });
   });
 
+  it('persists an invalid five-row roster declaration without importing products or allowing a smaller replacement', () => {
+    database = openDatabase(':memory:');
+    const [header, template] = productMasterCsv.split('\n');
+    const rows = Array.from({ length: 5 }, (_, index) => template
+      .replace('B0OWNED001', `B0MASTER0${index + 1}`)
+      .replace('OWN-001', `MASTER-00${index + 1}`));
+    rows[4] = rows[4].replace('Northstar,Contour Pillow,memory foam', 'Northstar,,memory foam');
+    const service = new ImportService(database);
+    const preview = service.preview(Buffer.from([header, ...rows].join('\n')), {
+      format: 'csv', filename: 'five-owned.csv',
+    });
+    expect(preview).toMatchObject({ totalCount: 5, errorCount: 1 });
+    expect(database.prepare(`SELECT marketplace, declared_count AS declaredCount,
+      expected_count AS expectedCount, status, import_batch_id AS importBatchId
+      FROM owned_roster_declarations`).get()).toEqual({
+      marketplace: 'US', declaredCount: 5, expectedCount: null,
+      status: 'pending_validation', importBatchId: null,
+    });
+    expect(database.prepare('SELECT COUNT(*) AS count FROM products').get()).toEqual({ count: 0 });
+    expect(database.prepare('SELECT COUNT(*) AS count FROM import_batches').get()).toEqual({ count: 0 });
+
+    const nextProcess = new ImportService(database);
+    expect(() => nextProcess.preview(Buffer.from([header, ...rows.slice(0, 3)].join('\n')), {
+      format: 'csv', filename: 'smaller-owned.csv',
+    })).toThrow(/roster|声明|范围|缩减|冲突/);
+    expect(database.prepare(`SELECT declared_count AS declaredCount, status
+      FROM owned_roster_declarations WHERE marketplace = 'US'`).get())
+      .toEqual({ declaredCount: 5, status: 'pending_validation' });
+    expect(new GoLiveMigrationService(database).verify()).toMatchObject({
+      expectedOwnedProducts: 5, ownedRosterDeclarationStatus: 'pending_validation',
+      ownedRosterMatches: false, readyForDemoCleanup: false,
+    });
+  });
+
+  it('rejects a master with missing roster identity without replacing the prior declaration', () => {
+    database = openDatabase(':memory:');
+    const service = new ImportService(database);
+    service.preview(Buffer.from(productMasterCsv), { format: 'csv', filename: 'original.csv' });
+    const before = database.prepare(`SELECT declared_count AS declaredCount,
+      declared_digest AS declaredDigest, preview_digest AS previewDigest, status
+      FROM owned_roster_declarations WHERE marketplace = 'US'`).get();
+    const missingIdentity = productMasterCsv.replace('B0OWNED001', '');
+    expect(() => service.preview(Buffer.from(missingIdentity), {
+      format: 'csv', filename: 'missing-asin.csv',
+    })).toThrow(/roster|身份|ASIN/i);
+    expect(database.prepare(`SELECT declared_count AS declaredCount,
+      declared_digest AS declaredDigest, preview_digest AS previewDigest, status
+      FROM owned_roster_declarations WHERE marketplace = 'US'`).get()).toEqual(before);
+  });
+
+  it.each(['asin', 'sku'])('does not declare an initial roster with a missing %s identity', (field) => {
+    database = openDatabase(':memory:');
+    const blank = field === 'asin'
+      ? productMasterCsv.replace('B0OWNED001', '')
+      : productMasterCsv.replace('OWN-001', '');
+    expect(() => new ImportService(database!).preview(Buffer.from(blank), {
+      format: 'csv', filename: 'missing-identity.csv',
+    })).toThrow(/roster|身份|ASIN|SKU/i);
+    expect(database.prepare('SELECT COUNT(*) AS count FROM owned_roster_declarations').get())
+      .toEqual({ count: 0 });
+  });
+
+  it('confirms a corrected same-identity declaration atomically with its complete Product Master', () => {
+    database = openDatabase(':memory:');
+    const service = new ImportService(database);
+    const [header, template] = productMasterCsv.split('\n');
+    const rows = Array.from({ length: 5 }, (_, index) => template
+      .replace('B0OWNED001', `B0MASTER0${index + 1}`)
+      .replace('OWN-001', `MASTER-00${index + 1}`));
+    rows[4] = rows[4].replace('Northstar,Contour Pillow,memory foam', 'Northstar,,memory foam');
+    service.preview(Buffer.from([header, ...rows].join('\n')), {
+      format: 'csv', filename: 'invalid-five.csv',
+    });
+    const corrected = rows[4]!.replace('Northstar,,memory foam', 'Northstar,Contour Pillow,memory foam');
+    const preview = service.preview(Buffer.from([header, ...rows.slice(0, 4), corrected].join('\n')), {
+      format: 'csv', filename: 'corrected-five.csv',
+    });
+    expect(preview.errorCount).toBe(0);
+    const result = service.confirm(preview.token);
+    expect(result).toMatchObject({ successCount: 5, failureCount: 0 });
+    expect(database.prepare(`SELECT declared_count AS declaredCount,
+      LENGTH(declared_digest) AS declaredDigestLength, expected_count AS expectedCount,
+      LENGTH(expected_digest) AS expectedDigestLength, status, import_batch_id AS importBatchId
+      FROM owned_roster_declarations WHERE marketplace = 'US'`).get()).toEqual({
+      declaredCount: 5, declaredDigestLength: 64, expectedCount: 5,
+      expectedDigestLength: 64, status: 'confirmed', importBatchId: result.batchId,
+    });
+    expect(database.prepare(`SELECT COUNT(*) AS count FROM products
+      WHERE is_owned = 1 AND is_parent = 0 AND status = 'active' AND source_type <> 'mock'`).get())
+      .toEqual({ count: 5 });
+  });
+
+  it('rejects confirmation when an active owned SKU is omitted from a superseding roster', () => {
+    database = openDatabase(':memory:');
+    const service = new ImportService(database);
+    service.confirm(service.preview(Buffer.from(productMasterCsv), {
+      format: 'csv', filename: 'original.csv',
+    }).token);
+    const current = database.prepare(`SELECT preview_digest AS previewDigest
+      FROM owned_roster_declarations WHERE marketplace = 'US'`).get() as { previewDigest: string };
+    const replacement = productMasterCsv
+      .replace('B0OWNED001', 'B0OWNED002')
+      .replace('OWN-001', 'OWN-002');
+    const preview = service.preview(Buffer.from(replacement), {
+      format: 'csv', filename: 'replacement.csv',
+      supersedesRosterDigest: current.previewDigest,
+    });
+
+    expect(() => service.confirm(preview.token)).toThrow(/active|活跃|文件|roster/i);
+    expect(database.prepare(`SELECT asin, status FROM products ORDER BY asin`).all())
+      .toEqual([{ asin: 'B0OWNED001', status: 'active' }]);
+    expect(database.prepare(`SELECT declared_digest AS declaredDigest, status
+      FROM owned_roster_declarations WHERE marketplace = 'US'`).get())
+      .toMatchObject({ status: 'pending_validation' });
+  });
+
+  it('confirms an explicit CAS roster supersede when omitted active SKUs are declared inactive', () => {
+    database = openDatabase(':memory:');
+    const service = new ImportService(database);
+    service.confirm(service.preview(Buffer.from(productMasterCsv), {
+      format: 'csv', filename: 'original.csv',
+    }).token);
+    const current = database.prepare(`SELECT preview_digest AS previewDigest
+      FROM owned_roster_declarations WHERE marketplace = 'US'`).get() as { previewDigest: string };
+    const [header, originalRow] = productMasterCsv.split('\n');
+    const inactiveRow = originalRow.replace(',true,active', ',false,inactive');
+    const newRow = originalRow
+      .replace('B0OWNED001', 'B0OWNED002')
+      .replace('OWN-001', 'OWN-002')
+      .replace('Contour Pillow', 'Replacement Pillow');
+    const preview = service.preview(Buffer.from([header, inactiveRow, newRow].join('\n')), {
+      format: 'csv', filename: 'reviewed-replacement.csv',
+      supersedesRosterDigest: current.previewDigest,
+    });
+    const result = service.confirm(preview.token);
+
+    expect(result).toMatchObject({ successCount: 2, failureCount: 0 });
+    expect(database.prepare(`SELECT asin, status FROM products ORDER BY asin`).all()).toEqual([
+      { asin: 'B0OWNED001', status: 'inactive' },
+      { asin: 'B0OWNED002', status: 'active' },
+    ]);
+    expect(database.prepare(`SELECT declared_count AS declaredCount,
+      expected_count AS expectedCount, status FROM owned_roster_declarations
+      WHERE marketplace = 'US'`).get()).toEqual({
+      declaredCount: 2, expectedCount: 1, status: 'confirmed',
+    });
+    expect(database.prepare(`SELECT event_type AS eventType
+      FROM owned_roster_declaration_events ORDER BY rowid`).all()).toEqual([
+      { eventType: 'declared' }, { eventType: 'confirmed' },
+      { eventType: 'superseded' }, { eventType: 'confirmed' },
+    ]);
+  });
+
+  it('rejects a cross-market master before changing the current roster declaration', () => {
+    database = openDatabase(':memory:');
+    const service = new ImportService(database);
+    service.confirm(service.preview(Buffer.from(productMasterCsv), {
+      format: 'csv', filename: 'original.csv',
+    }).token);
+    const before = database.prepare(`SELECT * FROM owned_roster_declarations
+      WHERE marketplace = 'US'`).get();
+
+    expect(() => service.preview(Buffer.from(productMasterCsv.replace('US,', 'CA,')), {
+      format: 'csv', filename: 'wrong-market.csv',
+    })).toThrow(/站点|marketplace|工作区/i);
+    expect(database.prepare(`SELECT * FROM owned_roster_declarations
+      WHERE marketplace = 'US'`).get()).toEqual(before);
+  });
+
+  it('requires a current declaration preview digest for every explicit CAS refresh', () => {
+    database = openDatabase(':memory:');
+    const service = new ImportService(database);
+    service.preview(Buffer.from(productMasterCsv), { format: 'csv', filename: 'first.csv' });
+    const first = database.prepare(`SELECT preview_digest AS previewDigest
+      FROM owned_roster_declarations WHERE marketplace = 'US'`).get() as { previewDigest: string };
+    const corrected = productMasterCsv.replace('Contour Pillow,Northstar', 'Reviewed Pillow,Northstar');
+    service.preview(Buffer.from(corrected), {
+      format: 'csv', filename: 'corrected.csv', supersedesRosterDigest: first.previewDigest,
+    });
+    const current = database.prepare(`SELECT preview_digest AS previewDigest
+      FROM owned_roster_declarations WHERE marketplace = 'US'`).get() as { previewDigest: string };
+    expect(current.previewDigest).not.toBe(first.previewDigest);
+
+    expect(() => service.preview(Buffer.from(productMasterCsv), {
+      format: 'csv', filename: 'stale.csv', supersedesRosterDigest: first.previewDigest,
+    })).toThrow(/过期|陈旧|最新|digest|版本/i);
+    expect(database.prepare(`SELECT preview_digest AS previewDigest
+      FROM owned_roster_declarations WHERE marketplace = 'US'`).get()).toEqual(current);
+  });
+
   it('imports an XLSX product snapshot over HTTP only after confirmation and keeps the observation idempotent', async () => {
     database = openDatabase(':memory:');
     const app = createApp({ database });
@@ -422,7 +612,10 @@ describe('import preview API', () => {
       .toMatchObject({ count: 1 });
   });
 
-  it('rejects a real Product Master that collides with a Demo ASIN or SKU', () => {
+  it.each([
+    ['ASIN', productMasterCsv.replace('B0OWNED001', 'B0DEMO0001')],
+    ['SKU', productMasterCsv.replace('OWN-001', 'MF-ERG-01')],
+  ])('rejects a real Product Master that collides with a Demo %s', (_identity, csv) => {
     database = openDatabase(':memory:');
     seedDemoData(database);
     const service = new ImportService(database);
@@ -430,17 +623,12 @@ describe('import preview API', () => {
       SELECT id, asin, sku, source_type AS sourceType, market_node_id AS marketNodeId
       FROM products WHERE id = 'owned-sku-01'
     `).get();
-    for (const csv of [
-      productMasterCsv.replace('B0OWNED001', 'B0DEMO0001'),
-      productMasterCsv.replace('OWN-001', 'MF-ERG-01'),
-    ]) {
-      const preview = service.preview(Buffer.from(csv), {
-        format: 'csv', filename: 'demo-collision.csv',
-      });
-      expect(preview).toMatchObject({ newCount: 0, errorCount: 1 });
-      expect(preview.errors[0]).toMatch(/Demo|Mock/);
-      expect(() => service.confirm(preview.token)).toThrow(/产品主数据.*整批/);
-    }
+    const preview = service.preview(Buffer.from(csv), {
+      format: 'csv', filename: 'demo-collision.csv',
+    });
+    expect(preview).toMatchObject({ newCount: 0, errorCount: 1 });
+    expect(preview.errors[0]).toMatch(/Demo|Mock/);
+    expect(() => service.confirm(preview.token)).toThrow(/产品主数据.*整批/);
     expect(database.prepare(`
       SELECT id, asin, sku, source_type AS sourceType, market_node_id AS marketNodeId
       FROM products WHERE id = 'owned-sku-01'
@@ -475,10 +663,15 @@ describe('import preview API', () => {
     const service = new ImportService(database);
     const sameNameMaster = productMasterCsv
       .replace('Memory Foam,true,active', 'Memory Foam Pillow,true,active');
+    const [header, firstRow] = sameNameMaster.split('\n');
+    const secondRow = firstRow
+      .replace('B0OWNED001', 'B0OWNED002')
+      .replace('OWN-001', 'OWN-002')
+      .replace('Contour Pillow,Northstar', 'Second Pillow,Northstar');
 
-    expect(service.confirm(service.preview(Buffer.from(sameNameMaster), {
+    expect(service.confirm(service.preview(Buffer.from([header, firstRow, secondRow].join('\n')), {
       format: 'csv', filename: 'same-name-real-master.csv',
-    }).token)).toMatchObject({ successCount: 1, failureCount: 0 });
+    }).token)).toMatchObject({ successCount: 2, failureCount: 0 });
 
     const imported = database.prepare(`
       SELECT product.market_node_id AS marketNodeId, market.source_type AS sourceType
@@ -492,13 +685,6 @@ describe('import preview API', () => {
       SELECT source_type AS sourceType FROM market_nodes WHERE id = 'mkt-memory-foam'
     `).get()).toEqual({ sourceType: 'mock' });
 
-    const secondMaster = sameNameMaster
-      .replace('B0OWNED001', 'B0OWNED002')
-      .replace('OWN-001', 'OWN-002')
-      .replace('Contour Pillow,Northstar', 'Second Pillow,Northstar');
-    expect(service.confirm(service.preview(Buffer.from(secondMaster), {
-      format: 'csv', filename: 'same-name-second-master.csv',
-    }).token)).toMatchObject({ successCount: 1, failureCount: 0 });
     expect(database.prepare(`
       SELECT COUNT(DISTINCT market_node_id) AS count FROM products
       WHERE asin IN ('B0OWNED001', 'B0OWNED002')
@@ -577,6 +763,7 @@ describe('import preview API', () => {
     const service = new ImportService(database);
     const first = service.preview(Buffer.from(productMasterCsv), { format: 'csv', filename: 'first.csv' });
     service.confirm(first.token);
+    database.prepare(`DELETE FROM owned_roster_declarations WHERE marketplace = 'US'`).run();
     const rekeyedAsin = productMasterCsv.replace('B0OWNED001', 'B0OWNED999');
     const conflicting = service.preview(Buffer.from(rekeyedAsin), { format: 'csv', filename: 'sku-conflict.csv' });
     expect(conflicting).toMatchObject({ duplicateCount: 0, errorCount: 1 });
@@ -596,19 +783,23 @@ describe('import preview API', () => {
     });
     expect(staged).toMatchObject({ totalCount: 2, newCount: 2, errorCount: 0 });
 
-    const collision = productMasterCsv
-      .replace('B0OWNED001', 'B0COLLIDE1')
-      .replace('OWN-001', 'OWN-002')
-      .replace('Contour Pillow', 'Collision Pillow');
-    service.confirm(service.preview(Buffer.from(collision), {
-      format: 'csv', filename: 'collision-master.csv',
-    }).token);
+    database.exec(`
+      INSERT INTO market_nodes (
+        id, name, level, marketplace, status, source_type, created_at
+      ) VALUES ('collision-market', 'Collision market', 1, 'US', 'active', 'import', '2026-09-22');
+      INSERT INTO products (
+        id, asin, sku, brand, title, image_url, marketplace, product_type,
+        is_owned, market_node_id, source_type, created_at
+      ) VALUES ('collision-product', 'B0COLLIDE1', 'OWN-002', 'Northstar',
+        'Collision Pillow', '', 'US', 'memory_foam_pillow', 1,
+        'collision-market', 'import', '2026-09-22');
+    `);
 
     expect(() => service.confirm(staged.token)).toThrow(/产品主数据.*整批/);
     expect(database.prepare('SELECT asin, sku FROM products ORDER BY asin').all()).toEqual([
       { asin: 'B0COLLIDE1', sku: 'OWN-002' },
     ]);
-    expect(database.prepare('SELECT COUNT(*) AS count FROM import_batches').get()).toEqual({ count: 1 });
+    expect(database.prepare('SELECT COUNT(*) AS count FROM import_batches').get()).toEqual({ count: 0 });
   });
 
   it('rejects a staged new Product Master when the exact identity was created after preview', () => {
@@ -624,7 +815,8 @@ describe('import preview API', () => {
       format: 'csv', filename: 'concurrent-master.csv',
     }).token);
 
-    expect(() => stagedService.confirm(staged.token)).toThrow(/发生变化.*重新预览|重新预览.*发生变化/);
+    expect(() => stagedService.confirm(staged.token))
+      .toThrow(/声明.*预览|发生变化.*重新预览|重新预览.*发生变化/);
     expect(database.prepare('SELECT COUNT(*) AS count FROM products').get()).toEqual({ count: 1 });
     expect(database.prepare('SELECT COUNT(*) AS count FROM import_batches').get()).toEqual({ count: 1 });
   });
@@ -1105,10 +1297,11 @@ describe('import preview API', () => {
   it('rejects product snapshots when ASIN and SKU resolve to different products', () => {
     database = openDatabase(':memory:');
     const service = new ImportService(database);
-    const first = service.preview(Buffer.from(productMasterCsv), { format: 'csv', filename: 'first.csv' });
-    service.confirm(first.token);
-    const second = productMasterCsv.replaceAll('B0OWNED001', 'B0OTHER001').replaceAll('OWN-001', 'OWN-002');
-    service.confirm(service.preview(Buffer.from(second), { format: 'csv', filename: 'second.csv' }).token);
+    const [header, firstRow] = productMasterCsv.split('\n');
+    const secondRow = firstRow.replaceAll('B0OWNED001', 'B0OTHER001').replaceAll('OWN-001', 'OWN-002');
+    service.confirm(service.preview(Buffer.from([header, firstRow, secondRow].join('\n')), {
+      format: 'csv', filename: 'two-product-master.csv',
+    }).token);
     const csv = [
       'ASIN,SKU,Brand,Title,MarketNodeId,MarketName,Price,Rating,ReviewCount,BSR,EstimatedSales,SellerCount,Growth7D,Growth30D,Growth90D,IsEstimated,Confidence,Date',
       'B0OWNED001,OWN-002,Northstar,Conflict,identity-market,Identity Market,39.99,4.5,120,1000,280,1,1.2,4.1,8.2,false,0.9,2026-06-30',

@@ -170,6 +170,20 @@ function restoreV15DevelopmentProjects(db: AppDatabase): void {
 }
 
 describe('database migrations', () => {
+  it('creates a constrained, marketplace-scoped owned roster declaration without changing product rows', () => {
+    const db = testDatabase();
+    expect(db.prepare(`SELECT name FROM sqlite_master
+      WHERE type = 'table' AND name = 'owned_roster_declarations'`).get())
+      .toEqual({ name: 'owned_roster_declarations' });
+    expect(db.prepare('SELECT COUNT(*) AS count FROM products').get()).toEqual({ count: 0 });
+    expect(() => db.prepare(`INSERT INTO owned_roster_declarations (
+      marketplace, declared_count, declared_digest, preview_digest, status, created_at, updated_at
+    ) VALUES ('US', 5, 'digest', 'preview', 'confirmed', '2026-09-22', '2026-09-22')`).run())
+      .toThrow();
+    expect(db.prepare(`SELECT name FROM sqlite_master
+      WHERE type = 'table' AND name = 'owned_roster_declaration_events'`).get())
+      .toEqual({ name: 'owned_roster_declaration_events' });
+  });
   it('adds nullable critical-sync lineage without assigning legacy observations to a run', () => {
     const db = testDatabase();
     for (const table of [
@@ -339,7 +353,7 @@ describe('database migrations', () => {
     `).all() as Array<{ version: number }>;
 
     expect(versions.map((row) => Number(row.version))).toEqual(
-      Array.from({ length: 29 }, (_, index) => index + 1),
+      Array.from({ length: 31 }, (_, index) => index + 1),
     );
     expect(db.prepare('PRAGMA foreign_key_check').all()).toEqual([]);
     expect(db.prepare('PRAGMA quick_check').get()).toMatchObject({ quick_check: 'ok' });

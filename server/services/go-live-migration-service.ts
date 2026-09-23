@@ -4,6 +4,7 @@ import type { AppDatabase } from '../database/database.js';
 import { transaction } from '../database/database.js';
 import { confirmedDirectCompetitors } from './confirmed-direct-competitor-coverage.js';
 import { validMarketHistorySpan } from './real-history-coverage.js';
+import { ownedRosterState, type OwnedRosterState } from './owned-roster-declaration.js';
 
 interface CountRow {
   count: number;
@@ -23,7 +24,7 @@ export interface GoLivePreview {
   }>;
 }
 
-export interface GoLiveVerification {
+export interface GoLiveVerification extends OwnedRosterState {
   mockObservations: number;
   realMarketSnapshots: number;
   realOwnedProductSnapshots: number;
@@ -97,6 +98,62 @@ function marketDateForMonth(value: string): string {
   const year = Number(value.slice(0, 4));
   const month = Number(value.slice(4));
   return new Date(Date.UTC(year, month, 0)).toISOString().slice(0, 10);
+}
+
+function jsonObject(value: unknown): Record<string, unknown> | null {
+  if (typeof value === 'string') {
+    try { return jsonObject(JSON.parse(value) as unknown); } catch { return null; }
+  }
+  return value && typeof value === 'object' && !Array.isArray(value)
+    ? value as Record<string, unknown> : null;
+}
+
+interface CertifiedMarketCall {
+  capability: string;
+  actualTool: string | null;
+  responseMetadataJson: string;
+  observationMonth: string | null;
+}
+
+function hasDiscoveredStringMonth(schema: unknown): boolean {
+  const input = jsonObject(schema);
+  const properties = jsonObject(input?.properties);
+  const nestedRequest = jsonObject(properties?.request);
+  const usesNestedRequest = Array.isArray(input?.required)
+    && input.required.includes('request');
+  const request = usesNestedRequest ? nestedRequest : input;
+  if (usesNestedRequest && request?.type !== 'object') return false;
+  const month = jsonObject(jsonObject(request?.properties)?.month);
+  return month?.type === 'string';
+}
+
+function certifiedMarketCall(call: CertifiedMarketCall, discovery: Record<string, unknown>): boolean {
+  const metadata = jsonObject(call.responseMetadataJson);
+  const certification = jsonObject(metadata?.observationCertification);
+  const capabilities = jsonObject(discovery.capabilities);
+  const hashes = jsonObject(discovery.capabilitySchemaHashes);
+  if (!certification || !capabilities || !hashes || !Array.isArray(discovery.tools)
+    || !call.actualTool || capabilities[call.capability] !== call.actualTool
+    || typeof certification.schemaHash !== 'string'
+    || !/^[a-f0-9]{64}$/.test(certification.schemaHash)
+    || hashes[call.capability] !== certification.schemaHash) return false;
+  const tools = discovery.tools.filter((candidate) => (
+    jsonObject(candidate)?.name === call.actualTool
+  ));
+  if (tools.length !== 1) return false;
+  const tool = jsonObject(tools[0]);
+  if (tool?.schemaHash !== certification.schemaHash) return false;
+  if (!isCalendarMonth(call.observationMonth ?? '')
+    || !hasDiscoveredStringMonth(tool.inputSchema)) return false;
+  if (certification.method === 'response_echo_v1') return true;
+  if (certification.method !== 'documented_request_v1') return false;
+  const documentedTool = call.capability === 'MARKET_RESEARCH'
+    ? 'market_research'
+    : call.capability === 'MARKET_STATISTICS'
+      ? 'market_research_statistics'
+      : call.capability === 'PRODUCT_CONCENTRATION'
+        ? 'market_product_concentration' : null;
+  return call.actualTool === documentedTool;
 }
 
 const MARKET_METRICS = `(
@@ -259,6 +316,7 @@ export class GoLiveMigrationService {
     `, true);
     const settingsRow = this.database.prepare(`SELECT marketplace, default_market_id FROM app_settings WHERE id = 1`).get();
     const settings = settingsRow as unknown as { marketplace: string; default_market_id: string };
+    const rosterState = ownedRosterState(this.database, settings.marketplace);
     const realMarketSnapshots = this.count(`
       SELECT COUNT(*) AS count FROM market_snapshots snapshot
       JOIN market_nodes market ON market.id = snapshot.market_node_id
@@ -360,7 +418,7 @@ export class GoLiveMigrationService {
             AND ${PRODUCT_METRICS})
     `, false, settings.default_market_id, settings.marketplace,
       settings.marketplace, settings.marketplace);
-    const criticalProof = verifiedMarketPath
+    const criticalProof = verifiedMarketPath && rosterState.ownedRosterMatches
       ? this.completeCriticalRun(settings.marketplace, settings.default_market_id, marketNode!.nodeIdPath!)
       : {
         runId: null, verifiedEvidenceEntities: 0,
@@ -375,11 +433,13 @@ export class GoLiveMigrationService {
       this.database, settings.marketplace,
     ).map((relation) => relation.competitorProductId)).size;
     const readyForDemoCleanup = verifiedMarketPath
+      && rosterState.ownedRosterMatches
       && sellerSpriteConnectionVerified
       && sellerSpriteCapabilitiesAvailable
       && sellerSpriteCriticalRunId !== null
       && criticalProof.runLinkedCandidateGroups > 0;
     return {
+      ...rosterState,
       mockObservations,
       realMarketSnapshots,
       realOwnedProductSnapshots,
@@ -540,10 +600,18 @@ export class GoLiveMigrationService {
         ORDER BY collected_at DESC, rowid DESC LIMIT 1
       `, false, run.id) === 1;
       if (!runCapabilitiesAvailable) continue;
+      const capabilityRow = this.database.prepare(`
+        SELECT capabilities_json AS capabilitiesJson FROM provider_capability_snapshots
+        WHERE provider_id = 'sellersprite' AND sync_run_id = ?
+        ORDER BY collected_at DESC, rowid DESC LIMIT 1
+      `).get(run.id) as { capabilitiesJson: string } | undefined;
+      const runDiscovery = jsonObject(capabilityRow?.capabilitiesJson);
+      if (!runDiscovery) continue;
       const calls = this.database.prepare(`
         SELECT provider_id AS providerId, capability, entity_type AS entityType, entity_id AS entityId,
           status, result_count AS resultCount, cache_hit AS cacheHit,
-          observation_month AS observationMonth,
+          observation_month AS observationMonth, actual_tool AS actualTool,
+          response_metadata_json AS responseMetadataJson,
           CASE WHEN julianday(started_at) BETWEEN julianday('now', '-1 day')
             AND julianday('now', '+5 minutes')
             AND julianday(COALESCE(completed_at, started_at)) BETWEEN julianday('now', '-1 day')
@@ -558,9 +626,19 @@ export class GoLiveMigrationService {
         resultCount: number | null;
         cacheHit: number;
         observationMonth: string | null;
+        actualTool: string | null;
+        responseMetadataJson: string;
         isFresh: number;
       }>;
       if (calls.length === 0 || calls.some((call) => call.cacheHit !== 0 || call.isFresh !== 1)) continue;
+      const certifiedMarketCapabilities = [
+        'MARKET_RESEARCH', 'MARKET_STATISTICS', 'PRODUCT_CONCENTRATION',
+      ];
+      if (calls.some((call) => call.providerId === 'sellersprite'
+        && call.entityType === 'market' && call.status === 'success'
+        && certifiedMarketCapabilities.includes(call.capability)
+        && (!marketMonths.includes(call.observationMonth ?? '')
+          || !certifiedMarketCall(call, runDiscovery)))) continue;
       const hasCall = (
         capability: string, type: string, id: string, allowEmpty = false, observationMonth?: string,
       ): boolean => calls.some((call) => (
@@ -576,6 +654,9 @@ export class GoLiveMigrationService {
           && call.resultCount !== null && call.resultCount > 0
       ));
       if (!hasToolDiscovery
+        || !marketNodes.every((marketNode) => marketMonths.every((observationMonth) => hasCall(
+          'MARKET_RESEARCH', 'market', marketNode.nodeIdPath, false, observationMonth,
+        )))
         || !marketNodes.every((marketNode) => marketMonths.every((observationMonth) => hasCall(
           'MARKET_STATISTICS', 'market', marketNode.nodeIdPath, false, observationMonth,
         )))

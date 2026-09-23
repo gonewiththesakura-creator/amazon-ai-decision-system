@@ -1,5 +1,40 @@
 import type { AppDatabase } from '../database/database.js';
 import { randomUUID } from 'node:crypto';
+import { sellerSpriteSchemaHash } from '../adapters/sellersprite-tool-registry.js';
+import { seedConfirmedOwnedRoster } from './owned-roster-declaration.js';
+
+const marketRequestProperties = {
+  marketplace: { type: 'string' },
+  nodeIdPath: { type: 'string' },
+  month: { type: 'string' },
+};
+const researchSchema = {
+  type: 'object',
+  required: ['request'],
+  properties: { request: {
+    type: 'object', required: ['marketplace', 'nodeIdPath'],
+    properties: { ...marketRequestProperties, size: { type: 'number' } },
+  } },
+};
+const statisticsSchema = {
+  type: 'object',
+  required: ['request'],
+  properties: { request: {
+    type: 'object', required: ['marketplace', 'nodeIdPath'],
+    properties: marketRequestProperties,
+  } },
+};
+const concentrationSchema = {
+  type: 'object',
+  required: ['request'],
+  properties: { request: {
+    type: 'object', required: ['marketplace', 'nodeIdPath'],
+    properties: { ...marketRequestProperties, sortOrder: { type: 'string' } },
+  } },
+};
+const researchHash = sellerSpriteSchemaHash(researchSchema);
+const statisticsHash = sellerSpriteSchemaHash(statisticsSchema);
+const concentrationHash = sellerSpriteSchemaHash(concentrationSchema);
 
 // Synthetic records for exercising the Go Live gate in isolated test databases only.
 export function addVerifiedMcpCoverage(
@@ -51,6 +86,7 @@ export function addVerifiedMcpCoverage(
   `).all(marketId, settings.marketplace, settings.marketplace, settings.marketplace) as Array<{
     id: string; asin: string; marketNodeId: string;
   }>;
+  seedConfirmedOwnedRoster(database, settings.marketplace);
   const includeConfirmedDirectCompetitor = options.includeConfirmedDirectCompetitor ?? true;
   const candidateFixtures = owned.map((product, index) => ({
     id: randomUUID(),
@@ -231,38 +267,65 @@ export function addVerifiedMcpCoverage(
   database.prepare(`INSERT INTO provider_capability_snapshots (
     id, provider_id, capabilities_json, collected_at, sync_run_id
   ) VALUES (?, 'sellersprite', ?, ?, ?)`)
-    .run(`verified-capabilities-${runId}`, JSON.stringify({ capabilities: {
-      MARKET_RESEARCH: 'market_research',
-      MARKET_STATISTICS: 'market_research_statistics',
-      PRODUCT_CONCENTRATION: 'market_product_concentration',
-      ASIN_SALES_TREND: 'asin_sales_trend',
-      ASIN_COMPETITOR_DISCOVERY: 'asin_competitor',
-    } }), now, runId);
+    .run(`verified-capabilities-${runId}`, JSON.stringify({
+      capabilities: {
+        MARKET_RESEARCH: 'market_research',
+        MARKET_STATISTICS: 'market_research_statistics',
+        PRODUCT_CONCENTRATION: 'market_product_concentration',
+        ASIN_SALES_TREND: 'asin_sales_trend',
+        ASIN_COMPETITOR_DISCOVERY: 'asin_competitor',
+      },
+      capabilitySchemaHashes: {
+        MARKET_RESEARCH: researchHash,
+        MARKET_STATISTICS: statisticsHash,
+        PRODUCT_CONCENTRATION: concentrationHash,
+      },
+      tools: [
+        { name: 'market_research', inputSchema: researchSchema, schemaHash: researchHash },
+        { name: 'market_research_statistics', inputSchema: statisticsSchema,
+          schemaHash: statisticsHash },
+        { name: 'market_product_concentration', inputSchema: concentrationSchema,
+          schemaHash: concentrationHash },
+      ],
+    }), now, runId);
   const addCall = database.prepare(`INSERT INTO mcp_call_logs (
     id, provider_id, capability, request_hash, status, entity_type,
-    entity_id, result_count, started_at, sync_run_id, observation_month
-  ) VALUES (?, 'sellersprite', ?, ?, 'success', ?, ?, 1, ?, ?, ?)`);
+    entity_id, result_count, started_at, sync_run_id, observation_month,
+    actual_tool, response_metadata_json
+  ) VALUES (?, 'sellersprite', ?, ?, 'success', ?, ?, 1, ?, ?, ?, ?, ?)`);
   addCall.run(randomUUID(), 'LIST_TOOLS', `list-tools-${runId}`,
-    null, null, now, runId, null);
+    null, null, now, runId, null, null, '{}');
   for (const marketNode of marketNodes) {
     for (const marketMonth of marketMonths) {
+      addCall.run(randomUUID(), 'MARKET_RESEARCH',
+        `research-${marketNode.id}-${marketMonth.month}-${runId}`,
+        'market', marketNode.nodeIdPath, now, runId, marketMonth.month,
+        'market_research', JSON.stringify({ observationCertification: {
+          method: 'documented_request_v1', schemaHash: researchHash,
+        } }));
       addCall.run(randomUUID(), 'MARKET_STATISTICS',
         `market-${marketNode.id}-${marketMonth.month}-${runId}`,
-        'market', marketNode.nodeIdPath, now, runId, marketMonth.month);
+        'market', marketNode.nodeIdPath, now, runId, marketMonth.month,
+        'market_research_statistics', JSON.stringify({ observationCertification: {
+          method: 'documented_request_v1', schemaHash: statisticsHash,
+        } }));
       addCall.run(randomUUID(), 'PRODUCT_CONCENTRATION',
         `concentration-${marketNode.id}-${marketMonth.month}-${runId}`,
-        'market', marketNode.nodeIdPath, now, runId, marketMonth.month);
+        'market', marketNode.nodeIdPath, now, runId, marketMonth.month,
+        'market_product_concentration', JSON.stringify({ observationCertification: {
+          method: 'documented_request_v1', schemaHash: concentrationHash,
+        } }));
     }
   }
   for (const product of owned) {
     addCall.run(randomUUID(), 'ASIN_SALES_TREND', `asin-${product.id}-${runId}`,
-      'product', product.asin.toUpperCase(), now, runId, null);
+      'product', product.asin.toUpperCase(), now, runId, null, 'asin_sales_trend', '{}');
     addCall.run(randomUUID(), 'ASIN_COMPETITOR_DISCOVERY', `candidates-${product.id}-${runId}`,
-      'product', product.asin.toUpperCase(), now, runId, null);
+      'product', product.asin.toUpperCase(), now, runId, null, 'asin_competitor', '{}');
   }
   for (const competitor of directCompetitors) {
     addCall.run(randomUUID(), 'ASIN_SALES_TREND', `competitor-${competitor.id}-${runId}`,
-      'product', competitor.asin.toUpperCase(), now, runId, null);
+      'product', competitor.asin.toUpperCase(), now, runId, null, 'asin_sales_trend', '{}');
   }
   database.prepare(`INSERT INTO data_coverage_runs (
     id, marketplace, run_type, coverage_json, is_complete, created_at

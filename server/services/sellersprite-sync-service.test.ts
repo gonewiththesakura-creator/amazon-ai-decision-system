@@ -5,6 +5,7 @@ import { SellerSpriteSyncService, type SellerSpriteSyncPort } from './sellerspri
 import { MetricAuthorityResolver } from './metric-authority-resolver.js';
 import { DashboardFreshnessService } from './dashboard-freshness-service.js';
 import { proveDashboardRunReadPath } from './dashboard-run-read-proof.js';
+import { seedConfirmedOwnedRoster } from '../test-utils/owned-roster-declaration.js';
 
 let database: AppDatabase | undefined;
 
@@ -25,6 +26,22 @@ const NODE_PATH = '1055398:1063252:1199122:10671043011';
 
 function fixturePort(overrides: Partial<SellerSpriteSyncPort> = {}): SellerSpriteSyncPort {
   return {
+    async fetchMarketResearchSummary(input: {
+      marketplace: string;
+      nodeIdPath: string;
+      month?: string;
+    }) {
+      return {
+        data: {
+          marketplace: input.marketplace,
+          nodeIdPath: input.nodeIdPath,
+          month: input.month,
+          totalProducts: 2,
+          topProducts: 2,
+        },
+        provenance,
+      };
+    },
     async fetchMarketStatistics() {
       return {
         data: {
@@ -92,6 +109,7 @@ function fixtureDatabase(): AppDatabase {
     );
     UPDATE app_settings SET mode = 'live', default_market_id = 'market-1' WHERE id = 1;
   `);
+  seedConfirmedOwnedRoster(connection);
   return connection;
 }
 
@@ -100,6 +118,23 @@ function count(table: 'market_snapshots' | 'product_snapshots' | 'competitor_can
 }
 
 describe('SellerSprite real-data sync', () => {
+  it('rejects a critical batch without a confirmed owned-roster declaration before contacting MCP', async () => {
+    database = fixtureDatabase();
+    database.prepare(`DELETE FROM owned_roster_declarations WHERE marketplace = 'US'`).run();
+    let calls = 0;
+    const port = fixturePort({
+      async fetchMarketResearchSummary() {
+        calls += 1;
+        throw new Error('MCP should not be called');
+      },
+    });
+    await expect(new SellerSpriteSyncService(database, port)
+      .syncCriticalBatch({ marketId: 'market-1', month: '202608' }))
+      .rejects.toThrow(/roster|声明|确认/);
+    expect(calls).toBe(0);
+    expect(database.prepare(`SELECT COUNT(*) AS count FROM data_tasks
+      WHERE task_type = 'critical_sync'`).get()).toEqual({ count: 0 });
+  });
   it('requires an explicit confirmed SellerSprite path before market sync', async () => {
     database = fixtureDatabase();
     database.prepare(`UPDATE market_nodes SET sellersprite_confirmed_node_path = NULL
@@ -146,6 +181,348 @@ describe('SellerSprite real-data sync', () => {
       .toEqual([{ runId: result.runId }]);
   });
 
+  it('uses one certified three-source request to normalize fully covered market metrics', async () => {
+    database = fixtureDatabase();
+    const calls: Array<{
+      source: string;
+      month: string | undefined;
+      runId: string | undefined;
+      requireObservationMonth: boolean | undefined;
+    }> = [];
+    const port = Object.assign(fixturePort(), {
+      async fetchMarketResearchSummary(
+        input: { marketplace: string; nodeIdPath: string; month?: string },
+        context?: { runId?: string; requireObservationMonth?: boolean },
+      ) {
+        calls.push({
+          source: 'research', month: input.month, runId: context?.runId,
+          requireObservationMonth: context?.requireObservationMonth,
+        });
+        return {
+          data: {
+            marketplace: input.marketplace, nodeIdPath: input.nodeIdPath, month: input.month,
+            totalProducts: 4, topProducts: 4, totalUnits: 12_345, totalRevenue: 456_789,
+            top10ProductCrn: 18.5, top20ProductCrn: 31.25,
+          },
+          provenance,
+        };
+      },
+      async fetchMarketStatistics(
+        input: { marketplace: string; nodeIdPath: string; month?: string },
+        context?: { runId?: string; requireObservationMonth?: boolean },
+      ) {
+        calls.push({
+          source: 'statistics', month: input.month, runId: context?.runId,
+          requireObservationMonth: context?.requireObservationMonth,
+        });
+        return {
+          data: {
+            marketplace: input.marketplace, nodeIdPath: input.nodeIdPath, month: input.month,
+            products: 999, totalProducts: 400, sellers: 70, brands: 62,
+            totalUnits: 1, totalRevenue: 2,
+            avgPrice: 36.38, medianPrice: 999, avgRating: 4.2, medianReviews: 999,
+            top10Share: 99, top20Share: 100, newProductProportion: 41,
+          },
+          provenance,
+        };
+      },
+      async fetchMarketConcentration(
+        input: { marketplace: string; nodeIdPath: string; month?: string },
+        context?: { runId?: string; requireObservationMonth?: boolean },
+      ) {
+        calls.push({
+          source: 'concentration', month: input.month, runId: context?.runId,
+          requireObservationMonth: context?.requireObservationMonth,
+        });
+        return {
+          data: [
+            { marketplace: input.marketplace, nodeIdPath: input.nodeIdPath,
+              month: input.month, asin: 'B0MEDIAN001', price: 20, reviews: 9, ratings: 900 },
+            { marketplace: input.marketplace, nodeIdPath: input.nodeIdPath,
+              month: input.month, asin: 'B0MEDIAN002', price: 40, reviews: 1, ratings: 100 },
+            { marketplace: input.marketplace, nodeIdPath: input.nodeIdPath,
+              month: input.month, asin: 'B0MEDIAN003', price: 10, reviews: 5, ratings: 500 },
+            { marketplace: input.marketplace, nodeIdPath: input.nodeIdPath,
+              month: input.month, asin: 'B0MEDIAN004', price: 30, reviews: 13, ratings: 1300 },
+          ],
+          provenance,
+        };
+      },
+    });
+
+    const result = await new SellerSpriteSyncService(database, port)
+      .syncMarket({ marketId: 'market-1', month: '202608' });
+
+    expect(calls.map(({ source }) => source).sort()).toEqual([
+      'concentration', 'research', 'statistics',
+    ]);
+    expect(calls.every((call) => call.month === '202608'
+      && call.runId === result.runId && call.requireObservationMonth === true)).toBe(true);
+    expect(database.prepare(`
+      SELECT product_count AS productCount, seller_count AS sellerCount,
+        brand_count AS brandCount, monthly_sales AS monthlySales,
+        monthly_revenue AS monthlyRevenue, avg_price AS avgPrice,
+        median_price AS medianPrice, avg_rating AS avgRating,
+        median_reviews AS medianReviews, top10_share AS top10Share,
+        top20_share AS top20Share, new_product_share AS newProductShare
+      FROM market_snapshots WHERE market_node_id = 'market-1'
+    `).get()).toEqual({
+      productCount: 4, sellerCount: 70, brandCount: 62,
+      monthlySales: 12_345, monthlyRevenue: 456_789,
+      avgPrice: 36.38, medianPrice: 25, avgRating: 4.2, medianReviews: 7,
+      top10Share: null, top20Share: null, newProductShare: 41,
+    });
+  });
+
+  it('keeps medians null when the research summary does not define a full cohort', async () => {
+    database = fixtureDatabase();
+    const port = fixturePort({
+      async fetchMarketConcentration(input) {
+        return {
+          data: [
+            { marketplace: input.marketplace, nodeIdPath: input.nodeIdPath,
+              asin: 'B0PUBLIC01', price: 11, reviews: 0 },
+            { marketplace: input.marketplace, nodeIdPath: input.nodeIdPath,
+              asin: 'B0PUBLIC02', price: 19, reviews: 10 },
+            { marketplace: input.marketplace, nodeIdPath: input.nodeIdPath,
+              asin: 'B0PUBLIC03', price: 15, reviews: 3 },
+            { marketplace: input.marketplace, nodeIdPath: input.nodeIdPath,
+              asin: 'B0PUBLIC04', price: -1, reviews: -1 },
+            { marketplace: input.marketplace, nodeIdPath: input.nodeIdPath,
+              asin: 'B0PUBLIC05', price: Number.POSITIVE_INFINITY, reviews: Number.NaN },
+          ],
+          provenance,
+        };
+      },
+    });
+
+    await new SellerSpriteSyncService(database, port)
+      .syncMarket({ marketId: 'market-1', month: '202608' });
+
+    expect(database.prepare(`
+      SELECT monthly_sales AS monthlySales, monthly_revenue AS monthlyRevenue,
+        median_price AS medianPrice, median_reviews AS medianReviews,
+        top10_share AS top10Share, top20_share AS top20Share
+      FROM market_snapshots WHERE market_node_id = 'market-1'
+    `).get()).toEqual({
+      monthlySales: null, monthlyRevenue: null, medianPrice: null, medianReviews: null,
+      top10Share: null, top20Share: null,
+    });
+  });
+
+  it.each([
+    {
+      scenario: 'top products cover only part of the market', totalProducts: 3,
+      rows: [
+        { asin: 'B0PUBLIC01', price: 10, reviews: 10 },
+        { asin: 'B0PUBLIC02', price: 30, reviews: 20 },
+      ], sales: null, price: null, reviews: null, top10: null,
+    },
+    {
+      scenario: 'the concentration result omits a product', totalProducts: 2,
+      rows: [{ asin: 'B0PUBLIC01', price: 10, reviews: 10 }],
+      sales: 30, price: null, reviews: null, top10: null,
+    },
+    {
+      scenario: 'the concentration result repeats an ASIN', totalProducts: 2,
+      rows: [
+        { asin: 'B0PUBLIC01', price: 10, reviews: 10 },
+        { asin: 'B0PUBLIC01', price: 30, reviews: 20 },
+      ], sales: 30, price: null, reviews: null, top10: null,
+    },
+    {
+      scenario: 'one product has no reviews count', totalProducts: 2,
+      rows: [
+        { asin: 'B0PUBLIC01', price: 10, reviews: 10 },
+        { asin: 'B0PUBLIC02', price: 30, ratings: 999 },
+      ], sales: 30, price: 20, reviews: null, top10: null,
+    },
+    {
+      scenario: 'one product has an invalid price', totalProducts: 2,
+      rows: [
+        { asin: 'B0PUBLIC01', price: 10, reviews: 10 },
+        { asin: 'B0PUBLIC02', price: -30, reviews: 20 },
+      ], sales: 30, price: null, reviews: 15, top10: null,
+    },
+  ])('never imputes medians from $scenario', async ({
+    totalProducts, rows, sales, price, reviews, top10,
+  }) => {
+    database = fixtureDatabase();
+    const port = fixturePort({
+      async fetchMarketResearchSummary(input) {
+        return { data: {
+          marketplace: input.marketplace, nodeIdPath: input.nodeIdPath,
+          totalProducts, topProducts: 2, totalUnits: 30, totalRevenue: 600,
+          top10ProductCrn: 10, top20ProductCrn: 20,
+        }, provenance };
+      },
+      async fetchMarketConcentration() { return { data: rows, provenance }; },
+    });
+
+    await new SellerSpriteSyncService(database, port)
+      .syncMarket({ marketId: 'market-1', month: '202608' });
+
+    expect(database.prepare(`
+      SELECT monthly_sales AS sales, median_price AS price,
+        median_reviews AS reviews, top10_share AS top10
+      FROM market_snapshots WHERE market_node_id = 'market-1'
+    `).get()).toEqual({ sales, price, reviews, top10 });
+  });
+
+  it('uses only explicit totalProducts fields for market size, never the statistics sample count', async () => {
+    database = fixtureDatabase();
+    const port = fixturePort({
+      async fetchMarketResearchSummary(input) {
+        return { data: { marketplace: input.marketplace,
+          nodeIdPath: input.nodeIdPath }, provenance };
+      },
+      async fetchMarketStatistics() {
+        return { data: { marketplace: 'US', nodeIdPath: NODE_PATH,
+          products: 100, totalProducts: 123, avgPrice: 40 }, provenance };
+      },
+    });
+
+    await new SellerSpriteSyncService(database, port)
+      .syncMarket({ marketId: 'market-1', month: '202608' });
+
+    expect(database.prepare(`SELECT product_count AS productCount,
+      monthly_sales AS monthlySales FROM market_snapshots`).get())
+      .toEqual({ productCount: 123, monthlySales: null });
+  });
+
+  it('does not present TOP100 sample statistics as full-market metrics', async () => {
+    database = fixtureDatabase();
+    const port = fixturePort({
+      async fetchMarketResearchSummary(input) {
+        return { data: {
+          marketplace: input.marketplace, nodeIdPath: input.nodeIdPath,
+          totalProducts: 3290, topProducts: 100,
+          totalUnits: 252_013, totalRevenue: 9_000_000,
+          top10ProductCrn: 0.3185,
+        }, provenance };
+      },
+      async fetchMarketStatistics() {
+        return { data: {
+          marketplace: 'US', nodeIdPath: NODE_PATH,
+          products: 100, sellers: 70, brands: 62, avgPrice: 36.38,
+          avgRating: 4.2, newProductProportion: 41,
+        }, provenance };
+      },
+    });
+
+    await new SellerSpriteSyncService(database, port)
+      .syncMarket({ marketId: 'market-1', month: '202608' });
+
+    expect(database.prepare(`SELECT product_count AS productCount,
+      seller_count AS sellerCount, brand_count AS brandCount,
+      monthly_sales AS monthlySales, monthly_revenue AS monthlyRevenue,
+      avg_price AS avgPrice, avg_rating AS avgRating,
+      new_product_share AS newProductShare, top10_share AS top10Share
+      FROM market_snapshots`).get()).toEqual({
+      productCount: 3290, sellerCount: null, brandCount: null,
+      monthlySales: null, monthlyRevenue: null, avgPrice: null,
+      avgRating: null, newProductShare: null, top10Share: null,
+    });
+  });
+
+  it('derives full-market TOP shares from ranked sales rather than an unverified CRn unit', async () => {
+    database = fixtureDatabase();
+    const port = fixturePort({
+      async fetchMarketResearchSummary(input) {
+        return { data: {
+          marketplace: input.marketplace, nodeIdPath: input.nodeIdPath,
+          totalProducts: 2, topProducts: 2, totalUnits: 100,
+          top10ProductSales: 25, top20ProductSales: 40,
+          top10ProductCrn: 0.25, top20ProductCrn: 0.4,
+        }, provenance };
+      },
+    });
+
+    await new SellerSpriteSyncService(database, port)
+      .syncMarket({ marketId: 'market-1', month: '202608' });
+
+    expect(database.prepare(`SELECT monthly_sales AS monthlySales,
+      top10_share AS top10Share, top20_share AS top20Share
+      FROM market_snapshots`).get()).toEqual({
+      monthlySales: 100, top10Share: 25, top20Share: 40,
+    });
+  });
+
+  it.each([
+    ['zero market denominator', 0, 0, 0],
+    ['ranked sales exceed total', 100, 20, 101],
+    ['TOP20 sales are less than TOP10 sales', 100, 50, 40],
+    ['negative TOP10 sales', 100, -1, 40],
+  ])('keeps ranked shares null for %s', async (_scenario, totalUnits, top10, top20) => {
+    database = fixtureDatabase();
+    const port = fixturePort({
+      async fetchMarketResearchSummary(input) {
+        return { data: {
+          marketplace: input.marketplace, nodeIdPath: input.nodeIdPath,
+          totalProducts: 2, topProducts: 2, totalUnits,
+          top10ProductSales: top10, top20ProductSales: top20,
+          top10ProductCrn: 0.25, top20ProductCrn: 0.4,
+        }, provenance };
+      },
+    });
+
+    await new SellerSpriteSyncService(database, port)
+      .syncMarket({ marketId: 'market-1', month: '202608' });
+
+    expect(database.prepare(`SELECT top10_share AS top10Share,
+      top20_share AS top20Share FROM market_snapshots`).get())
+      .toEqual({ top10Share: null, top20Share: null });
+  });
+
+  it('keeps product count null when only the statistics sample count exists', async () => {
+    database = fixtureDatabase();
+    const port = fixturePort({
+      async fetchMarketResearchSummary(input) {
+        return { data: { marketplace: input.marketplace,
+          nodeIdPath: input.nodeIdPath }, provenance };
+      },
+    });
+
+    await expect(new SellerSpriteSyncService(database, port)
+      .syncMarket({ marketId: 'market-1', month: '202608' }))
+      .rejects.toThrow(/没有有效指标/);
+    expect(count('market_snapshots')).toBe(0);
+  });
+
+  it('rejects negative measures and anomalous percentages without replacing missing with zero', async () => {
+    database = fixtureDatabase();
+    const port = fixturePort({
+      async fetchMarketResearchSummary(input) {
+        return { data: {
+          marketplace: input.marketplace, nodeIdPath: input.nodeIdPath,
+          totalProducts: 2, topProducts: 2, totalUnits: -30, totalRevenue: -600,
+          top10ProductCrn: 110, top20ProductCrn: -10,
+        }, provenance };
+      },
+      async fetchMarketStatistics() {
+        return { data: {
+          marketplace: 'US', nodeIdPath: NODE_PATH,
+          sellers: -1, brands: -2, avgPrice: -40, avgRating: 6,
+          newProductShare: 105, newProductProportion: 25,
+        }, provenance };
+      },
+    });
+
+    await new SellerSpriteSyncService(database, port)
+      .syncMarket({ marketId: 'market-1', month: '202608' });
+
+    expect(database.prepare(`SELECT product_count AS productCount,
+      seller_count AS sellerCount, brand_count AS brandCount,
+      monthly_sales AS monthlySales, monthly_revenue AS monthlyRevenue,
+      avg_price AS avgPrice, avg_rating AS avgRating, top10_share AS top10,
+      top20_share AS top20, new_product_share AS newProductShare
+      FROM market_snapshots`).get()).toEqual({
+      productCount: 2, sellerCount: null, brandCount: null,
+      monthlySales: null, monthlyRevenue: null, avgPrice: null,
+      avgRating: null, top10: null, top20: null, newProductShare: 25,
+    });
+  });
+
   it('records provider-confirmed parent identity with MCP run lineage', async () => {
     database = fixtureDatabase();
     const service = new SellerSpriteSyncService(database, fixturePort());
@@ -183,9 +560,13 @@ describe('SellerSprite real-data sync', () => {
     expect(task.errorLog).not.toContain('standalone-secret');
   });
 
-  it('does not turn an incomplete concentration cohort into total market sales', async () => {
+  it('does not turn an incomplete concentration cohort into totals or ranked shares', async () => {
     database = fixtureDatabase();
     const port = fixturePort({
+      async fetchMarketResearchSummary(input) {
+        return { data: { marketplace: input.marketplace,
+          nodeIdPath: input.nodeIdPath, totalProducts: 100, topProducts: 2 }, provenance };
+      },
       async fetchMarketStatistics() {
         return { data: { marketplace: 'US', nodeIdPath: NODE_PATH, products: 100,
           brands: 71, sellers: 69, avgPrice: 40 }, provenance };
@@ -216,12 +597,16 @@ describe('SellerSprite real-data sync', () => {
     `).get()).toEqual({ top10_share: null, top20_share: null });
   });
 
-  it('accepts direct provider market metrics without promoting a partial product sample', async () => {
+  it('does not accept legacy statistics aliases for research totals or cohort medians', async () => {
     database = fixtureDatabase();
     const port = fixturePort({
+      async fetchMarketResearchSummary(input) {
+        return { data: { marketplace: input.marketplace,
+          nodeIdPath: input.nodeIdPath, totalProducts: 100, topProducts: 2 }, provenance };
+      },
       async fetchMarketStatistics() {
         return { data: { marketplace: 'US', nodeIdPath: NODE_PATH, month: '2026-08',
-          products: 100, totalUnits: 12000, medianPrice: 42,
+          products: 100, totalUnits: 12000, avgPrice: 40, medianPrice: 42,
           medianReviews: 300, top10Share: 18.5 }, provenance };
       },
     });
@@ -232,8 +617,8 @@ describe('SellerSprite real-data sync', () => {
       SELECT monthly_sales, median_price, median_reviews, top10_share, top20_share
       FROM market_snapshots WHERE market_node_id = 'market-1'
     `).get()).toEqual({
-      monthly_sales: 12000, median_price: 42, median_reviews: 300,
-      top10_share: 18.5, top20_share: null,
+      monthly_sales: null, median_price: null, median_reviews: null,
+      top10_share: null, top20_share: null,
     });
   });
 
@@ -254,6 +639,14 @@ describe('SellerSprite real-data sync', () => {
     });
     await expect(new SellerSpriteSyncService(database, mismatchedConcentration)
       .syncMarket({ marketId: 'market-1', month: '202608' })).rejects.toThrow(/节点|node/i);
+    const mismatchedResearch = fixturePort({
+      async fetchMarketResearchSummary() {
+        return { data: { marketplace: 'US', nodeIdPath: 'other-node', totalProducts: 100 },
+          provenance };
+      },
+    });
+    await expect(new SellerSpriteSyncService(database, mismatchedResearch)
+      .syncMarket({ marketId: 'market-1', month: '202608' })).rejects.toThrow(/节点|node/i);
     expect(count('market_snapshots')).toBe(0);
   });
 
@@ -268,8 +661,15 @@ describe('SellerSprite real-data sync', () => {
     await expect(new SellerSpriteSyncService(database, wrongMonth)
       .syncMarket({ marketId: 'market-1', month: '202608' })).rejects.toThrow(/月份|month/i);
     const nullOnly = fixturePort({
+      async fetchMarketResearchSummary(input) {
+        return { data: { marketplace: input.marketplace,
+          nodeIdPath: input.nodeIdPath }, provenance };
+      },
       async fetchMarketStatistics() {
         return { data: { marketplace: 'US', nodeIdPath: NODE_PATH }, provenance };
+      },
+      async fetchMarketConcentration() {
+        return { data: [], provenance };
       },
     });
     await expect(new SellerSpriteSyncService(database, nullOnly)
@@ -290,6 +690,42 @@ describe('SellerSprite real-data sync', () => {
       .syncMarket({ marketId: 'market-1', month: '202608' })).rejects.toThrow(/月份|month/i);
     expect(count('market_snapshots')).toBe(0);
   });
+
+  it.each(['research', 'statistics', 'concentration'] as const)(
+    'fails standalone market sync when %s cannot certify the requested month', async (capability) => {
+      database = fixtureDatabase();
+      const base = fixturePort();
+      const port = fixturePort({
+        async fetchMarketResearchSummary(input, context) {
+          if (capability === 'research' && context?.requireObservationMonth) {
+            throw new Error('SellerSprite research cannot certify observation month');
+          }
+          return base.fetchMarketResearchSummary(input, context);
+        },
+        async fetchMarketStatistics(input, context) {
+          if (capability === 'statistics' && context?.requireObservationMonth) {
+            throw new Error('SellerSprite statistics cannot certify observation month');
+          }
+          return base.fetchMarketStatistics(input, context);
+        },
+        async fetchMarketConcentration(input, context) {
+          if (capability === 'concentration' && context?.requireObservationMonth) {
+            throw new Error('SellerSprite concentration cannot certify observation month');
+          }
+          return base.fetchMarketConcentration(input, context);
+        },
+      });
+
+      await expect(new SellerSpriteSyncService(database, port)
+        .syncMarket({ marketId: 'market-1', month: '202608' }))
+        .rejects.toThrow(/cannot certify observation month/);
+      expect(count('market_snapshots')).toBe(0);
+      expect(database.prepare('SELECT COUNT(*) AS count FROM metric_facts').get())
+        .toEqual({ count: 0 });
+      expect(database.prepare("SELECT status FROM data_tasks WHERE task_type = 'market_refresh'").get())
+        .toEqual({ status: 'failed' });
+    },
+  );
 
   it('rejects a day-specific market request instead of silently dropping the day', async () => {
     database = fixtureDatabase();
@@ -347,7 +783,8 @@ describe('SellerSprite real-data sync', () => {
     expect(database.prepare(`SELECT COUNT(*) AS count FROM metric_facts
       WHERE entity_type = 'market' AND observation_date = '2026-08-31'`).get())
       .toEqual({ count: 0 });
-    expect(database.prepare(`SELECT status FROM data_tasks ORDER BY created_at, id`).all())
+    expect(database.prepare(`SELECT status FROM data_tasks
+      WHERE task_type <> 'file_import' ORDER BY created_at, id`).all())
       .toEqual([{ status: 'failed' }, { status: 'failed' }]);
   });
 
@@ -815,9 +1252,13 @@ describe('SellerSprite real-data sync', () => {
   it('selects the actual SellerSprite market fact over an alternate source', async () => {
     database = fixtureDatabase();
     const port = fixturePort({
+      async fetchMarketResearchSummary() {
+        return { data: { marketplace: 'US', nodeIdPath: NODE_PATH,
+          totalProducts: 2, topProducts: 2, totalUnits: 30 }, provenance };
+      },
       async fetchMarketStatistics() {
         return { data: { marketplace: 'US', nodeIdPath: NODE_PATH,
-          products: 2, totalUnits: 30 }, provenance };
+          products: 2 }, provenance };
       },
     });
     await new SellerSpriteSyncService(database, port)
@@ -845,7 +1286,12 @@ describe('SellerSprite real-data sync', () => {
 
   it('makes persisted MCP facts resolvable by the authoritative read path', async () => {
     database = fixtureDatabase();
-    const service = new SellerSpriteSyncService(database, fixturePort());
+    const service = new SellerSpriteSyncService(database, fixturePort({
+      async fetchMarketResearchSummary(input) {
+        return { data: { marketplace: input.marketplace,
+          nodeIdPath: input.nodeIdPath, totalProducts: 2 }, provenance };
+      },
+    }));
     await service.syncMarket({ marketId: 'market-1', month: '202608' });
     await service.syncOwnedProduct({ productId: 'owned-1' });
     const resolver = new MetricAuthorityResolver(database);
@@ -869,6 +1315,7 @@ describe('SellerSprite real-data sync', () => {
       VALUES ('owned-2', 'B0OWNED002', 'SKU-02', 'Owned', 'Second child', '',
         'US', 'pillow', 1, 'market-1', 'import', '2026-09-01T00:00:00Z')
     `).run();
+    seedConfirmedOwnedRoster(database);
     const port = fixturePort({
       async fetchAsinSalesTrend(input) {
         return { data: { asin: { asin: input.asin, marketplace: input.marketplace,
@@ -932,7 +1379,8 @@ describe('SellerSprite real-data sync', () => {
       .syncOwnedProduct({ productId: 'owned-1' })).rejects.toThrow(/自有产品|市场节点/);
 
     expect(calls).toBe(0);
-    expect(database.prepare(`SELECT COUNT(*) AS count FROM data_tasks`).get()).toEqual({ count: 0 });
+    expect(database.prepare(`SELECT COUNT(*) AS count FROM data_tasks
+      WHERE task_type <> 'file_import'`).get()).toEqual({ count: 0 });
   });
 
   it('rejects a critical run when an active real owned SKU is outside the main-market tree', async () => {
@@ -1051,6 +1499,20 @@ describe('SellerSprite real-data sync', () => {
     const requests: Array<{ capability: string; month: string | undefined; runId: string | undefined }> = [];
     const base = fixturePort();
     const port = fixturePort({
+      async fetchMarketResearchSummary(input, context) {
+        requests.push({ capability: 'research', month: input.month, runId: context?.runId });
+        const current = input.month === '202608';
+        return {
+          data: {
+            marketplace: input.marketplace, nodeIdPath: input.nodeIdPath, month: input.month,
+            totalProducts: 2, topProducts: 2,
+            totalUnits: current ? 1_200 : 1_000,
+            totalRevenue: current ? 48_000 : 40_000,
+            top10ProductCrn: 25, top20ProductCrn: 40,
+          },
+          provenance,
+        };
+      },
       async fetchMarketStatistics(input, context) {
         requests.push({ capability: 'statistics', month: input.month, runId: context?.runId });
         const current = input.month === '202608';
@@ -1077,8 +1539,10 @@ describe('SellerSprite real-data sync', () => {
 
     expect(result.marketSnapshots).toBe(2);
     expect(requests.map(({ capability, month }) => ({ capability, month }))).toEqual([
+      { capability: 'research', month: '202608' },
       { capability: 'statistics', month: '202608' },
       { capability: 'concentration', month: '202608' },
+      { capability: 'research', month: '202607' },
       { capability: 'statistics', month: '202607' },
       { capability: 'concentration', month: '202607' },
     ]);
@@ -1116,7 +1580,7 @@ describe('SellerSprite real-data sync', () => {
         return {
           data: {
             marketplace: input.marketplace, nodeIdPath: input.nodeIdPath, month: input.month,
-            products: 100, newProductShare, newProductProportion,
+            products: 100, avgPrice: 40, newProductShare, newProductProportion,
           },
           provenance,
         };
@@ -1152,8 +1616,16 @@ describe('SellerSprite real-data sync', () => {
       ) VALUES ('owned-child', 'B0OWNED002', 'SKU-02', 'Owned', 'Child Pillow', '', 'US',
         'memory_foam_pillow', 1, 'child-market', 'import', '2026-09-01');
     `);
+    seedConfirmedOwnedRoster(database);
     const requests: Array<{ path: string; month: string | undefined; runId: string | undefined }> = [];
     const port = fixturePort({
+      async fetchMarketResearchSummary(input, context) {
+        requests.push({ path: input.nodeIdPath, month: input.month, runId: context?.runId });
+        return { data: {
+          marketplace: input.marketplace, nodeIdPath: input.nodeIdPath, month: input.month,
+          totalProducts: 20, totalUnits: input.month === '202608' ? 120 : 100,
+        }, provenance };
+      },
       async fetchMarketStatistics(input, context) {
         requests.push({ path: input.nodeIdPath, month: input.month, runId: context?.runId });
         return { data: {
@@ -1173,9 +1645,9 @@ describe('SellerSprite real-data sync', () => {
     const scopes = [NODE_PATH, childPath].flatMap((path) => ['202607', '202608']
       .map((month) => `${path}/${month}`));
     expect(result).toMatchObject({ marketSnapshots: 4, productSnapshots: 4 });
-    expect(requests).toHaveLength(8);
+    expect(requests).toHaveLength(12);
     expect(requests.map((item) => `${item.path}/${item.month}`).sort())
-      .toEqual([...scopes, ...scopes].sort());
+      .toEqual([...scopes, ...scopes, ...scopes].sort());
     expect(requests.every((item) => item.runId === result.runId)).toBe(true);
     expect(database.prepare(`SELECT total, success, failed FROM data_tasks WHERE id = ?`)
       .get(result.runId)).toEqual({ total: 4, success: 4, failed: 0 });
@@ -1252,7 +1724,7 @@ describe('SellerSprite real-data sync', () => {
       async fetchMarketStatistics(input) {
         return { data: {
           marketplace: input.marketplace, nodeIdPath: input.nodeIdPath,
-          month: input.month, products: 20, totalUnits: 100,
+          month: input.month, products: 20, totalUnits: 100, avgPrice: 40,
         }, provenance };
       },
       async fetchMarketConcentration() { return { data: [], provenance }; },
@@ -1386,8 +1858,8 @@ describe('SellerSprite real-data sync', () => {
       .syncCriticalBatch({ marketId: 'market-1', month: '202608' });
     const changed = fixturePort({
       async fetchMarketStatistics() {
-        return { data: { marketplace: 'US', nodeIdPath: NODE_PATH, products: 3,
-          brands: 2, sellers: 2, avgPrice: 40, avgRating: 4.4 }, provenance };
+        return { data: { marketplace: 'US', nodeIdPath: NODE_PATH, products: 2,
+          brands: 3, sellers: 2, avgPrice: 40, avgRating: 4.4 }, provenance };
       },
     });
 
@@ -1411,9 +1883,10 @@ describe('SellerSprite real-data sync', () => {
     database = fixtureDatabase();
     const base = fixturePort();
     const healthy = fixturePort({
-      async fetchMarketStatistics(input) {
-        const result = await base.fetchMarketStatistics(input);
-        return { ...result, data: { ...result.data, totalUnits: 450 } };
+      async fetchMarketResearchSummary(input, context) {
+        const result = await base.fetchMarketResearchSummary(input, context);
+        return { ...result, data: { ...result.data,
+          totalProducts: 2, topProducts: 2, totalUnits: 450 } };
       },
     });
     await new SellerSpriteSyncService(database, healthy)

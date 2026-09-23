@@ -9,6 +9,7 @@ import { WorkflowRepository } from '../repository/workflow-repository.js';
 import { SellerSpriteSyncService } from '../services/sellersprite-sync-service.js';
 import { GoLiveMigrationService } from '../services/go-live-migration-service.js';
 import { WorkflowOrchestrator } from '../services/workflow-orchestrator.js';
+import { seedConfirmedOwnedRoster } from '../test-utils/owned-roster-declaration.js';
 
 describe('SellerSpriteMCPAdapter', () => {
   it('pins callable tool schemas to each run when two run discoveries interleave', async () => {
@@ -120,21 +121,39 @@ describe('SellerSpriteMCPAdapter', () => {
           1, 'market-live', 'active', 'import', '2026-09-20T00:00:00Z')`)
           .run(id, asin, id);
       }
+      seedConfirmedOwnedRoster(database);
       const transport = new AdapterTransport();
       transport.marketToolsRequireMonth = true;
       transport.echoConcentrationMonth = true;
+      transport.concentrationItems = transport.concentrationItems.map((item) => ({
+        ...item, reviews: item.ratings,
+      }));
       transport.marketStatisticsByMonth = {
         '202607': {
           marketplace: 'US', nodeIdPath: '1055398:1063252', month: '202607',
-          products: 100, brands: 68, sellers: 64, totalUnits: 1_000, totalRevenue: 40_000,
+          products: 2, brands: 2, sellers: 2, totalUnits: 1_000, totalRevenue: 40_000,
           avgPrice: 40, medianPrice: 39, avgRating: 4.2, medianReviews: 90,
           top10Share: 24, top20Share: 39, newProductShare: 9,
         },
         '202608': {
           marketplace: 'US', nodeIdPath: '1055398:1063252', month: '202608',
-          products: 120, brands: 71, sellers: 69, totalUnits: 1_200, totalRevenue: 48_000,
+          products: 2, brands: 2, sellers: 2, totalUnits: 1_200, totalRevenue: 48_000,
           avgPrice: 42, medianPrice: 41, avgRating: 4.3, medianReviews: 100,
           top10Share: 25, top20Share: 40, newProductShare: 10,
+        },
+      };
+      transport.marketResearchByMonth = {
+        '202607': {
+          marketplace: 'US', nodeIdPath: '1055398:1063252',
+          totalProducts: 2, topProducts: 2, totalUnits: 1_000, totalRevenue: 40_000,
+          top10ProductSales: 1_000, top20ProductSales: 1_000,
+          top10ProductCrn: 1, top20ProductCrn: 1,
+        },
+        '202608': {
+          marketplace: 'US', nodeIdPath: '1055398:1063252',
+          totalProducts: 2, topProducts: 2, totalUnits: 1_200, totalRevenue: 48_000,
+          top10ProductSales: 1_200, top20ProductSales: 1_200,
+          top10ProductCrn: 1, top20ProductCrn: 1,
         },
       };
       transport.salesTrendPoints = [
@@ -353,7 +372,259 @@ describe('SellerSpriteMCPAdapter', () => {
     })).resolves.toMatchObject({ data: { products: 100 } });
   });
 
-  it('rejects critical monthly market data unless schema and response both certify the month', async () => {
+  it('certifies exact documented market tools from a fresh run schema without response month echoes', async () => {
+    const database = openDatabase(':memory:');
+    try {
+      const runId = '123e4567-e89b-42d3-a456-426614174050';
+      database.prepare(`INSERT INTO data_tasks (
+        id, name, task_type, target, source, marketplace, status, created_at
+      ) VALUES (?, 'Critical sync', 'critical_sync', 'market-1',
+        'SellerSprite MCP', 'US', 'running', '2026-09-20T00:00:00.000Z')`).run(runId);
+      const transport = new AdapterTransport();
+      transport.marketToolsRequireMonth = true;
+      transport.marketStatisticsByMonth = {
+        '202607': { marketplace: 'US', nodeIdPath: '1055398:1063252', month: null, avgUnits: 100 },
+        '202608': { marketplace: 'US', nodeIdPath: '1055398:1063252', avgUnits: 180 },
+      };
+      transport.concentrationItems = [
+        { asin: 'B000TEST01', marketplace: null, nodeIdPath: null, month: null, totalUnitsRatio: 0.1 },
+      ];
+      const adapter = new SellerSpriteMCPAdapter({
+        database,
+        client: new SellerSpriteMcpClient({ transport,
+          ledgerStore: new SqliteMcpCallLedgerStore(database),
+          cacheStore: new SqliteMcpResponseCacheStore(database) }),
+      });
+      const context = { runId, requireObservationMonth: true };
+      const input = { marketplace: 'US', nodeIdPath: '1055398:1063252' };
+
+      const july = await adapter.fetchMarketStatistics({ ...input, month: '202607' }, context);
+      const august = await adapter.fetchMarketStatistics({ ...input, month: '202608' }, context);
+      const concentration = await adapter.fetchMarketConcentration({ ...input, month: '202608' }, context);
+
+      expect([july.data.avgUnits, august.data.avgUnits]).toEqual([100, 180]);
+      expect(concentration.data).toHaveLength(1);
+      expect(transport.listToolsCallCount).toBe(1);
+      expect(transport.calls).toHaveLength(3);
+      const snapshot = database.prepare(`SELECT capabilities_json FROM provider_capability_snapshots
+        WHERE sync_run_id = ?`).get(runId) as { capabilities_json: string };
+      const hashes = (JSON.parse(snapshot.capabilities_json) as {
+        capabilitySchemaHashes: Record<string, string>;
+      }).capabilitySchemaHashes;
+      const rows = database.prepare(`SELECT capability, status, cache_hit, observation_month,
+        response_metadata_json FROM mcp_call_logs WHERE capability <> 'LIST_TOOLS'
+        ORDER BY rowid`).all() as Array<Record<string, unknown>>;
+      expect(rows.map(({ capability, status, cache_hit, observation_month, response_metadata_json }) => ({
+        capability, status, cache_hit, observation_month,
+        observationCertification: (JSON.parse(response_metadata_json as string) as Record<string, unknown>)
+          .observationCertification,
+      }))).toEqual([
+        { capability: 'MARKET_STATISTICS', status: 'success', cache_hit: 0, observation_month: '202607',
+          observationCertification: { method: 'documented_request_v1', schemaHash: hashes.MARKET_STATISTICS } },
+        { capability: 'MARKET_STATISTICS', status: 'success', cache_hit: 0, observation_month: '202608',
+          observationCertification: { method: 'documented_request_v1', schemaHash: hashes.MARKET_STATISTICS } },
+        { capability: 'PRODUCT_CONCENTRATION', status: 'success', cache_hit: 0, observation_month: '202608',
+          observationCertification: { method: 'documented_request_v1', schemaHash: hashes.PRODUCT_CONCENTRATION } },
+      ]);
+      expect(hashes.MARKET_STATISTICS).toMatch(/^[a-f0-9]{64}$/);
+      expect(JSON.stringify(rows)).not.toMatch(/avgUnits|totalUnitsRatio|secret-key|"request"/i);
+    } finally { database.close(); }
+  });
+
+  it('returns the unique exact market research summary and certifies the documented request', async () => {
+    const database = openDatabase(':memory:');
+    try {
+      const runId = '123e4567-e89b-42d3-a456-426614174060';
+      database.prepare(`INSERT INTO data_tasks (
+        id, name, task_type, target, source, marketplace, status, created_at
+      ) VALUES (?, 'Critical sync', 'critical_sync', 'market-1',
+        'SellerSprite MCP', 'US', 'running', '2026-09-20T00:00:00.000Z')`).run(runId);
+      const transport = new AdapterTransport();
+      transport.marketToolsRequireMonth = true;
+      transport.marketToolsSupportReturnFields = true;
+      transport.marketItems = [
+        {
+          marketplace: 'US', nodeIdPath: '1055398:1063252:other', month: null,
+          totalProducts: 9, totalUnits: 90, totalRevenue: 900,
+          top10ProductCrn: 0.9, top20ProductCrn: 0.95,
+        },
+        {
+          marketplace: 'US', nodeIdPath: '1055398:1063252', month: null,
+          totalProducts: 100, totalUnits: 1_200, totalRevenue: 48_000,
+          top10ProductCrn: 0.25, top20ProductCrn: 0.4,
+        },
+      ];
+      const adapter = new SellerSpriteMCPAdapter({ database, client: new SellerSpriteMcpClient({
+        transport, ledgerStore: new SqliteMcpCallLedgerStore(database),
+        cacheStore: new SqliteMcpResponseCacheStore(database),
+      }) });
+
+      const result = await adapter.fetchMarketResearchSummary({
+        marketplace: 'US', nodeIdPath: '1055398:1063252', month: '202608',
+      }, { runId, requireObservationMonth: true });
+
+      expect(result).toMatchObject({
+        data: {
+          marketplace: 'US', nodeIdPath: '1055398:1063252',
+          totalProducts: 100, totalUnits: 1_200, totalRevenue: 48_000,
+          top10ProductCrn: 0.25, top20ProductCrn: 0.4,
+        },
+        provenance: { source: 'SellerSprite MCP', sourceType: 'mcp', period: 'monthly' },
+      });
+      expect(transport.calls).toEqual([{
+        name: 'market_research',
+        arguments: { request: {
+          marketplace: 'US', nodeIdPath: '1055398:1063252', month: '202608',
+          returnFields: 'marketplace,nodeIdPath,month,totalProducts,topProducts,totalUnits,totalRevenue,avgUnits,avgRevenue,avgPrice,avgRatings,avgRating,brands,sellers,top10ProductSales,top10ProductCrn,top20ProductSales,top20ProductCrn,newProductProportion',
+        } },
+      }]);
+      const row = database.prepare(`SELECT capability, status, cache_hit, observation_month,
+        response_metadata_json FROM mcp_call_logs WHERE capability = 'MARKET_RESEARCH'`).get() as {
+          capability: string; status: string; cache_hit: number; observation_month: string;
+          response_metadata_json: string;
+        };
+      expect({ ...row, response_metadata_json: undefined }).toEqual({
+        capability: 'MARKET_RESEARCH', status: 'success', cache_hit: 0,
+        observation_month: '202608', response_metadata_json: undefined,
+      });
+      expect(JSON.parse(row.response_metadata_json)).toMatchObject({
+        observationCertification: {
+          method: 'documented_request_v1', schemaHash: expect.stringMatching(/^[a-f0-9]{64}$/),
+        },
+      });
+    } finally { database.close(); }
+  });
+
+  it.each([
+    ['empty items', []],
+    ['no exact scope', [{ marketplace: 'US', nodeIdPath: 'other', totalProducts: 1 }]],
+    ['duplicate exact scope', [
+      { marketplace: 'US', nodeIdPath: '1055398:1063252', totalProducts: 100 },
+      { marketplace: 'us', nodeIdPath: '1055398:1063252', totalProducts: 101 },
+    ]],
+    ['explicit wrong month', [
+      { marketplace: 'US', nodeIdPath: '1055398:1063252', month: '202607', totalProducts: 100 },
+    ]],
+  ])('rejects market research summary with %s', async (_scenario, marketItems) => {
+    const transport = new AdapterTransport();
+    transport.marketToolsRequireMonth = true;
+    transport.marketItems = marketItems;
+    const adapter = new SellerSpriteMCPAdapter({ client: new SellerSpriteMcpClient({ transport }) });
+
+    await expect(adapter.fetchMarketResearchSummary({
+      marketplace: 'US', nodeIdPath: '1055398:1063252', month: '202608',
+    }, {
+      runId: '123e4567-e89b-42d3-a456-426614174061', requireObservationMonth: true,
+    })).rejects.toMatchObject({ code: 'INVALID_SCHEMA' });
+  });
+
+  it('does not log or cache a successful non-critical summary before unique scope validation', async () => {
+    const database = openDatabase(':memory:');
+    try {
+      const transport = new AdapterTransport();
+      transport.marketItems = [
+        { marketplace: 'US', nodeIdPath: '1055398:1063252', totalProducts: 100 },
+        { marketplace: 'US', nodeIdPath: '1055398:1063252', totalProducts: 101 },
+      ];
+      const adapter = new SellerSpriteMCPAdapter({ client: new SellerSpriteMcpClient({
+        transport, ledgerStore: new SqliteMcpCallLedgerStore(database),
+        cacheStore: new SqliteMcpResponseCacheStore(database),
+      }) });
+
+      await expect(adapter.fetchMarketResearchSummary({
+        marketplace: 'US', nodeIdPath: '1055398:1063252', month: '202608',
+      })).rejects.toMatchObject({ code: 'INVALID_SCHEMA' });
+
+      expect(database.prepare(`SELECT status, error_code AS errorCode FROM mcp_call_logs
+        WHERE capability = 'MARKET_RESEARCH'`).get()).toEqual({
+        status: 'failed', errorCode: 'INVALID_SCHEMA',
+      });
+      expect(database.prepare('SELECT COUNT(*) AS count FROM mcp_response_cache').get())
+        .toEqual({ count: 0 });
+    } finally { database.close(); }
+  });
+
+  it('requires a fresh run and a discovered string month for critical market research', async () => {
+    const withoutFreshRun = new AdapterTransport();
+    withoutFreshRun.marketToolsRequireMonth = true;
+    withoutFreshRun.marketItems = [{
+      marketplace: 'US', nodeIdPath: '1055398:1063252', month: '202608', totalProducts: 100,
+    }];
+    const noRunAdapter = new SellerSpriteMCPAdapter({
+      client: new SellerSpriteMcpClient({ transport: withoutFreshRun }),
+    });
+    await expect(noRunAdapter.fetchMarketResearchSummary({
+      marketplace: 'US', nodeIdPath: '1055398:1063252', month: '202608',
+    }, { requireObservationMonth: true })).rejects.toMatchObject({ code: 'INVALID_SCHEMA' });
+    expect(withoutFreshRun.calls).toHaveLength(0);
+
+    const nonStringMonth = new AdapterTransport();
+    nonStringMonth.marketToolsRequireMonth = true;
+    nonStringMonth.marketMonthType = 'number';
+    const wrongSchemaAdapter = new SellerSpriteMCPAdapter({
+      client: new SellerSpriteMcpClient({ transport: nonStringMonth }),
+    });
+    await expect(wrongSchemaAdapter.fetchMarketResearchSummary({
+      marketplace: 'US', nodeIdPath: '1055398:1063252', month: '202608',
+    }, {
+      runId: '123e4567-e89b-42d3-a456-426614174062', requireObservationMonth: true,
+    })).rejects.toMatchObject({ code: 'INVALID_SCHEMA' });
+    expect(nonStringMonth.calls).toHaveLength(0);
+  });
+
+  it('keeps market research aliases on response-echo certification', async () => {
+    class ResearchAliasTransport extends AdapterTransport {
+      override async listTools(): Promise<unknown> {
+        const result = await super.listTools() as { tools: Array<{ name: string }> };
+        result.tools = result.tools.map((entry) => entry.name === 'market_research'
+          ? { ...entry, name: 'market_research_v2' } : entry);
+        return result;
+      }
+    }
+    const database = openDatabase(':memory:');
+    try {
+      const runId = '123e4567-e89b-42d3-a456-426614174063';
+      database.prepare(`INSERT INTO data_tasks (
+        id, name, task_type, target, source, marketplace, status, created_at
+      ) VALUES (?, 'Critical sync', 'critical_sync', 'market-1',
+        'SellerSprite MCP', 'US', 'running', '2026-09-20T00:00:00.000Z')`).run(runId);
+      const transport = new ResearchAliasTransport();
+      transport.marketToolsRequireMonth = true;
+      transport.marketItems = [{
+        marketplace: 'US', nodeIdPath: '1055398:1063252', totalProducts: 100,
+      }];
+      transport.responseData = { items: transport.marketItems };
+      const adapter = new SellerSpriteMCPAdapter({ database, client: new SellerSpriteMcpClient({
+        transport, ledgerStore: new SqliteMcpCallLedgerStore(database),
+        cacheStore: new SqliteMcpResponseCacheStore(database),
+      }) });
+      const input = { marketplace: 'US', nodeIdPath: '1055398:1063252', month: '202608' };
+      const context = { runId, requireObservationMonth: true };
+
+      await expect(adapter.fetchMarketResearchSummary(input, context))
+        .rejects.toMatchObject({ code: 'INVALID_SCHEMA' });
+      transport.marketItems = [{ ...transport.marketItems[0], month: '202608' }];
+      transport.responseData = { items: transport.marketItems };
+      await expect(adapter.fetchMarketResearchSummary(input, context))
+        .resolves.toMatchObject({ data: { totalProducts: 100 } });
+
+      const rows = database.prepare(`SELECT status, response_metadata_json FROM mcp_call_logs
+        WHERE capability = 'MARKET_RESEARCH' ORDER BY rowid`).all() as Array<{
+          status: string; response_metadata_json: string;
+        }>;
+      expect(rows.map(({ status, response_metadata_json }) => ({
+        status,
+        method: (JSON.parse(response_metadata_json) as {
+          observationCertification?: { method: string };
+        }).observationCertification?.method ?? null,
+      }))).toEqual([
+        { status: 'failed', method: null },
+        { status: 'success', method: 'response_echo_v1' },
+      ]);
+    } finally { database.close(); }
+  });
+
+  it('requires a month argument and uses response echoes without a fresh run', async () => {
     const noMonthSchema = new AdapterTransport();
     const withoutSchema = new SellerSpriteMCPAdapter({
       client: new SellerSpriteMcpClient({ transport: noMonthSchema }),
@@ -363,32 +634,225 @@ describe('SellerSpriteMCPAdapter', () => {
     }, { runId: '123e4567-e89b-42d3-a456-426614174000', requireObservationMonth: true }))
       .rejects.toMatchObject({ code: 'INVALID_SCHEMA' });
 
-    const noMonthEcho = new AdapterTransport();
-    noMonthEcho.marketToolsRequireMonth = true;
-    const withoutEcho = new SellerSpriteMCPAdapter({
-      client: new SellerSpriteMcpClient({ transport: noMonthEcho }),
+    const noFreshRun = new AdapterTransport();
+    noFreshRun.marketToolsRequireMonth = true;
+    const withoutFreshRun = new SellerSpriteMCPAdapter({
+      client: new SellerSpriteMcpClient({ transport: noFreshRun }),
     });
-    await expect(withoutEcho.fetchMarketStatistics({
+    await expect(withoutFreshRun.fetchMarketStatistics({
       marketplace: 'US', nodeIdPath: '1055398:1063252', month: '202608',
-    }, { runId: '123e4567-e89b-42d3-a456-426614174000', requireObservationMonth: true }))
+    }, { requireObservationMonth: true }))
       .rejects.toMatchObject({ code: 'INVALID_SCHEMA' });
 
-    noMonthEcho.responseData = [
+    noFreshRun.responseData = [
       { asin: 'B000TEST01', marketplace: 'US', nodeIdPath: '1055398:1063252' },
     ];
-    await expect(withoutEcho.fetchMarketConcentration({
+    await expect(withoutFreshRun.fetchMarketConcentration({
       marketplace: 'US', nodeIdPath: '1055398:1063252', month: '202608',
-    }, { runId: '123e4567-e89b-42d3-a456-426614174000', requireObservationMonth: true }))
+    }, { requireObservationMonth: true }))
       .rejects.toMatchObject({ code: 'INVALID_SCHEMA' });
   });
+
+  it('rejects a critical string month when the discovered schema declares another type', async () => {
+    const transport = new AdapterTransport();
+    transport.marketToolsRequireMonth = true;
+    transport.marketMonthType = 'number';
+    transport.responseData = {
+      marketplace: 'US', nodeIdPath: '1055398:1063252', month: '202608', products: 100,
+    };
+    const adapter = new SellerSpriteMCPAdapter({ client: new SellerSpriteMcpClient({ transport }) });
+    const input = { marketplace: 'US', nodeIdPath: '1055398:1063252', month: '202608' };
+    const context = { runId: '123e4567-e89b-42d3-a456-426614174051', requireObservationMonth: true };
+
+    await expect(adapter.fetchMarketStatistics(input, context))
+      .rejects.toMatchObject({ code: 'INVALID_SCHEMA' });
+    expect(transport.calls).toHaveLength(0);
+  });
+
+  it.each(['2026-08', '202613', 'nearly'])('rejects non-yyyyMM critical month %s before a provider call', async (month) => {
+    const transport = new AdapterTransport();
+    transport.marketToolsRequireMonth = true;
+    const adapter = new SellerSpriteMCPAdapter({ client: new SellerSpriteMcpClient({ transport }) });
+
+    await expect(adapter.fetchMarketStatistics({ marketplace: 'US', nodeIdPath: '1055398:1063252', month }, {
+      runId: '123e4567-e89b-42d3-a456-426614174052', requireObservationMonth: true,
+    })).rejects.toMatchObject({ code: 'INVALID_SCHEMA' });
+    expect(transport.calls).toHaveLength(0);
+  });
+
+  it('keeps aliases on response echo with complete scope and logs only successful certification', async () => {
+    class AliasTransport extends AdapterTransport {
+      override async listTools(): Promise<unknown> {
+        const result = await super.listTools() as { tools: Array<{ name: string }> };
+        result.tools = result.tools.map((entry) => ({ ...entry,
+          name: entry.name === 'market_research_statistics' ? 'market_statistics'
+            : entry.name === 'market_product_concentration' ? 'product_concentration' : entry.name,
+        }));
+        return result;
+      }
+    }
+    const database = openDatabase(':memory:');
+    try {
+      const runId = '123e4567-e89b-42d3-a456-426614174053';
+      database.prepare(`INSERT INTO data_tasks (
+        id, name, task_type, target, source, marketplace, status, created_at
+      ) VALUES (?, 'Critical sync', 'critical_sync', 'market-1',
+        'SellerSprite MCP', 'US', 'running', '2026-09-20T00:00:00.000Z')`).run(runId);
+      const transport = new AliasTransport();
+      transport.marketToolsRequireMonth = true;
+      const adapter = new SellerSpriteMCPAdapter({ database, client: new SellerSpriteMcpClient({
+        transport, ledgerStore: new SqliteMcpCallLedgerStore(database),
+        cacheStore: new SqliteMcpResponseCacheStore(database),
+      }) });
+      const input = { marketplace: 'US', nodeIdPath: '1055398:1063252', month: '202608' };
+      const context = { runId, requireObservationMonth: true };
+      transport.responseData = { marketplace: input.marketplace, nodeIdPath: input.nodeIdPath, products: 100 };
+      await expect(adapter.fetchMarketStatistics(input, context)).rejects.toMatchObject({ code: 'INVALID_SCHEMA' });
+      transport.responseData = [{ asin: 'B000TEST01', totalUnitsRatio: 0.1 }];
+      await expect(adapter.fetchMarketConcentration(input, context)).rejects.toMatchObject({ code: 'INVALID_SCHEMA' });
+      expect(database.prepare('SELECT COUNT(*) AS total FROM mcp_response_cache').get()).toEqual({ total: 0 });
+
+      transport.responseData = { ...input, products: 100 };
+      await adapter.fetchMarketStatistics(input, context);
+      transport.responseData = [{ ...input, asin: 'B000TEST01', totalUnitsRatio: 0.1 }];
+      await adapter.fetchMarketConcentration(input, context);
+      const rows = database.prepare(`SELECT status, error_code, response_metadata_json
+        FROM mcp_call_logs WHERE capability <> 'LIST_TOOLS' ORDER BY rowid`).all() as Array<{
+          status: string; error_code: string | null; response_metadata_json: string;
+        }>;
+      expect(rows.map(({ status, error_code, response_metadata_json }) => ({
+        status, error_code,
+        method: (JSON.parse(response_metadata_json) as { observationCertification?: { method: string } })
+          .observationCertification?.method ?? null,
+      }))).toEqual([
+        { status: 'failed', error_code: 'INVALID_SCHEMA', method: null },
+        { status: 'failed', error_code: 'INVALID_SCHEMA', method: null },
+        { status: 'success', error_code: null, method: 'response_echo_v1' },
+        { status: 'success', error_code: null, method: 'response_echo_v1' },
+      ]);
+      expect(database.prepare('SELECT COUNT(*) AS total FROM mcp_response_cache').get()).toEqual({ total: 2 });
+    } finally { database.close(); }
+  });
+
+  it('revalidates a cached response echo and records the same schema certification', async () => {
+    const database = openDatabase(':memory:');
+    try {
+      const transport = new AdapterTransport();
+      transport.marketToolsRequireMonth = true;
+      transport.responseData = {
+        marketplace: 'US', nodeIdPath: '1055398:1063252', month: '202608', products: 100,
+      };
+      const adapter = new SellerSpriteMCPAdapter({ client: new SellerSpriteMcpClient({
+        transport, ledgerStore: new SqliteMcpCallLedgerStore(database),
+        cacheStore: new SqliteMcpResponseCacheStore(database),
+      }) });
+      const input = { marketplace: 'US', nodeIdPath: '1055398:1063252', month: '202608' };
+
+      await adapter.fetchMarketStatistics(input, { requireObservationMonth: true });
+      await adapter.fetchMarketStatistics(input, { requireObservationMonth: true });
+
+      expect(transport.calls).toHaveLength(1);
+      const rows = database.prepare(`SELECT cache_hit, response_metadata_json FROM mcp_call_logs
+        WHERE capability = 'MARKET_STATISTICS' ORDER BY rowid`).all() as Array<{
+          cache_hit: number; response_metadata_json: string;
+        }>;
+      const certifications = rows.map(({ cache_hit, response_metadata_json }) => ({
+        cache_hit,
+        certification: (JSON.parse(response_metadata_json) as {
+          observationCertification: { method: string; schemaHash: string };
+        }).observationCertification,
+      }));
+      expect(certifications).toEqual([
+        { cache_hit: 0, certification: {
+          method: 'response_echo_v1', schemaHash: expect.stringMatching(/^[a-f0-9]{64}$/),
+        } },
+        { cache_hit: 1, certification: certifications[0].certification },
+      ]);
+    } finally { database.close(); }
+  });
+
+  it('does not certify rejected envelopes, invalid payloads, or empty documented concentration', async () => {
+    const database = openDatabase(':memory:');
+    try {
+      const runId = '123e4567-e89b-42d3-a456-426614174054';
+      database.prepare(`INSERT INTO data_tasks (
+        id, name, task_type, target, source, marketplace, status, created_at
+      ) VALUES (?, 'Critical sync', 'critical_sync', 'market-1',
+        'SellerSprite MCP', 'US', 'running', '2026-09-20T00:00:00.000Z')`).run(runId);
+      const transport = new AdapterTransport();
+      transport.marketToolsRequireMonth = true;
+      const adapter = new SellerSpriteMCPAdapter({ database, client: new SellerSpriteMcpClient({
+        transport, ledgerStore: new SqliteMcpCallLedgerStore(database),
+        cacheStore: new SqliteMcpResponseCacheStore(database),
+        retry: { maxAttempts: 1, baseDelayMs: 1 },
+      }) });
+      const input = { marketplace: 'US', nodeIdPath: '1055398:1063252', month: '202608' };
+      const context = { runId, requireObservationMonth: true };
+      transport.responsePayload = { code: 'DENIED', data: { ...input, products: 100 } };
+      await expect(adapter.fetchMarketStatistics(input, context)).rejects.toMatchObject({ code: 'REMOTE_ERROR' });
+      transport.responsePayload = { code: 'OK', data: { products: 100 } };
+      await expect(adapter.fetchMarketStatistics(input, context)).rejects.toMatchObject({ code: 'INVALID_SCHEMA' });
+      transport.responsePayload = undefined;
+      transport.responseData = [];
+      await expect(adapter.fetchMarketConcentration(input, context)).rejects.toMatchObject({ code: 'INVALID_SCHEMA' });
+      expect(database.prepare('SELECT COUNT(*) AS total FROM mcp_response_cache').get()).toEqual({ total: 0 });
+      const rows = database.prepare(`SELECT status, response_metadata_json FROM mcp_call_logs
+        WHERE capability <> 'LIST_TOOLS' ORDER BY rowid`).all() as Array<{
+          status: string; response_metadata_json: string;
+        }>;
+      expect(rows).toHaveLength(3);
+      expect(rows.every(({ status, response_metadata_json }) => status === 'failed'
+        && !Object.hasOwn(JSON.parse(response_metadata_json) as object, 'observationCertification'))).toBe(true);
+    } finally { database.close(); }
+  });
+
   it.each([
-    ['missing marketplace', { nodeIdPath: '1055398:1063252', month: '202608' }],
+    ['an empty row', [{}]],
+    ['a row without ASIN', [{ totalUnitsRatio: 0.1 }]],
+    ['an invalid ASIN', [{ asin: 'not-an-asin', totalUnitsRatio: 0.1 }]],
+    ['a row without a concentration metric', [{ asin: 'B000TEST01' }]],
+    ['a row with only negative metrics', [{ asin: 'B000TEST01', totalUnits: -1, totalUnitsRatio: -0.1 }]],
+    ['a row with only non-finite metrics', [{ asin: 'B000TEST01', totalRevenue: Number.NaN }]],
+    ['a row with only a price', [{ asin: 'B000TEST01', price: 39 }]],
+    ['a row with only ratings', [{ asin: 'B000TEST01', ratings: 100 }]],
+  ])('does not certify documented concentration containing %s', async (_scenario, responseData) => {
+    const database = openDatabase(':memory:');
+    try {
+      const runId = '123e4567-e89b-42d3-a456-426614174064';
+      database.prepare(`INSERT INTO data_tasks (
+        id, name, task_type, target, source, marketplace, status, created_at
+      ) VALUES (?, 'Critical sync', 'critical_sync', 'market-1',
+        'SellerSprite MCP', 'US', 'running', '2026-09-20T00:00:00.000Z')`).run(runId);
+      const transport = new AdapterTransport();
+      transport.marketToolsRequireMonth = true;
+      transport.responseData = responseData;
+      const adapter = new SellerSpriteMCPAdapter({ database, client: new SellerSpriteMcpClient({
+        transport, ledgerStore: new SqliteMcpCallLedgerStore(database),
+        cacheStore: new SqliteMcpResponseCacheStore(database),
+      }) });
+
+      await expect(adapter.fetchMarketConcentration({
+        marketplace: 'US', nodeIdPath: '1055398:1063252', month: '202608',
+      }, { runId, requireObservationMonth: true })).rejects.toMatchObject({ code: 'INVALID_SCHEMA' });
+
+      expect(database.prepare('SELECT COUNT(*) AS total FROM mcp_response_cache').get()).toEqual({ total: 0 });
+      const row = database.prepare(`SELECT status, response_metadata_json FROM mcp_call_logs
+        WHERE capability = 'PRODUCT_CONCENTRATION'`).get() as {
+          status: string; response_metadata_json: string;
+        };
+      expect(row.status).toBe('failed');
+      expect(JSON.parse(row.response_metadata_json)).not.toHaveProperty('observationCertification');
+    } finally { database.close(); }
+  });
+
+  it.each([
     ['empty marketplace', { marketplace: '', nodeIdPath: '1055398:1063252', month: '202608' }],
     ['wrong marketplace', { marketplace: 'CA', nodeIdPath: '1055398:1063252', month: '202608' }],
-    ['missing nodeIdPath', { marketplace: 'US', month: '202608' }],
     ['empty nodeIdPath', { marketplace: 'US', nodeIdPath: '', month: '202608' }],
     ['wrong nodeIdPath', { marketplace: 'US', nodeIdPath: 'wrong', month: '202608' }],
-  ])('rejects critical concentration items with %s', async (_scenario, scope) => {
+    ['wrong month', { marketplace: 'US', nodeIdPath: '1055398:1063252', month: '202607' }],
+    ['empty month', { marketplace: 'US', nodeIdPath: '1055398:1063252', month: '' }],
+  ])('rejects documented concentration items with explicit %s', async (_scenario, scope) => {
     const transport = new AdapterTransport();
     transport.marketToolsRequireMonth = true;
     transport.responseData = [{ asin: 'B000TEST01', totalUnitsRatio: 0.1, ...scope }];
@@ -649,12 +1113,12 @@ describe('SellerSpriteMCPAdapter', () => {
     ['nested request', false, {
       request: {
         marketplace: 'US', nodeIdPath: 'bed-pillows', month: '202608',
-        returnFields: 'marketplace,nodeIdPath,month,products,sellers,brands,totalUnits,totalRevenue,avgPrice,medianPrice,avgRating,medianReviews,top10Share,top20Share,newProductShare,newProductProportion',
+        returnFields: 'marketplace,nodeIdPath,month,totalProducts,products,sellers,brands,totalUnits,totalRevenue,avgPrice,medianPrice,avgRating,medianReviews,top10Share,top20Share,newProductShare,newProductProportion',
       },
     }],
     ['flat schema', true, {
       marketplace: 'US', nodeIdPath: 'bed-pillows', month: '202608',
-      returnFields: 'marketplace,nodeIdPath,month,products,sellers,brands,totalUnits,totalRevenue,avgPrice,medianPrice,avgRating,medianReviews,top10Share,top20Share,newProductShare,newProductProportion',
+      returnFields: 'marketplace,nodeIdPath,month,totalProducts,products,sellers,brands,totalUnits,totalRevenue,avgPrice,medianPrice,avgRating,medianReviews,top10Share,top20Share,newProductShare,newProductProportion',
     }],
   ])('projects only synchronized statistics fields for a %s supporting returnFields', async (_shape, flatMarketTools, expected) => {
     const transport = new AdapterTransport();
@@ -675,12 +1139,12 @@ describe('SellerSpriteMCPAdapter', () => {
     ['nested request', false, {
       request: {
         marketplace: 'US', nodeIdPath: 'bed-pillows', month: '202608',
-        returnFields: 'marketplace,nodeIdPath,month,asin,title,brand,price,rating,ratings,totalUnits,totalRevenue,totalUnitsRatio,totalRevenueRatio',
+        returnFields: 'marketplace,nodeIdPath,month,asin,title,brand,price,rating,ratings,reviews,totalUnits,totalRevenue,totalUnitsRatio,totalRevenueRatio',
       },
     }],
     ['flat schema', true, {
       marketplace: 'US', nodeIdPath: 'bed-pillows', month: '202608',
-      returnFields: 'marketplace,nodeIdPath,month,asin,title,brand,price,rating,ratings,totalUnits,totalRevenue,totalUnitsRatio,totalRevenueRatio',
+      returnFields: 'marketplace,nodeIdPath,month,asin,title,brand,price,rating,ratings,reviews,totalUnits,totalRevenue,totalUnitsRatio,totalRevenueRatio',
     }],
   ])('projects only synchronized concentration fields for a %s supporting returnFields', async (_shape, flatMarketTools, expected) => {
     const transport = new AdapterTransport();
@@ -878,6 +1342,48 @@ describe('SellerSpriteMCPAdapter', () => {
       .rejects.toMatchObject({ code: 'INVALID_SCHEMA' });
   });
 
+  it('keeps previous snapshots out of strict SellerSprite product arguments', async () => {
+    class StrictProductTransport extends AdapterTransport {
+      override async listTools(): Promise<unknown> {
+        const result = await super.listTools() as {
+          tools: Array<{ name: string; inputSchema: { additionalProperties?: boolean } }>;
+        };
+        result.tools = result.tools.map((entry) => (
+          entry.name === 'asin_sales_trend' || entry.name === 'asin_detail'
+            ? { ...entry, inputSchema: { ...entry.inputSchema, additionalProperties: false } }
+            : entry
+        ));
+        return result;
+      }
+    }
+    const transport = new StrictProductTransport();
+    transport.includeAsinDetail = true;
+    const adapter = new SellerSpriteMCPAdapter({ client: new SellerSpriteMcpClient({ transport }) });
+
+    await expect(adapter.fetchProductDetail({
+      marketplace: 'US',
+      asin: 'B000TEST01',
+      previousSnapshot: {
+        id: 'private-snapshot-id', snapshotAvailable: true, productId: 'US:B000TEST01',
+        date: '2026-06-30', price: 49, rating: 4.5, reviewCount: 300, bsr: 10,
+        estimatedSales: 200, estimatedRevenue: 9_800, sellerCount: 2,
+        growth7d: null, growth30d: null, growth30dAvailable: false, growth90d: null,
+        provenance: {
+          source: 'internal-private-source', sourceType: 'mcp', collectedAt: '2026-06-30T00:00:00Z',
+          period: 'monthly', isEstimated: true, confidence: 0.75,
+        },
+      },
+    })).resolves.toMatchObject({ asin: 'B000TEST01' });
+    expect(transport.calls).toEqual([
+      { name: 'asin_sales_trend', arguments: { marketplace: 'US', asin: 'B000TEST01' } },
+      { name: 'asin_detail', arguments: {
+        marketplace: 'US', asin: 'B000TEST01',
+        returnFields: 'asin,title,brand,parent,nodeIdPath,marketplace',
+      } },
+    ]);
+    expect(JSON.stringify(transport.calls)).not.toMatch(/private-snapshot|internal-private-source/);
+  });
+
   it('falls back field by field to trend identity when optional detail fields are null', async () => {
     const transport = new AdapterTransport();
     transport.includeAsinDetail = true;
@@ -1045,12 +1551,20 @@ class AdapterTransport implements SellerSpriteMcpTransport {
   structuredPayloadByTool: Record<string, Record<string, unknown>> = {};
   marketItems: Array<Record<string, unknown>> = [];
   marketStatisticsByMonth: Record<string, Record<string, unknown>> | undefined;
+  marketResearchByMonth: Record<string, Record<string, unknown>> | undefined;
   concentrationItems: Array<Record<string, unknown>> = [
-    { asin: 'B000TEST01', totalUnitsRatio: 0.1, totalRevenueRatio: 0.12 },
-    { asin: 'B000TEST02', totalUnitsRatio: 0.08, totalRevenueRatio: 0.09 },
+    {
+      asin: 'B000TEST01', price: 39, ratings: 90, totalUnits: 300, totalRevenue: 11_700,
+      totalUnitsRatio: 0.1, totalRevenueRatio: 0.12,
+    },
+    {
+      asin: 'B000TEST02', price: 43, ratings: 110, totalUnits: 240, totalRevenue: 10_320,
+      totalUnitsRatio: 0.08, totalRevenueRatio: 0.09,
+    },
   ];
   flatMarketTools = false;
   marketToolsRequireMonth = false;
+  marketMonthType = 'string';
   marketToolsSupportReturnFields = false;
   marketReturnFieldsType = 'string';
   echoConcentrationMonth = false;
@@ -1078,10 +1592,14 @@ class AdapterTransport implements SellerSpriteMcpTransport {
           if (this.marketToolsSupportReturnFields) {
             result.inputSchema.properties.returnFields = { type: this.marketReturnFieldsType };
           }
+          if (this.marketToolsRequireMonth) {
+            result.inputSchema.properties.month = { type: this.marketMonthType };
+          }
           return result;
         }
       : (name: string) => tool(name, ['request'], {
-          marketplace: {}, nodeIdPath: {}, ...(this.marketToolsRequireMonth ? { month: {} } : {}),
+          marketplace: {}, nodeIdPath: {}, ...(this.marketToolsRequireMonth
+            ? { month: { type: this.marketMonthType } } : {}),
           ...(this.marketToolsSupportReturnFields
             ? { returnFields: { type: this.marketReturnFieldsType } } : {}),
         });
@@ -1097,8 +1615,8 @@ class AdapterTransport implements SellerSpriteMcpTransport {
         ...(this.includeAsinDetail ? [asinDetailTool] : []),
         ...(this.omitCompetitorTool ? [] : [tool('asin_competitor', ['marketplace', 'asin'])]),
         this.flatMarketTools
-          ? tool('market_research', ['marketplace', 'nodeIdPath'])
-          : tool('market_research', ['request'], { marketplace: {} }),
+          ? marketTool('market_research', ['marketplace', 'nodeIdPath'])
+          : marketTool('market_research', ['request']),
       ],
       _meta: { progressToken: 'test' },
     };
@@ -1130,7 +1648,13 @@ class AdapterTransport implements SellerSpriteMcpTransport {
       },
       asin_detail: this.asinDetail,
       asin_competitor: [{ asin: 'B000TEST02', title: 'Candidate', units: 300 }],
-      market_research: { pages: 1, page: 1, size: 5, total: this.marketItems.length, items: this.marketItems, hasNextPage: false },
+      market_research: {
+        pages: 1, page: 1, size: 5,
+        total: this.marketResearchByMonth?.[String(request.month)] ? 1 : this.marketItems.length,
+        items: this.marketResearchByMonth?.[String(request.month)]
+          ? [this.marketResearchByMonth[String(request.month)]] : this.marketItems,
+        hasNextPage: false,
+      },
     };
     const payload = this.responsePayload ?? { code: this.remoteCode, message: this.remoteCode === 'OK' ? 'success' : 'denied',
       data: this.responseData === undefined ? data[params.name] : this.responseData };

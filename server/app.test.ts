@@ -34,6 +34,11 @@ function liveSyncPort(): SellerSpriteSyncPort {
     isEstimated: true, confidence: 0.85,
   };
   return {
+    async fetchMarketResearchSummary(input) {
+      return { data: { marketplace: input.marketplace, nodeIdPath: input.nodeIdPath,
+        totalProducts: 1, totalUnits: 10, totalRevenue: 390,
+        top10ProductCrn: 100, top20ProductCrn: 100 }, provenance };
+    },
     async fetchMarketStatistics(input) {
       return { data: { marketplace: input.marketplace, nodeIdPath: input.nodeIdPath,
         products: 1, brands: 1, sellers: 1, avgPrice: 39, avgRating: 4.5 }, provenance };
@@ -375,6 +380,7 @@ describe('V2.2 real-data administration routes', () => {
     let calls = 0;
     const delegate = liveSyncPort();
     const port: SellerSpriteSyncPort = {
+      async fetchMarketResearchSummary(input) { calls += 1; return delegate.fetchMarketResearchSummary(input); },
       async fetchMarketStatistics(input) { calls += 1; return delegate.fetchMarketStatistics(input); },
       async fetchMarketConcentration(input) { calls += 1; return delegate.fetchMarketConcentration(input); },
       async fetchAsinSalesTrend(input) { calls += 1; return delegate.fetchAsinSalesTrend(input); },
@@ -386,12 +392,12 @@ describe('V2.2 real-data administration routes', () => {
       .send({ marketId: 'market-live', month: '202608' }).expect(201);
     await request(app).post('/api/integrations/sellersprite/sync/products')
       .send({ productIds: ['owned-live'] }).expect(201);
-    expect(calls).toBe(3);
+    expect(calls).toBe(4);
 
     await request(app).get('/api/dashboard/executive?range=30D').expect(200);
     const coverage = await request(app).get('/api/data-coverage?marketplace=US').expect(200);
     expect(coverage.body.data).toMatchObject({ marketplace: 'US' });
-    expect(calls).toBe(3);
+    expect(calls).toBe(4);
     expect((database.prepare(`SELECT COUNT(*) AS count FROM market_snapshots`).get() as { count: number }).count).toBe(1);
     expect((database.prepare(`SELECT COUNT(*) AS count FROM product_snapshots`).get() as { count: number }).count).toBe(1);
     await request(app).patch('/api/markets/market-live/sellersprite-node')

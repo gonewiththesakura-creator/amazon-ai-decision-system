@@ -38,6 +38,9 @@ interface GoLiveVerification {
   realMarketSnapshots: number;
   realOwnedProductSnapshots: number;
   activeOwnedProducts: number;
+  expectedOwnedProducts: number | null;
+  ownedRosterDeclarationStatus: 'missing' | 'pending_validation' | 'confirmed' | 'mismatch';
+  ownedRosterMatches: boolean;
   sellerSpriteMarketSnapshots: number;
   sellerSpriteOwnedProductSnapshots: number;
   sellerSpriteConnectionVerified: boolean;
@@ -279,6 +282,13 @@ export default function RealDataControls({
             <span>{verification.readyForDemoCleanup ? '清理前真实链路已通过' : '清理前真实链路未通过'} ·
               {' '}{verification.hasMinimumRealCoverage ? 'Live 切换条件已满足' : 'Live 切换条件未满足'} ·
               {' '}主市场 {verification.realMarketSnapshots} · 自有 SKU {verification.realOwnedProductSnapshots} / {verification.activeOwnedProducts} · Mock {verification.mockObservations}
+              <br />主档声明 {verification.activeOwnedProducts} / {verification.expectedOwnedProducts ?? '—'} ·
+              {' '}{verification.ownedRosterDeclarationStatus === 'confirmed' && verification.ownedRosterMatches
+                ? '已确认'
+                : verification.ownedRosterDeclarationStatus === 'pending_validation'
+                  ? '待校验'
+                  : verification.ownedRosterDeclarationStatus === 'mismatch'
+                    ? '范围不匹配' : '未声明'}
               <br />SellerSprite 连接 {verification.sellerSpriteConnectionVerified ? '已验证' : '未验证'} · 市场 {verification.sellerSpriteMarketSnapshots} · 自有 SKU {verification.sellerSpriteOwnedProductSnapshots} ·
               {' '}能力 {verification.sellerSpriteCapabilitiesAvailable ? '已发现' : '未验证'} · 市场调用 {verification.sellerSpriteMarketCalls} · ASIN 调用 {verification.sellerSpriteAsinCalls}
               <br />运行 Evidence {verification.verifiedEvidenceEntities} / {verification.requiredEvidenceEntities} ·

@@ -2165,6 +2165,59 @@ const migrations = [
       `);
     },
   },
+  {
+    version: 30,
+    sql: `
+      CREATE TABLE owned_roster_declarations (
+        marketplace TEXT PRIMARY KEY,
+        declared_count INTEGER NOT NULL CHECK (declared_count > 0),
+        declared_digest TEXT NOT NULL CHECK (LENGTH(declared_digest) = 64),
+        expected_count INTEGER CHECK (expected_count IS NULL OR expected_count >= 0),
+        expected_digest TEXT CHECK (expected_digest IS NULL OR LENGTH(expected_digest) = 64),
+        preview_digest TEXT NOT NULL CHECK (LENGTH(preview_digest) = 64),
+        status TEXT NOT NULL CHECK (status IN ('pending_validation', 'confirmed')),
+        import_batch_id TEXT REFERENCES import_batches(id),
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        CHECK ((status = 'pending_validation' AND expected_count IS NULL
+          AND expected_digest IS NULL AND import_batch_id IS NULL)
+          OR (status = 'confirmed' AND expected_count IS NOT NULL
+            AND expected_digest IS NOT NULL AND import_batch_id IS NOT NULL))
+      );
+    `,
+  },
+  {
+    version: 31,
+    sql: `
+      CREATE TABLE owned_roster_declaration_events (
+        id TEXT PRIMARY KEY,
+        marketplace TEXT NOT NULL,
+        event_type TEXT NOT NULL CHECK (
+          event_type IN ('declared', 'refreshed', 'superseded', 'confirmed')
+        ),
+        declared_count INTEGER NOT NULL CHECK (declared_count > 0),
+        declared_digest TEXT NOT NULL CHECK (LENGTH(declared_digest) = 64),
+        preview_digest TEXT NOT NULL CHECK (LENGTH(preview_digest) = 64),
+        previous_preview_digest TEXT CHECK (
+          previous_preview_digest IS NULL OR LENGTH(previous_preview_digest) = 64
+        ),
+        import_batch_id TEXT REFERENCES import_batches(id),
+        created_at TEXT NOT NULL
+      );
+      CREATE INDEX idx_owned_roster_events_marketplace
+        ON owned_roster_declaration_events(marketplace, created_at, id);
+      CREATE TRIGGER trg_owned_roster_events_immutable_update
+      BEFORE UPDATE ON owned_roster_declaration_events
+      BEGIN
+        SELECT RAISE(ABORT, 'owned roster declaration events are immutable');
+      END;
+      CREATE TRIGGER trg_owned_roster_events_immutable_delete
+      BEFORE DELETE ON owned_roster_declaration_events
+      BEGIN
+        SELECT RAISE(ABORT, 'owned roster declaration events are immutable');
+      END;
+    `,
+  },
 ];
 
 export function migrate(database: DatabaseSync): void {

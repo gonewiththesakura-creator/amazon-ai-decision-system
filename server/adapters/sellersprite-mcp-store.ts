@@ -35,6 +35,10 @@ export interface McpCallLedgerEntry {
   researchJobId?: string;
   runId?: string;
   observationMonth?: string;
+  observationCertification?: {
+    method: 'response_echo_v1' | 'documented_request_v1';
+    schemaHash: string;
+  };
   resultCount?: number | null;
   startedAt: string;
   completedAt: string;
@@ -105,7 +109,10 @@ export class SqliteMcpCallLedgerStore implements McpCallLedgerStore {
          observation_month)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).run(entry.id, entry.provider, entry.capability ?? 'unspecified', entry.requestHash,
-      entry.status, JSON.stringify({ operation: entry.operation, attempt: entry.attempt }),
+      entry.status, JSON.stringify({ operation: entry.operation, attempt: entry.attempt,
+        ...(entry.status === 'success' && entry.observationCertification
+          ? { observationCertification: entry.observationCertification } : {}),
+      }),
       entry.errorCode, entry.startedAt, entry.completedAt, entry.toolName, entry.requestHash,
       Math.max(0, Date.parse(entry.completedAt) - Date.parse(entry.startedAt)), entry.cacheHit ? 1 : 0,
       entry.entityType ?? null, entry.entityId ?? null, entry.researchJobId ?? null,

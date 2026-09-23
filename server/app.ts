@@ -698,11 +698,18 @@ export function createApp(options: CreateAppOptions = {}): express.Express {
   app.post(['/api/import/csv', '/api/import/xlsx'], adminOnly, () => {
     throw httpError(410, '直接导入已停用；请先通过 /api/import/preview/csv 或 /api/import/preview/xlsx 审核文件，再使用确认令牌导入。');
   });
+  app.get('/api/import/owned-roster', adminOnly, (_request, response) => {
+    const declaration = database.prepare(`SELECT marketplace, declared_count AS declaredCount,
+      preview_digest AS previewDigest, status FROM owned_roster_declarations WHERE marketplace = ?`)
+      .get(repository.getSettings().marketplace);
+    sendData(response, declaration ?? null, repository);
+  });
   const previewImportHandler = (format: 'csv' | 'xlsx') => (request: Request, response: Response): void => {
     if (!request.file) throw httpError(400, '请使用 multipart/form-data 的 file 字段上传文件。');
     sendData(response, importer.preview(request.file.buffer, {
       format,
       filename: request.file.originalname,
+      supersedesRosterDigest: stringBodyValue(request.body.supersedesRosterDigest),
       entityType: stringBodyValue(request.body.entityType),
       marketplace: stringBodyValue(request.body.marketplace),
       marketNodeId: stringBodyValue(request.body.marketNodeId),

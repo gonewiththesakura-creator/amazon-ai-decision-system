@@ -9,6 +9,7 @@ import { openDatabase, type AppDatabase } from '../database/database.js';
 import { DataCoverageService } from './data-coverage-service.js';
 import { GoLiveMigrationService } from './go-live-migration-service.js';
 import { IntelligenceService } from './intelligence-service.js';
+import { seedConfirmedOwnedRoster } from '../test-utils/owned-roster-declaration.js';
 import {
   SellerSpriteSyncService,
   type SellerSpriteSyncPort,
@@ -62,6 +63,7 @@ function setupFamily(): AppDatabase {
     ) VALUES ('market-history', 'market-1', '2026-08-31', 10000, 'Historical import', 'import', '2026-09-01',
       '1M', 1, 0.9, '2026-08-31', 'market-history');
   `);
+  seedConfirmedOwnedRoster(connection);
   return connection;
 }
 
@@ -120,6 +122,11 @@ function sellerSpritePort(asinCalls: string[]): SellerSpriteSyncPort {
     period: '1M', isEstimated: true, confidence: 0.9,
   };
   return {
+    async fetchMarketResearchSummary(input) {
+      return { data: { marketplace: input.marketplace, nodeIdPath: input.nodeIdPath,
+        totalProducts: 20, totalUnits: 1000, totalRevenue: 40000,
+        top10ProductCrn: 50, top20ProductCrn: 75 }, provenance };
+    },
     async fetchMarketStatistics(input) {
       return { data: { marketplace: input.marketplace, nodeIdPath: input.nodeIdPath, products: 20, totalUnits: 1000 }, provenance };
     },

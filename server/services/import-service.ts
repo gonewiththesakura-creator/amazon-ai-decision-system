@@ -21,6 +21,7 @@ import {
   type ParentLookupStatus,
   type ProductIdentityResolution,
 } from '../domain/product-identity-resolver.js';
+import { activeOwnedRoster, ownedRosterDigest } from './owned-roster-declaration.js';
 
 type ImportRow = Record<string, unknown>;
 
@@ -106,6 +107,7 @@ class ImportIntegrityError extends Error {
 export interface ImportOptions {
   format: ImportFormat;
   filename: string;
+  supersedesRosterDigest?: string;
   entityType?: string;
   marketplace?: string;
   marketNodeId?: string;
@@ -419,6 +421,60 @@ export class ImportService {
       rowsOmitted: batch.rows.length - previewedCount,
       expiresAt,
     };
+    if (entityType === 'owned_product_master') {
+      const marketplace = this.repository.getSettings().marketplace;
+      if (batch.rowCount === 0) throw new ImportIntegrityError('产品主数据 roster 声明不能为空。');
+      if (batch.rows.some((row) => !optionalString(row.values, ['asin'])
+        || !optionalString(row.values, ['sku']))) {
+        throw new ImportIntegrityError('产品主数据 roster 声明需要每行明确 ASIN 和 SKU 身份；未更改既有声明。');
+      }
+      if (batch.rows.some((row) => optionalString(row.values, ['marketplace'])?.toUpperCase()
+        !== marketplace)) {
+        throw new ImportIntegrityError(`产品主数据 roster 中存在与当前工作区站点 ${marketplace} 不一致的行；未更改既有声明。`);
+      }
+      const supersedesRosterDigest = options.supersedesRosterDigest;
+      if (supersedesRosterDigest !== undefined && !/^[a-f0-9]{64}$/.test(supersedesRosterDigest)) {
+        throw new ImportIntegrityError('supersedesRosterDigest 必须是当前 roster 声明的 64 位 preview digest。');
+      }
+      const declaredDigest = ownedRosterDigest(batch.rows.map((row) => ({
+        asin: requiredString(row.values, ['asin']),
+        sku: requiredString(row.values, ['sku']),
+      })));
+      transaction(this.database, () => {
+        const existing = this.database.prepare(`SELECT declared_count AS declaredCount,
+          declared_digest AS declaredDigest, preview_digest AS previewDigest
+          FROM owned_roster_declarations WHERE marketplace = ?`
+        ).get(marketplace) as {
+          declaredCount: number; declaredDigest: string; previewDigest: string;
+        } | undefined;
+        if (supersedesRosterDigest !== undefined
+          && (!existing || existing.previewDigest !== supersedesRosterDigest)) {
+          throw new ImportIntegrityError('supersedesRosterDigest 已过期或不是当前 roster 声明版本；请重新获取最新声明。');
+        }
+        const replacesScope = Boolean(existing && (existing.declaredCount !== batch.rowCount
+          || existing.declaredDigest !== declaredDigest));
+        if (replacesScope && supersedesRosterDigest === undefined) {
+          throw new ImportIntegrityError('产品主数据 roster 声明与既有范围冲突；不得静默缩减或替换，请显式复核范围。');
+        }
+        const now = new Date().toISOString();
+        this.database.prepare(`INSERT INTO owned_roster_declarations (
+          marketplace, declared_count, declared_digest, preview_digest, status,
+          created_at, updated_at
+        ) VALUES (?, ?, ?, ?, 'pending_validation', ?, ?)
+        ON CONFLICT(marketplace) DO UPDATE SET declared_count = excluded.declared_count,
+          declared_digest = excluded.declared_digest, preview_digest = excluded.preview_digest,
+          expected_count = NULL, expected_digest = NULL, status = 'pending_validation',
+          import_batch_id = NULL, updated_at = excluded.updated_at`
+        ).run(marketplace, batch.rowCount, declaredDigest, contentDigest, now, now);
+        const eventType = !existing ? 'declared' : replacesScope ? 'superseded' : 'refreshed';
+        this.database.prepare(`INSERT INTO owned_roster_declaration_events (
+          id, marketplace, event_type, declared_count, declared_digest,
+          preview_digest, previous_preview_digest, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`)
+          .run(randomUUID(), marketplace, eventType, batch.rowCount, declaredDigest,
+            contentDigest, existing?.previewDigest ?? null, now);
+      });
+    }
     this.stagedPreviews.set(token, {
       hash: contentDigest,
       buffer: Buffer.from(buffer),
@@ -458,6 +514,7 @@ export class ImportService {
       { ...staged.options, entityType },
       batch,
       staged.ownedMasterPreconditions,
+      staged.hash,
     );
     staged.confirmed = result;
     return result;
@@ -468,6 +525,7 @@ export class ImportService {
     options: ImportOptions,
     preparedBatch?: FileImportBatch,
     ownedMasterPreconditions?: Map<number, OwnedMasterPrecondition>,
+    ownedMasterPreviewDigest?: string,
   ): ImportResult {
     const taskId = randomUUID();
     const batchId = randomUUID();
@@ -499,7 +557,8 @@ export class ImportService {
 
     const { entityType, rowCount } = batch;
     if (entityType === 'owned_product_master') {
-      return this.importOwnedProductMaster(batch, normalizedOptions, ownedMasterPreconditions);
+      return this.importOwnedProductMaster(batch, normalizedOptions,
+        ownedMasterPreconditions, ownedMasterPreviewDigest);
     }
     const errors: string[] = [];
     const stagedRows: StagedImportRow[] = [];
@@ -661,6 +720,7 @@ export class ImportService {
     batch: FileImportBatch,
     options: ImportOptions,
     expectedPreconditions?: Map<number, OwnedMasterPrecondition>,
+    previewDigest?: string,
   ): ImportResult {
     const taskId = randomUUID();
     const batchId = randomUUID();
@@ -672,6 +732,22 @@ export class ImportService {
     const dispositions = new Map<number, OwnedMasterDisposition>();
 
     transaction(this.database, () => {
+      const marketplace = this.repository.getSettings().marketplace;
+      const declaration = this.database.prepare(`SELECT declared_count AS declaredCount,
+        declared_digest AS declaredDigest, preview_digest AS previewDigest, status
+        FROM owned_roster_declarations WHERE marketplace = ?`).get(marketplace) as {
+          declaredCount: number; declaredDigest: string; previewDigest: string; status: string;
+        } | undefined;
+      const declaredDigest = ownedRosterDigest(batch.rows.map((row) => ({
+        asin: optionalString(row.values, ['asin']) ?? '',
+        sku: optionalString(row.values, ['sku']) ?? '',
+      })));
+      if (!previewDigest || !declaration || declaration.status !== 'pending_validation'
+        || declaration.previewDigest !== previewDigest
+        || declaration.declaredCount !== batch.rowCount
+        || declaration.declaredDigest !== declaredDigest) {
+        throw new ImportIntegrityError('产品主数据 roster 声明与已审核预览不一致，请重新预览整批文件。');
+      }
       const ownedMasterGuard = new OwnedMasterBatchGuard();
       const validationErrors: string[] = [];
       for (const row of batch.rows) {
@@ -740,6 +816,35 @@ export class ImportService {
         SET success_count = ?, failure_count = 0, errors_json = ?, imported_at = ?
         WHERE id = ?
       `).run(batch.rowCount, JSON.stringify({ errors: [], successfulRows }), completedAt, batchId);
+      const active = activeOwnedRoster(this.database, marketplace);
+      const declaredActive = batch.rows
+        .filter((row) => requiredProductStatus(row.values) === 'active')
+        .map((row) => ({
+          asin: requiredString(row.values, ['asin']),
+          sku: requiredString(row.values, ['sku']),
+        }));
+      const declaredActiveDigest = ownedRosterDigest(declaredActive);
+      if (active.length !== declaredActive.length
+        || ownedRosterDigest(active) !== declaredActiveDigest) {
+        throw new ImportIntegrityError(
+          '产品主数据确认后的活跃 roster 与文件中声明的 active SKU 身份不一致；遗漏 SKU 必须在复核文件中显式标记 inactive。',
+        );
+      }
+      const declarationUpdate = this.database.prepare(`UPDATE owned_roster_declarations SET
+        status = 'confirmed', expected_count = ?, expected_digest = ?, import_batch_id = ?,
+        updated_at = ? WHERE marketplace = ? AND status = 'pending_validation'
+          AND preview_digest = ? AND declared_digest = ? AND declared_count = ?`
+      ).run(declaredActive.length, declaredActiveDigest, batchId, completedAt, marketplace,
+        previewDigest, declaredDigest, batch.rowCount);
+      if (declarationUpdate.changes !== 1) {
+        throw new ImportIntegrityError('产品主数据 roster 声明确认状态变化，整批已回滚。');
+      }
+      this.database.prepare(`INSERT INTO owned_roster_declaration_events (
+        id, marketplace, event_type, declared_count, declared_digest,
+        preview_digest, previous_preview_digest, import_batch_id, created_at
+      ) VALUES (?, ?, 'confirmed', ?, ?, ?, ?, ?, ?)`)
+        .run(randomUUID(), marketplace, batch.rowCount, declaredDigest,
+          previewDigest, previewDigest, batchId, completedAt);
       if (batch.rowCount > 0) {
         this.database.prepare('UPDATE data_sources SET last_sync_at = ? WHERE id = ?').run(completedAt, sourceId);
       }

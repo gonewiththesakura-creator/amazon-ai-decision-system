@@ -24,6 +24,8 @@ const preview = {
 const verification = {
   mockObservations: 6, realMarketSnapshots: 0, realOwnedProductSnapshots: 0,
   activeOwnedProducts: 4, sellerSpriteMarketSnapshots: 0, sellerSpriteOwnedProductSnapshots: 0,
+  expectedOwnedProducts: 5, ownedRosterDeclarationStatus: 'pending_validation',
+  ownedRosterMatches: false,
   sellerSpriteConnectionVerified: false, sellerSpriteCapabilitiesAvailable: false,
   sellerSpriteMarketCalls: 0, sellerSpriteAsinCalls: 0,
   sellerSpriteCriticalRunId: null as string | null,
@@ -76,6 +78,14 @@ afterEach(() => {
 });
 
 describe('real-data administration controls', () => {
+  it('shows a pending five-SKU master separately from the imported active roster', async () => {
+    vi.stubGlobal('fetch', fetchMock);
+    render(<RealDataControls isViewer={false} marketId="market-1" />);
+
+    expect(await screen.findByText(/主档声明 4 \/ 5 · 待校验/)).toBeInTheDocument();
+    expect(screen.getByText(/清理前真实链路未通过/)).toBeInTheDocument();
+  });
+
   it('lists retained Demo history in Dry Run but keeps cleanup blocked', async () => {
     currentVerification = { ...verification, readyForDemoCleanup: true };
     currentPreview = {

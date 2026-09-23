@@ -14,6 +14,7 @@ import { DataCoverageService } from './services/data-coverage-service.js';
 import { GoLiveMigrationService } from './services/go-live-migration-service.js';
 import { SellerSpriteSyncService } from './services/sellersprite-sync-service.js';
 import { WorkflowOrchestrator } from './services/workflow-orchestrator.js';
+import { seedConfirmedOwnedRoster } from './test-utils/owned-roster-declaration.js';
 
 const MARKET_ID = 'dynamic-market';
 const NODE_PATH = '1055398:1063252:1199122:10671043011';
@@ -35,10 +36,10 @@ describe('dynamic owned roster integration', () => {
     expect(fixture.transport.calls).toEqual([]);
     expect(database!.prepare(`
       SELECT status, total, success, failed FROM data_tasks WHERE task_type = 'critical_sync'
-    `).get()).toEqual({ status: 'failed', total: 1, success: 0, failed: 1 });
+    `).get()).toBeUndefined();
     expect(database!.prepare(`
       SELECT is_complete AS isComplete FROM data_coverage_runs WHERE run_type = 'critical_sync'
-    `).get()).toEqual({ isComplete: 0 });
+    `).get()).toBeUndefined();
     expect(new DataCoverageService(database!).getCoverage('US').activeOwnedProducts)
       .toMatchObject({ covered: 0, total: 0, status: 'not_applicable' });
     expect(new GoLiveMigrationService(database!).verify()).toMatchObject({
@@ -239,6 +240,7 @@ function createFixture(total: number): {
     );
     ownedProducts.push(product);
   }
+  if (total > 0) seedConfirmedOwnedRoster(database);
 
   const transport = new DynamicRosterTransport();
   const client = new SellerSpriteMcpClient({
@@ -267,7 +269,7 @@ class DynamicRosterTransport implements SellerSpriteMcpTransport {
         requestTool('market_product_concentration', ['marketplace', 'nodeIdPath', 'month']),
         flatTool('asin_sales_trend', ['marketplace', 'asin']),
         flatTool('asin_competitor', ['marketplace', 'asin']),
-        requestTool('market_research', ['marketplace', 'nodeIdPath']),
+        requestTool('market_research', ['marketplace', 'nodeIdPath', 'month']),
       ],
       _meta: { progressToken: 'dynamic-roster' },
     };
@@ -296,8 +298,8 @@ class DynamicRosterTransport implements SellerSpriteMcpTransport {
         top20Share: 40,
         newProductShare: 10,
       },
-      market_product_concentration: [{
-        asin: 'B0PEER0001',
+      market_product_concentration: Array.from({ length: 100 }, (_, index) => ({
+        asin: `B0PEER${String(index + 1).padStart(4, '0')}`,
         marketplace: request.marketplace,
         nodeIdPath: request.nodeIdPath,
         month: request.month,
@@ -306,11 +308,12 @@ class DynamicRosterTransport implements SellerSpriteMcpTransport {
         price: 40,
         rating: 4.3,
         ratings: 100,
-        totalUnits: 100,
-        totalRevenue: 4_000,
-        totalUnitsRatio: 0.1,
-        totalRevenueRatio: 0.1,
-      }],
+        reviews: 20,
+        totalUnits: request.month === '202608' ? 12 : 10,
+        totalRevenue: request.month === '202608' ? 480 : 400,
+        totalUnitsRatio: 0.01,
+        totalRevenueRatio: 0.01,
+      })),
       asin_sales_trend: {
         asin: {
           asin: request.asin,
@@ -337,8 +340,20 @@ class DynamicRosterTransport implements SellerSpriteMcpTransport {
         nodeIdPath: request.nodeIdPath,
         page: 1,
         size: 1,
-        total: 0,
-        items: [],
+        total: 1,
+        items: [{
+          marketplace: request.marketplace,
+          nodeIdPath: request.nodeIdPath,
+          month: request.month,
+          totalProducts: 100,
+          topProducts: 100,
+          totalUnits: request.month === '202608' ? 1_200 : 1_000,
+          totalRevenue: request.month === '202608' ? 48_000 : 40_000,
+          top10ProductSales: request.month === '202608' ? 120 : 100,
+          top20ProductSales: request.month === '202608' ? 240 : 200,
+          top10ProductCrn: 0.1,
+          top20ProductCrn: 0.2,
+        }],
         hasNextPage: false,
       },
     };

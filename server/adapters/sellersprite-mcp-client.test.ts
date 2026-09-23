@@ -398,6 +398,36 @@ describe('SellerSpriteMcpClient', () => {
     expect(cache.entries).toHaveLength(0);
   });
 
+  it('returns a validated remote result without retrying or contradicting the ledger when cache persistence fails', async () => {
+    const ledger = new MemoryLedgerStore();
+    const transport = new FakeTransport({
+      callOutcomes: [callResult({ code: 'OK', data: { products: 100 } })],
+    });
+    const cache: McpResponseCacheStore = {
+      get: () => null,
+      set: () => { throw new Error('cache unavailable'); },
+    };
+    const client = new SellerSpriteMcpClient({ transport, ledgerStore: ledger, cacheStore: cache });
+
+    const result = await client.callTool({
+      tool: 'market_research_statistics', arguments: { marketplace: 'US' },
+      context: { capability: 'MARKET_STATISTICS' },
+    }, (response) => {
+      if (response.structuredContent?.code !== 'OK') throw new Error('invalid provider result');
+      return {
+        value: response.structuredContent.data,
+        observationCertification: { method: 'response_echo_v1', schemaHash: 'a'.repeat(64) },
+      };
+    });
+
+    expect(result).toEqual({ products: 100 });
+    expect(transport.callCount).toBe(1);
+    expect(ledger.entries).toMatchObject([{
+      status: 'success', errorCode: null, cacheHit: false, attempt: 1,
+      observationCertification: { method: 'response_echo_v1', schemaHash: 'a'.repeat(64) },
+    }]);
+  });
+
   it('redacts query credentials, authorization, tokens, and secret-key values', () => {
     const secretBearingError = new Error(
       'Authorization: Bearer secret-value; https://example.test/mcp?token=secret-value&x=1 '

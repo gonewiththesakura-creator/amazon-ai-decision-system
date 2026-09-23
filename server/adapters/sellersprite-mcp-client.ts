@@ -12,6 +12,7 @@ import {
   newLedgerEntry,
   type McpCallLedgerStore,
   type McpResponseCacheStore,
+  type McpCallLedgerEntry,
 } from './sellersprite-mcp-store.js';
 import { isCredentialFieldName, redactCredentialAssignments } from './sensitive-field.js';
 
@@ -44,6 +45,11 @@ export interface SellerSpriteToolCall {
 export interface SellerSpriteMcpAcquisition {
   source: 'remote' | 'cache';
   acquiredAt: string;
+}
+
+export interface SellerSpriteValidated<T> {
+  value: T;
+  observationCertification?: McpCallLedgerEntry['observationCertification'];
 }
 
 interface SellerSpriteMcpClientOptions {
@@ -184,11 +190,11 @@ export class SellerSpriteMcpClient {
   async callTool(request: SellerSpriteToolCall): Promise<McpCallToolResult>;
   async callTool<T>(request: SellerSpriteToolCall, validate: (
     result: McpCallToolResult, acquisition: SellerSpriteMcpAcquisition,
-  ) => T): Promise<T>;
+  ) => SellerSpriteValidated<T>): Promise<T>;
   async callTool<T>(
     request: SellerSpriteToolCall, validate?: (
       result: McpCallToolResult, acquisition: SellerSpriteMcpAcquisition,
-    ) => T,
+    ) => SellerSpriteValidated<T>,
   ): Promise<T | McpCallToolResult> {
     const key = createHash('sha256').update(JSON.stringify([
       request.tool, ordered(request.arguments), request.context.capability ?? '',
@@ -196,20 +202,22 @@ export class SellerSpriteMcpClient {
     const now = new Date(this.now()).toISOString();
     const cached = request.context.fresh ? null : this.options.cacheStore?.get(key, now);
     if (cached) {
-      let accepted: { raw: McpCallToolResult; value: T | McpCallToolResult } | null = null;
+      let accepted: { raw: McpCallToolResult; value: T | McpCallToolResult;
+        observationCertification?: McpCallLedgerEntry['observationCertification'] } | null = null;
       try {
         const result = mcpCallToolResultSchema.safeParse(JSON.parse(cached.responseJson) as unknown);
         if (result.success) {
           assertToolSuccess(result.data);
           const acquiredAt = normalizedTimestamp(cached.createdAt);
-          accepted = { raw: result.data, value: validate
-            ? validate(result.data, { source: 'cache', acquiredAt }) : result.data };
+          accepted = { raw: result.data, ...(validate
+            ? validate(result.data, { source: 'cache', acquiredAt }) : { value: result.data }) };
         }
       } catch {
         // A stale or malformed cache entry cannot certify a capability call.
       }
       if (accepted) {
-        this.record(request, key, 'success', null, true, 0, now, countResult(accepted.raw));
+        this.record(request, key, 'success', null, true, 0, now, countResult(accepted.raw),
+          accepted.observationCertification);
         return accepted.value;
       }
     }
@@ -227,20 +235,25 @@ export class SellerSpriteMcpClient {
         if (!parsed.success) throw new SellerSpriteMcpError('INVALID_SCHEMA', 'Invalid SellerSprite MCP tool response');
         assertToolSuccess(parsed.data);
         const acquiredAt = new Date(this.now()).toISOString();
-        const accepted = validate
-          ? validate(parsed.data, { source: 'remote', acquiredAt }) : parsed.data;
-        this.record(request, key, 'success', null, false, attempt, startedAt, countResult(parsed.data));
+        const accepted: SellerSpriteValidated<T | McpCallToolResult> = validate
+          ? validate(parsed.data, { source: 'remote', acquiredAt }) : { value: parsed.data };
+        this.record(request, key, 'success', null, false, attempt, startedAt, countResult(parsed.data),
+          accepted.observationCertification);
         if (this.options.cacheStore && (this.options.cacheTtlMs ?? 300_000) > 0) {
-          this.options.cacheStore.set({
-            cacheKey: key,
-            provider: 'sellersprite',
-            toolName: request.tool,
-            responseJson: JSON.stringify(scrubSecrets(parsed.data)),
-            createdAt: acquiredAt,
-            expiresAt: new Date(this.now() + (this.options.cacheTtlMs ?? 300_000)).toISOString(),
-          });
+          try {
+            this.options.cacheStore.set({
+              cacheKey: key,
+              provider: 'sellersprite',
+              toolName: request.tool,
+              responseJson: JSON.stringify(scrubSecrets(parsed.data)),
+              createdAt: acquiredAt,
+              expiresAt: new Date(this.now() + (this.options.cacheTtlMs ?? 300_000)).toISOString(),
+            });
+          } catch {
+            // A validated provider response remains usable when the optional cache is unavailable.
+          }
         }
-        return accepted;
+        return accepted.value;
       } catch (error) {
         const mapped = mapMcpError(error);
         this.record(request, key, 'failed', mapped.code, false, attempt, startedAt);
@@ -262,6 +275,7 @@ export class SellerSpriteMcpClient {
     request: SellerSpriteToolCall, requestHash: string,
     status: 'success' | 'failed', errorCode: SellerSpriteMcpErrorCode | null,
     cacheHit: boolean, attempt: number, startedAt: string, resultCount: number | null = null,
+    observationCertification?: McpCallLedgerEntry['observationCertification'],
   ): void {
     this.options.ledgerStore?.record(newLedgerEntry({
       provider: 'sellersprite',
@@ -278,6 +292,7 @@ export class SellerSpriteMcpClient {
       runId: request.context.runId && /^[0-9a-f]{8}-[0-9a-f-]{27,36}$/i.test(request.context.runId)
         ? request.context.runId : undefined,
       observationMonth: safeObservationMonth(request.context.observationMonth),
+      ...(status === 'success' && observationCertification ? { observationCertification } : {}),
       resultCount,
       completedAt: new Date(this.now()).toISOString(),
     }));

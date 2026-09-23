@@ -80,6 +80,18 @@ function addChildMarketCriticalFixture(db: AppDatabase): string {
 }
 
 describe('GoLiveMigrationService', () => {
+  it('does not certify a complete-looking critical run without a declared owned roster', () => {
+    database = openDatabase(':memory:');
+    insertObservationFixture(database, 'mcp');
+    addVerifiedMcpCoverage(database, 'market-us', 'owned-product');
+    database.prepare(`DELETE FROM owned_roster_declarations WHERE marketplace = 'US'`).run();
+    expect(new GoLiveMigrationService(database).verify()).toMatchObject({
+      expectedOwnedProducts: null,
+      ownedRosterDeclarationStatus: 'missing', ownedRosterMatches: false,
+      sellerSpriteCriticalRunId: null, readyForDemoCleanup: false,
+      hasMinimumRealCoverage: false,
+    });
+  });
   it('itemizes retained Demo rule and rejection history without exposing record payloads', () => {
     database = openDatabase(':memory:');
     seedDemoData(database);
@@ -316,8 +328,10 @@ describe('GoLiveMigrationService', () => {
     expect(database.prepare(`SELECT entity_id AS nodeIdPath, capability, COUNT(*) AS count
       FROM mcp_call_logs WHERE sync_run_id = ? AND entity_type = 'market'
       GROUP BY entity_id, capability ORDER BY entity_id, capability`).all(runId)).toEqual([
+      { nodeIdPath: '1055398:1063252', capability: 'MARKET_RESEARCH', count: 2 },
       { nodeIdPath: '1055398:1063252', capability: 'MARKET_STATISTICS', count: 2 },
       { nodeIdPath: '1055398:1063252', capability: 'PRODUCT_CONCENTRATION', count: 2 },
+      { nodeIdPath: '1055398:1063252:999', capability: 'MARKET_RESEARCH', count: 2 },
       { nodeIdPath: '1055398:1063252:999', capability: 'MARKET_STATISTICS', count: 2 },
       { nodeIdPath: '1055398:1063252:999', capability: 'PRODUCT_CONCENTRATION', count: 2 },
     ]);
@@ -339,6 +353,269 @@ describe('GoLiveMigrationService', () => {
   });
 
   it.each([
+    ['missing research certification', (db: AppDatabase, runId: string) => db.prepare(`
+      UPDATE mcp_call_logs SET response_metadata_json = '{}'
+      WHERE sync_run_id = ? AND capability = 'MARKET_RESEARCH'
+        AND entity_id = '1055398:1063252:999' AND observation_month = '202608'
+    `).run(runId)],
+    ['missing certification', (db: AppDatabase, runId: string) => db.prepare(`
+      UPDATE mcp_call_logs SET response_metadata_json = '{}'
+      WHERE sync_run_id = ? AND capability = 'MARKET_STATISTICS'
+        AND entity_id = '1055398:1063252:999' AND observation_month = '202608'
+    `).run(runId)],
+    ['malformed certification JSON', (db: AppDatabase, runId: string) => db.prepare(`
+      UPDATE mcp_call_logs SET response_metadata_json = '{'
+      WHERE sync_run_id = ? AND capability = 'MARKET_STATISTICS'
+        AND entity_id = '1055398:1063252:999' AND observation_month = '202608'
+    `).run(runId)],
+    ['unrecognized certification method', (db: AppDatabase, runId: string) => db.prepare(`
+      UPDATE mcp_call_logs SET response_metadata_json = json_set(response_metadata_json,
+        '$.observationCertification.method', 'unverified')
+      WHERE sync_run_id = ? AND capability = 'PRODUCT_CONCENTRATION'
+        AND entity_id = '1055398:1063252' AND observation_month = '202609'
+    `).run(runId)],
+    ['wrong ledger schema hash', (db: AppDatabase, runId: string) => db.prepare(`
+      UPDATE mcp_call_logs SET response_metadata_json = json_set(response_metadata_json,
+        '$.observationCertification.schemaHash', ?)
+      WHERE sync_run_id = ? AND capability = 'MARKET_STATISTICS'
+        AND entity_id = '1055398:1063252' AND observation_month = '202609'
+    `).run('0'.repeat(64), runId)],
+    ['wrong actual tool', (db: AppDatabase, runId: string) => db.prepare(`
+      UPDATE mcp_call_logs SET actual_tool = 'market_research_statistics'
+      WHERE sync_run_id = ? AND capability = 'PRODUCT_CONCENTRATION'
+        AND entity_id = '1055398:1063252:999' AND observation_month = '202608'
+    `).run(runId)],
+    ['wrong research actual tool', (db: AppDatabase, runId: string) => db.prepare(`
+      UPDATE mcp_call_logs SET actual_tool = 'market_research_statistics'
+      WHERE sync_run_id = ? AND capability = 'MARKET_RESEARCH'
+        AND entity_id = '1055398:1063252:999' AND observation_month = '202608'
+    `).run(runId)],
+    ['missing same-run schema hash', (db: AppDatabase, runId: string) => db.prepare(`
+      UPDATE provider_capability_snapshots
+      SET capabilities_json = json_remove(capabilities_json,
+        '$.capabilitySchemaHashes.MARKET_STATISTICS')
+      WHERE sync_run_id = ?
+    `).run(runId)],
+    ['conflicting discovered tool schema hash', (db: AppDatabase, runId: string) => db.prepare(`
+      UPDATE provider_capability_snapshots SET capabilities_json = json_set(capabilities_json,
+        '$.tools[1].schemaHash', ?)
+      WHERE sync_run_id = ?
+    `).run('0'.repeat(64), runId)],
+    ['unsafe discovered month schema', (db: AppDatabase, runId: string) => db.prepare(`
+      UPDATE provider_capability_snapshots SET capabilities_json = json_set(capabilities_json,
+        '$.tools[1].inputSchema.properties.request.properties.month.type', 'number')
+      WHERE sync_run_id = ?
+    `).run(runId)],
+    ['unsafe research month schema', (db: AppDatabase, runId: string) => db.prepare(`
+      UPDATE provider_capability_snapshots SET capabilities_json = json_set(capabilities_json,
+        '$.tools[0].inputSchema.properties.request.properties.month.type', 'number')
+      WHERE sync_run_id = ?
+    `).run(runId)],
+    ['foreign-run discovery snapshot', (db: AppDatabase, runId: string) => {
+      db.prepare(`UPDATE provider_capability_snapshots SET sync_run_id = (
+        SELECT id FROM data_tasks WHERE sync_run_id = ? AND id <> ? ORDER BY id LIMIT 1
+      ) WHERE sync_run_id = ?`).run(runId, runId, runId);
+    }],
+  ])('rejects a complete run with %s on a required market call', (_case, tamper) => {
+    database = openDatabase(':memory:');
+    const runId = addChildMarketCriticalFixture(database);
+    const service = new GoLiveMigrationService(database);
+    expect(service.verify().sellerSpriteCriticalRunId).toBe(runId);
+
+    tamper(database, runId);
+
+    expect(service.verify()).toMatchObject({
+      sellerSpriteCriticalRunId: null,
+      readyForDemoCleanup: false,
+      hasMinimumRealCoverage: false,
+    });
+  });
+
+  it('accepts a response-echo-certified alias when the same-run mapping and hash agree', () => {
+    database = openDatabase(':memory:');
+    const runId = addChildMarketCriticalFixture(database);
+    const snapshot = database.prepare(`SELECT capabilities_json AS capabilitiesJson
+      FROM provider_capability_snapshots WHERE sync_run_id = ?`).get(runId) as {
+      capabilitiesJson: string;
+    };
+    const discovery = JSON.parse(snapshot.capabilitiesJson) as {
+      capabilities: Record<string, string>;
+      tools: Array<{ name: string; schemaHash: string; inputSchema: unknown }>;
+    };
+    discovery.capabilities.MARKET_STATISTICS = 'market_statistics';
+    discovery.tools[1]!.name = 'market_statistics';
+    database.prepare(`UPDATE provider_capability_snapshots SET capabilities_json = ?
+      WHERE sync_run_id = ?`).run(JSON.stringify(discovery), runId);
+    database.prepare(`UPDATE mcp_call_logs SET actual_tool = 'market_statistics',
+      response_metadata_json = json_set(response_metadata_json,
+        '$.observationCertification.method', 'response_echo_v1')
+      WHERE sync_run_id = ? AND capability = 'MARKET_STATISTICS'`).run(runId);
+
+    expect(new GoLiveMigrationService(database).verify()).toMatchObject({
+      sellerSpriteCriticalRunId: runId,
+      readyForDemoCleanup: true,
+    });
+  });
+
+  it('rejects documented-request certification for an alias even when discovery matches', () => {
+    database = openDatabase(':memory:');
+    const runId = addChildMarketCriticalFixture(database);
+    const snapshot = database.prepare(`SELECT capabilities_json AS capabilitiesJson
+      FROM provider_capability_snapshots WHERE sync_run_id = ?`).get(runId) as {
+      capabilitiesJson: string;
+    };
+    const discovery = JSON.parse(snapshot.capabilitiesJson) as {
+      capabilities: Record<string, string>;
+      tools: Array<{ name: string; schemaHash: string; inputSchema: unknown }>;
+    };
+    discovery.capabilities.MARKET_STATISTICS = 'market_statistics';
+    discovery.tools[1]!.name = 'market_statistics';
+    database.prepare(`UPDATE provider_capability_snapshots SET capabilities_json = ?
+      WHERE sync_run_id = ?`).run(JSON.stringify(discovery), runId);
+    database.prepare(`UPDATE mcp_call_logs SET actual_tool = 'market_statistics'
+      WHERE sync_run_id = ? AND capability = 'MARKET_STATISTICS'`).run(runId);
+
+    expect(new GoLiveMigrationService(database).verify()).toMatchObject({
+      sellerSpriteCriticalRunId: null,
+      readyForDemoCleanup: false,
+    });
+  });
+
+  it('accepts a response-echo-certified MARKET_RESEARCH alias with matching discovery', () => {
+    database = openDatabase(':memory:');
+    const runId = addChildMarketCriticalFixture(database);
+    const snapshot = database.prepare(`SELECT capabilities_json AS capabilitiesJson
+      FROM provider_capability_snapshots WHERE sync_run_id = ?`).get(runId) as {
+      capabilitiesJson: string;
+    };
+    const discovery = JSON.parse(snapshot.capabilitiesJson) as {
+      capabilities: Record<string, string>;
+      tools: Array<{ name: string; schemaHash: string; inputSchema: unknown }>;
+    };
+    discovery.capabilities.MARKET_RESEARCH = 'market_research_alias';
+    discovery.tools[0]!.name = 'market_research_alias';
+    database.prepare(`UPDATE provider_capability_snapshots SET capabilities_json = ?
+      WHERE sync_run_id = ?`).run(JSON.stringify(discovery), runId);
+    database.prepare(`UPDATE mcp_call_logs SET actual_tool = 'market_research_alias',
+      response_metadata_json = json_set(response_metadata_json,
+        '$.observationCertification.method', 'response_echo_v1')
+      WHERE sync_run_id = ? AND capability = 'MARKET_RESEARCH'`).run(runId);
+
+    expect(new GoLiveMigrationService(database).verify()).toMatchObject({
+      sellerSpriteCriticalRunId: runId,
+      readyForDemoCleanup: true,
+    });
+  });
+
+  it('rejects documented-request certification for a MARKET_RESEARCH alias', () => {
+    database = openDatabase(':memory:');
+    const runId = addChildMarketCriticalFixture(database);
+    const snapshot = database.prepare(`SELECT capabilities_json AS capabilitiesJson
+      FROM provider_capability_snapshots WHERE sync_run_id = ?`).get(runId) as {
+      capabilitiesJson: string;
+    };
+    const discovery = JSON.parse(snapshot.capabilitiesJson) as {
+      capabilities: Record<string, string>;
+      tools: Array<{ name: string; schemaHash: string; inputSchema: unknown }>;
+    };
+    discovery.capabilities.MARKET_RESEARCH = 'market_research_alias';
+    discovery.tools[0]!.name = 'market_research_alias';
+    database.prepare(`UPDATE provider_capability_snapshots SET capabilities_json = ?
+      WHERE sync_run_id = ?`).run(JSON.stringify(discovery), runId);
+    database.prepare(`UPDATE mcp_call_logs SET actual_tool = 'market_research_alias'
+      WHERE sync_run_id = ? AND capability = 'MARKET_RESEARCH'`).run(runId);
+
+    expect(new GoLiveMigrationService(database).verify()).toMatchObject({
+      sellerSpriteCriticalRunId: null,
+      readyForDemoCleanup: false,
+    });
+  });
+
+  it('rejects an extra certified MARKET_RESEARCH call outside the critical months', () => {
+    database = openDatabase(':memory:');
+    const runId = addChildMarketCriticalFixture(database);
+    const service = new GoLiveMigrationService(database);
+    expect(service.verify().sellerSpriteCriticalRunId).toBe(runId);
+    database.prepare(`INSERT INTO mcp_call_logs (
+      id, provider_id, capability, actual_tool, request_hash, status, entity_type,
+      entity_id, result_count, response_metadata_json, started_at, sync_run_id,
+      observation_month
+    ) SELECT 'extra-research-wrong-month', provider_id, capability, actual_tool,
+      'extra-research-wrong-month', status, entity_type, entity_id, result_count,
+      response_metadata_json, started_at, sync_run_id, '202607'
+      FROM mcp_call_logs WHERE sync_run_id = ? AND capability = 'MARKET_RESEARCH'
+      LIMIT 1`).run(runId);
+
+    expect(service.verify()).toMatchObject({
+      sellerSpriteCriticalRunId: null,
+      readyForDemoCleanup: false,
+      hasMinimumRealCoverage: false,
+    });
+  });
+
+  it('rejects an uncertified extra successful market call even when required calls are certified', () => {
+    database = openDatabase(':memory:');
+    const runId = addChildMarketCriticalFixture(database);
+    const service = new GoLiveMigrationService(database);
+    expect(service.verify().sellerSpriteCriticalRunId).toBe(runId);
+    database.prepare(`INSERT INTO mcp_call_logs (
+      id, provider_id, capability, request_hash, status, entity_type,
+      entity_id, result_count, started_at, sync_run_id, observation_month,
+      actual_tool, response_metadata_json
+    ) VALUES ('extra-unverified-market', 'sellersprite', 'MARKET_STATISTICS',
+      'extra-unverified-market', 'success', 'market', '1055398:1063252', 1,
+      ?, ?, '202609', 'market_research_statistics', '{}')`)
+      .run(new Date().toISOString(), runId);
+
+    expect(service.verify()).toMatchObject({
+      sellerSpriteCriticalRunId: null,
+      readyForDemoCleanup: false,
+    });
+  });
+
+  it.each([
+    ['a missing', null],
+    ['an invalid', '2026-09'],
+  ])('rejects an extra response-echo-certified market call with %s observation month',
+    (_case, observationMonth) => {
+      database = openDatabase(':memory:');
+      const runId = addChildMarketCriticalFixture(database);
+      const service = new GoLiveMigrationService(database);
+      expect(service.verify().sellerSpriteCriticalRunId).toBe(runId);
+      if (observationMonth !== null) database.exec('PRAGMA ignore_check_constraints = ON');
+      try {
+        database.prepare(`INSERT INTO mcp_call_logs (
+          id, provider_id, capability, actual_tool, request_hash, status, entity_type,
+          entity_id, result_count, response_metadata_json, started_at, sync_run_id,
+          observation_month
+        ) SELECT ?, provider_id, capability, actual_tool, ?, status, entity_type,
+          entity_id, result_count,
+          json_set(response_metadata_json, '$.observationCertification.method', 'response_echo_v1'),
+          started_at, sync_run_id, ?
+          FROM mcp_call_logs WHERE sync_run_id = ? AND capability = 'MARKET_STATISTICS'
+          LIMIT 1`)
+          .run(`extra-response-echo-${observationMonth ?? 'missing'}`,
+            `extra-response-echo-${observationMonth ?? 'missing'}`, observationMonth, runId);
+      } finally {
+        if (observationMonth !== null) database.exec('PRAGMA ignore_check_constraints = OFF');
+      }
+
+      expect(service.verify()).toMatchObject({
+        sellerSpriteCriticalRunId: null,
+        readyForDemoCleanup: false,
+      });
+    });
+
+  it.each([
+    ['baseline research call', (db: AppDatabase, runId: string) => db.prepare(`
+      DELETE FROM mcp_call_logs WHERE sync_run_id = ? AND capability = 'MARKET_RESEARCH'
+        AND entity_id = '1055398:1063252:999' AND observation_month = '202608'
+    `).run(runId)],
+    ['current research non-positive result', (db: AppDatabase, runId: string) => db.prepare(`
+      UPDATE mcp_call_logs SET result_count = 0
+      WHERE sync_run_id = ? AND capability = 'MARKET_RESEARCH'
+        AND entity_id = '1055398:1063252:999' AND observation_month = '202609'
+    `).run(runId)],
     ['baseline statistics call', (db: AppDatabase, runId: string) => db.prepare(`
       DELETE FROM mcp_call_logs WHERE sync_run_id = ? AND capability = 'MARKET_STATISTICS'
         AND entity_id = '1055398:1063252:999' AND observation_month = '202608'

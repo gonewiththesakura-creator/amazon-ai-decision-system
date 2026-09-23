@@ -5,12 +5,14 @@ import type {
   SellerSpriteCompetitorCandidates,
   SellerSpriteConcentration,
   SellerSpriteData,
+  SellerSpriteMarketResearchSummary,
   SellerSpriteStatistics,
 } from '../adapters/sellersprite-mcp-adapter.js';
 import type { AppDatabase } from '../database/database.js';
 import { transaction } from '../database/database.js';
 import { ProductIdentityResolver } from '../domain/product-identity-resolver.js';
 import { sanitizeMcpError } from '../adapters/sellersprite-mcp-client.js';
+import { requireConfirmedOwnedRoster } from './owned-roster-declaration.js';
 
 export interface SellerSpriteMarketSyncInput {
   marketId: string;
@@ -80,6 +82,11 @@ interface SellerSpriteTrackedSyncResult {
 }
 
 export interface SellerSpriteSyncPort {
+  fetchMarketResearchSummary(input: {
+    marketplace: string;
+    nodeIdPath: string;
+    month?: string;
+  }, context?: { runId?: string; requireObservationMonth?: boolean }): Promise<SellerSpriteData<SellerSpriteMarketResearchSummary>>;
   fetchMarketStatistics(input: {
     marketplace: string;
     nodeIdPath: string;
@@ -195,7 +202,7 @@ export class SellerSpriteSyncService {
       name: 'SellerSprite 市场同步', taskType: 'market_refresh', target: market.id,
       marketplace: market.marketplace,
     }, async (runId) => {
-      const prepared = await this.prepareMarket(input, runId);
+      const prepared = await this.prepareMarket(input, runId, true);
       return () => {
         const current = this.requireMarket(market.id);
         if (current.marketplace !== market.marketplace
@@ -490,6 +497,7 @@ export class SellerSpriteSyncService {
     const market = this.requireMarket(input.marketId);
     const month = compactMonth(input.month);
     const baselineMonth = previousMonth(month);
+    requireConfirmedOwnedRoster(this.database, market.marketplace);
     const products = this.activeOwnedProducts(market.marketplace, market.id);
     const marketNodes = this.criticalMarketNodes(market, products);
     const runId = randomUUID();
@@ -521,6 +529,7 @@ export class SellerSpriteSyncService {
       for (const product of products) preparedProducts.push(await this.prepareProduct(product, runId));
 
       primary = transaction(this.database, () => {
+        requireConfirmedOwnedRoster(this.database, market.marketplace);
         const currentMarket = this.requireMarket(market.id);
         if (currentMarket.marketplace !== market.marketplace
           || currentMarket.sellerSpriteNodePath !== market.sellerSpriteNodePath
@@ -562,6 +571,7 @@ export class SellerSpriteSyncService {
       const candidateCoverage = await this.syncCandidateDiscoveryBatch(runId, market.marketplace, products);
       const competitorCoverage = await this.syncCoreCompetitorBatch(runId, market.marketplace);
       transaction(this.database, () => {
+        requireConfirmedOwnedRoster(this.database, market.marketplace);
         const completedAt = new Date().toISOString();
         const coverageUpdate = this.database.prepare(`
           UPDATE data_coverage_runs SET is_complete = 1
@@ -724,11 +734,14 @@ export class SellerSpriteSyncService {
       nodeIdPath: market.sellerSpriteNodePath,
       month: compactMonth(input.month),
     };
-    const [statistics, concentration] = await Promise.all([
+    const [research, statistics, concentration] = await Promise.all([
+      this.port.fetchMarketResearchSummary(request, { runId, requireObservationMonth }),
       this.port.fetchMarketStatistics(request, { runId, requireObservationMonth }),
       this.port.fetchMarketConcentration(request, { runId, requireObservationMonth }),
     ]);
+    ensureCompatibleProvenance(research.provenance, statistics.provenance);
     ensureCompatibleProvenance(statistics.provenance, concentration.provenance);
+    ensureResponseScope(research.data, market.marketplace, request.nodeIdPath, request.month);
     ensureResponseScope(statistics.data, market.marketplace, request.nodeIdPath, request.month);
     for (const item of concentration.data) {
       ensureResponseScope(item, market.marketplace, request.nodeIdPath, request.month);
@@ -738,29 +751,48 @@ export class SellerSpriteSyncService {
       asin: stringOrNull(item.asin),
       title: stringOrNull(item.title),
       brand: stringOrNull(item.brand),
-      price: finiteNumber(item.price),
-      rating: finiteNumber(item.rating),
-      ratings: finiteNumber(item.ratings),
-      totalUnits: finiteNumber(item.totalUnits),
-      totalRevenue: finiteNumber(item.totalRevenue),
-      totalUnitsRatio: finiteNumber(item.totalUnitsRatio),
-      totalRevenueRatio: finiteNumber(item.totalRevenueRatio),
+      price: nonnegativeNumber(item.price),
+      rating: ratingOrNull(item.rating),
+      ratings: nonnegativeNumber(item.ratings),
+      reviews: nonnegativeNumber(item.reviews),
+      totalUnits: nonnegativeNumber(item.totalUnits),
+      totalRevenue: nonnegativeNumber(item.totalRevenue),
+      totalUnitsRatio: fractionOrNull(item.totalUnitsRatio),
+      totalRevenueRatio: fractionOrNull(item.totalRevenueRatio),
     }));
+    const researchData = research.data;
     const data = statistics.data;
+    const totalProducts = nonnegativeInteger(researchData.totalProducts);
+    const topProducts = positiveInteger(researchData.topProducts);
+    const summaryCoversMarket = totalProducts !== null && topProducts === totalProducts;
+    const asins = concentration.data.map((item) => stringOrNull(item.asin)?.toUpperCase());
+    const concentrationCoversMarket = summaryCoversMarket
+      && concentration.data.length === topProducts
+      && asins.every((asin) => asin !== undefined && asin !== null)
+      && new Set(asins).size === concentration.data.length;
+    const monthlySales = summaryCoversMarket ? nonnegativeNumber(researchData.totalUnits) : null;
+    const top10Sales = nonnegativeNumber(researchData.top10ProductSales);
+    const top20Sales = nonnegativeNumber(researchData.top20ProductSales);
+    const rankedSalesValid = monthlySales !== null && monthlySales > 0
+      && top10Sales !== null && top20Sales !== null
+      && top10Sales <= top20Sales && top20Sales <= monthlySales;
     const metrics: Record<MarketMetric, number | null> = {
-      productCount: finiteNumber(data.products),
-      sellerCount: finiteNumber(data.sellers),
-      brandCount: finiteNumber(data.brands),
-      monthlySales: finiteNumber(data.totalUnits),
-      monthlyRevenue: finiteNumber(data.totalRevenue),
-      avgPrice: finiteNumber(data.avgPrice),
-      medianPrice: finiteNumber(data.medianPrice),
-      avgRating: finiteNumber(data.avgRating),
-      medianReviews: finiteNumber(data.medianReviews),
-      top10Share: percentOrNull(data.top10Share),
-      top20Share: percentOrNull(data.top20Share),
-      newProductShare: finiteNumber(data.newProductShare)
-        ?? finiteNumber(data.newProductProportion),
+      productCount: totalProducts ?? nonnegativeInteger(data.totalProducts),
+      sellerCount: summaryCoversMarket ? nonnegativeInteger(data.sellers) : null,
+      brandCount: summaryCoversMarket ? nonnegativeInteger(data.brands) : null,
+      monthlySales,
+      monthlyRevenue: summaryCoversMarket ? nonnegativeNumber(researchData.totalRevenue) : null,
+      avgPrice: summaryCoversMarket ? nonnegativeNumber(data.avgPrice) : null,
+      medianPrice: concentrationCoversMarket
+        ? completeNonnegativeMedian(concentration.data.map((item) => item.price)) : null,
+      avgRating: summaryCoversMarket ? ratingOrNull(data.avgRating) : null,
+      medianReviews: concentrationCoversMarket
+        ? completeNonnegativeMedian(concentration.data.map((item) => item.reviews)) : null,
+      top10Share: rankedSalesValid ? top10Sales! / monthlySales * 100 : null,
+      top20Share: rankedSalesValid ? top20Sales! / monthlySales * 100 : null,
+      newProductShare: summaryCoversMarket
+        ? percentOrNull(data.newProductShare) ?? percentOrNull(data.newProductProportion)
+        : null,
     };
     if (Object.values(metrics).every((value) => value === null)) {
       throw new Error('SellerSprite 市场响应没有有效指标。');
@@ -1294,6 +1326,42 @@ function compactObservationMonth(value: string): string {
 
 function finiteNumber(value: unknown): number | null {
   return typeof value === 'number' && Number.isFinite(value) ? value : null;
+}
+
+function nonnegativeNumber(value: unknown): number | null {
+  const number = finiteNumber(value);
+  return number !== null && number >= 0 ? number : null;
+}
+
+function nonnegativeInteger(value: unknown): number | null {
+  const number = nonnegativeNumber(value);
+  return number !== null && Number.isSafeInteger(number) ? number : null;
+}
+
+function positiveInteger(value: unknown): number | null {
+  const number = nonnegativeInteger(value);
+  return number !== null && number > 0 ? number : null;
+}
+
+function completeNonnegativeMedian(values: unknown[]): number | null {
+  if (values.length === 0) return null;
+  const numbers = values.map(nonnegativeNumber);
+  if (numbers.some((value) => value === null)) return null;
+  const sorted = (numbers as number[]).sort((left, right) => left - right);
+  const middle = Math.floor(sorted.length / 2);
+  return sorted.length % 2 === 1
+    ? sorted[middle]!
+    : (sorted[middle - 1]! + sorted[middle]!) / 2;
+}
+
+function ratingOrNull(value: unknown): number | null {
+  const number = nonnegativeNumber(value);
+  return number !== null && number <= 5 ? number : null;
+}
+
+function fractionOrNull(value: unknown): number | null {
+  const number = nonnegativeNumber(value);
+  return number !== null && number <= 1 ? number : null;
 }
 
 function stringOrNull(value: unknown): string | null {
