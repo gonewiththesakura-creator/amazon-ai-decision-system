@@ -11,6 +11,8 @@ Research Job -> Data -> Normalize -> Snapshot -> Rule -> AI Explanation
 
 ## 本地运行
 
+换电脑或交给另一位 Codex 时，先读 [项目交接说明](docs/CODEX_HANDOFF.md)。代码克隆不包含本地数据库、真实主档、验收报告或密钥，需要按交接清单恢复私人数据。
+
 要求 Node.js 22 或更高版本。
 
 ```powershell
