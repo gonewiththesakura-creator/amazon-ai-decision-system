@@ -100,7 +100,6 @@ export function sellerSpriteEndpoint(configured: string, secret?: string): URL {
       'SellerSprite MCP URL 不得包含凭据；请使用 SELLERSPRITE_MCP_SECRET。',
     );
   }
-  if (secret) endpoint.searchParams.set('secret-key', secret);
   return endpoint;
 }
 
@@ -134,7 +133,14 @@ export class SellerSpriteMcpClient {
       if (!configured) throw new SellerSpriteMcpError('AUTH_ERROR', 'SellerSprite MCP is not configured');
       const endpoint = sellerSpriteEndpoint(configured, process.env.SELLERSPRITE_MCP_SECRET);
       const sdkClient = new Client({ name: 'amazon-ai-decision-system', version: '2.2.0' });
-      const sdkTransport = new StreamableHTTPClientTransport(endpoint);
+      const secret = process.env.SELLERSPRITE_MCP_SECRET;
+      const sdkTransport = new StreamableHTTPClientTransport(endpoint, {
+        requestInit: {
+          ...(secret ? { headers: { 'secret-key': secret } } : {}),
+          // Custom credential headers must never follow a provider redirect.
+          redirect: 'error',
+        },
+      });
       this.transport = {
         connect: (requestOptions) => sdkClient.connect(sdkTransport, requestOptions),
         ping: (requestOptions) => sdkClient.ping(requestOptions),

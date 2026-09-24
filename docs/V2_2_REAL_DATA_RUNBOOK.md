@@ -13,6 +13,8 @@ npm run dev
 
 在本机或服务器的 `.env` 中填写 `SELLERSPRITE_MCP_URL`（不含用户名、密码或任何密钥查询参数的 MCP 地址）和 `SELLERSPRITE_MCP_SECRET`。端点解析器会拒绝 URL 内嵌凭据；带 Secret 的远程地址必须使用 HTTPS，本机回环地址才允许 HTTP。两者只能供服务端读取。不要放入 `VITE_*`、命令行历史、截图、工单、日志或公开 Git 仓库。`.env`、本地数据库、备份和原始业务文件已被 Git 忽略。公开仓库不应包含真实 SKU 报表或凭据；向外部署前还需另行配置正式身份认证，当前 Admin/Viewer 只是本地权限预览。
 
+服务端使用官方支持的 `secret-key` HTTP Header 传输 Secret，不追加 URL query，也不回退到 query。MCP HTTP 请求拒绝重定向，防止自定义凭据 Header 转发到其他地址；日志、错误和缓存继续脱敏。官方配置参考：https://open.sellersprite.com/mcp/16 。
+
 默认前端为 `http://127.0.0.1:5173`，API 为 `http://127.0.0.1:8787`。首次打开数据库会执行向前迁移。不要对有业务数据的数据库运行 `npm run db:reset`，该命令会删除本地内容。
 
 真实链验收必须先启动专用 API 进程，将 `DATABASE_PATH` 指向独立验收数据库，并在该隔离库核对市场节点和产品主数据；不得把验收 runner 指向默认业务库。`acceptance:real` 限制调用路由，但不创建或校验数据库隔离。核对完成后，用专用进程的 loopback 地址执行：

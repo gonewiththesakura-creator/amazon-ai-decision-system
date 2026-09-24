@@ -441,7 +441,7 @@ describe('SellerSpriteMcpClient', () => {
 
   it('uses only the separate SellerSprite secret and rejects credentials embedded in the URL', () => {
     const endpoint = sellerSpriteEndpoint('https://mcp.sellersprite.com/mcp', 'test-secret');
-    expect(endpoint.searchParams.get('secret-key')).toBe('test-secret');
+    expect(endpoint.href).toBe('https://mcp.sellersprite.com/mcp');
     expect(endpoint.searchParams.has('secretKey')).toBe(false);
     expect(() => sellerSpriteEndpoint('https://mcp.sellersprite.com/mcp?secretKey=old', 'test-secret'))
       .toThrow(/URL.*凭据|credential/i);
@@ -469,7 +469,7 @@ describe('SellerSpriteMcpClient', () => {
   it.each(['http://localhost:8787/mcp', 'http://127.0.0.1:8787/mcp', 'http://[::1]:8787/mcp'])(
     'permits a secret-bearing loopback endpoint at %s', (address) => {
       expect(sellerSpriteEndpoint(address, 'test-secret').searchParams.get('secret-key'))
-        .toBe('test-secret');
+        .toBeNull();
     },
   );
 });
