@@ -330,8 +330,10 @@ export class SellerSpriteSyncService {
       const candidates = this.database.prepare("SELECT id FROM competitor_candidates WHERE source_product_id=? AND marketplace=? AND source_type='mcp'").all(product.id, product.marketplace);
       transaction(this.database, () => {
         for (const candidate of candidates) this.database.prepare(`INSERT OR IGNORE INTO competitor_candidate_run_links
-          (sync_run_id,candidate_id,source_product_id,disposition,created_at) VALUES (?, ?, ?, 'reused', ?)`)
-          .run(runId, candidate.id, product.id, new Date().toISOString());
+          (sync_run_id,candidate_id,source_product_id,disposition,created_at,observation_id)
+          VALUES (?, ?, ?, 'reused', ?, (SELECT id FROM competitor_candidate_observations
+            WHERE candidate_id=? ORDER BY collected_at DESC,rowid DESC LIMIT 1))`)
+          .run(runId, candidate.id, product.id, new Date().toISOString(), candidate.id);
         budget.record(discoveryKey, fresh ? 'freshness_skip' : 'budget_blocked');
         if (fresh) budget.record(discoveryKey, 'local_hit');
         complete?.();
@@ -353,6 +355,9 @@ export class SellerSpriteSyncService {
         candidate !== null && candidate.asin !== product.asin.toUpperCase()
       ));
     const candidates = [...new Map(normalized.map((candidate) => [candidate.asin, candidate])).values()];
+    const schema = this.database.prepare(`SELECT schema_hash FROM mcp_local_observations
+      WHERE capability='ASIN_COMPETITOR_DISCOVERY' AND scope_key=? AND collected_at=?
+      ORDER BY collected_at DESC LIMIT 1`).get(requestKey([product.marketplace,product.asin,null]),response.provenance.collectedAt);
 
     return transaction(this.database, () => {
       const current = this.requireOwnedProduct(product.id);
@@ -364,16 +369,17 @@ export class SellerSpriteSyncService {
       const statement = this.database.prepare(`
         INSERT OR IGNORE INTO competitor_candidates (
           id, marketplace, asin, source_product_id, source, source_type,
-          payload_json, status, created_at, sync_run_id
-        ) VALUES (?, ?, ?, ?, ?, 'mcp', ?, 'pending_review', ?, ?)
+          payload_json, status, created_at, sync_run_id, first_seen_at, last_seen_at
+        ) VALUES (?, ?, ?, ?, ?, 'mcp', ?, 'pending_review', ?, ?, ?, ?)
       `);
       for (const candidate of candidates) {
         const candidateId = randomUUID();
         const result = statement.run(
           candidateId, product.marketplace, candidate.asin, product.id,
-          response.provenance.source, JSON.stringify(candidate.payload),
+          response.provenance.source, JSON.stringify({ asin: candidate.asin }),
           response.provenance.collectedAt,
           runId,
+          response.provenance.collectedAt, response.provenance.collectedAt,
         );
         const disposition = result.changes === 1 ? 'inserted' : 'reused';
         const existing = result.changes === 1 ? undefined : this.database.prepare(`
@@ -384,27 +390,43 @@ export class SellerSpriteSyncService {
           id: string; source: string; sourceType: string; payloadJson: string;
         } | undefined;
         if (existing) {
-          const storedPayload = safeJsonObject(existing.payloadJson);
-          const fields = Object.keys(candidate.payload);
-          if (existing.sourceType !== 'mcp' || existing.source !== response.provenance.source
-            || Object.keys(storedPayload).length !== fields.length
-            || fields.some((field) => storedPayload[field] !== candidate.payload[field])) {
+          if (existing.sourceType !== 'mcp' || existing.source !== response.provenance.source) {
             throw new Error('竞品候选来源或标准化数据与已有记录不一致，需人工核对。');
           }
         }
         const linkedCandidateId = result.changes === 1 ? candidateId : existing?.id;
         if (!linkedCandidateId) throw new Error('竞品候选运行关联创建失败。');
+        const previous = this.latestCandidatePayload(linkedCandidateId, existing?.payloadJson ?? '{}');
+        const identityReview = ['title', 'brand', 'parentAsin'].some((field) =>
+          previous[field] != null && candidate.payload[field] != null && previous[field] !== candidate.payload[field]);
+        const observationId = randomUUID();
+        this.database.prepare(`INSERT INTO competitor_candidate_observations
+          (id,candidate_id,sync_run_id,collected_at,price,estimated_sales,revenue,rating,review_count,bsr,
+           title,brand,normalized_payload_json,provenance_json,identity_review_required,schema_hash)
+          VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(observationId,linkedCandidateId,runId,
+          response.provenance.collectedAt,candidate.payload.price,candidate.payload.units,candidate.payload.revenue,
+          candidate.payload.rating,candidate.payload.ratings,candidate.payload.bsr,candidate.payload.title,
+          candidate.payload.brand,JSON.stringify(candidate.payload),JSON.stringify(response.provenance),Number(identityReview),
+          schema?.schema_hash ?? null);
+        this.database.prepare('UPDATE competitor_candidates SET last_seen_at=MAX(COALESCE(last_seen_at,created_at),?) WHERE id=?')
+          .run(response.provenance.collectedAt,linkedCandidateId);
         const link = this.database.prepare(`
           INSERT INTO competitor_candidate_run_links (
-            sync_run_id, candidate_id, source_product_id, disposition, created_at
-          ) VALUES (?, ?, ?, ?, ?)
-        `).run(runId, linkedCandidateId, product.id, disposition, new Date().toISOString());
+            sync_run_id, candidate_id, source_product_id, disposition, created_at, observation_id
+          ) VALUES (?, ?, ?, ?, ?, ?)
+        `).run(runId, linkedCandidateId, product.id, disposition, new Date().toISOString(), observationId);
         observed += Number(link.changes);
       }
       this.database.prepare('INSERT OR REPLACE INTO mcp_discovery_state VALUES (?, ?)').run(discoveryKey, response.provenance.collectedAt);
       if (complete) complete();
       return { candidates: observed };
     });
+  }
+
+  private latestCandidatePayload(candidateId: string, fallback: string): Record<string, unknown> {
+    const row = this.database.prepare(`SELECT normalized_payload_json AS payload FROM competitor_candidate_observations
+      WHERE candidate_id=? ORDER BY collected_at DESC, rowid DESC LIMIT 1`).get(candidateId);
+    return safeJsonObject(row ? String(row.payload) : fallback);
   }
 
   listCompetitorCandidates(ownedProductId: string): SellerSpriteCandidateSummary[] {
@@ -424,7 +446,7 @@ export class SellerSpriteSyncService {
       reviewedAt: string | null;
     }>;
     return rows.map((row) => {
-      const payload = safeJsonObject(row.payloadJson);
+      const payload = this.latestCandidatePayload(row.id, row.payloadJson);
       return {
         id: row.id,
         asin: row.asin,
@@ -472,7 +494,7 @@ export class SellerSpriteSyncService {
     if (!candidate) throw new Error('竞争候选不存在。');
     if (candidate.marketplace !== owned.marketplace) throw new Error('竞争候选站点不匹配。');
     if (candidate.status !== 'pending_review') throw new Error('竞争候选已经处理。');
-    const payload = safeJsonObject(candidate.payloadJson);
+    const payload = this.latestCandidatePayload(candidate.id, candidate.payloadJson);
 
     return transaction(this.database, () => {
       const existing = this.database.prepare(`
@@ -655,38 +677,58 @@ export class SellerSpriteSyncService {
       products.length + marketNodes.length, startedAt);
 
     let primary: { runId: string; taskId: string; marketSnapshots: number; productSnapshots: number };
+    const primaryFailures: Array<{id:string;status:'failed'}> = [];
+    const assertScope = () => {
+      requireConfirmedOwnedRoster(this.database, market.marketplace);
+      const currentMarket = this.requireMarket(market.id);
+      if (currentMarket.marketplace !== market.marketplace
+        || currentMarket.sellerSpriteNodePath !== market.sellerSpriteNodePath
+        || sellerSpriteRosterScope(this.database,market.marketplace).digest !== scope.rosterScopeDigest
+        || JSON.stringify(this.activeOwnedProducts(market.marketplace,market.id)) !== JSON.stringify(products)
+        || JSON.stringify(this.criticalMarketNodes(currentMarket,products)) !== JSON.stringify(marketNodes)) {
+        throw new Error('关键同步期间市场节点或自有 SKU 范围发生变化，请重新运行。');
+      }
+    };
     try {
       if (products.length === 0) throw new Error('关键同步需要至少一个启用中的自有 SKU。');
-      // Remote calls finish outside the write transaction; a failure cannot commit half a batch.
+      // Commit each validated observation for audit, even if a later required step fails.
+      let marketSnapshots = 0;
+      let productSnapshots = 0;
+      const strict = currentExecution().syncMode !== 'incremental';
       const preparedMarkets: PreparedMarketObservation[] = [];
-      for (const node of marketNodes) for (const period of [month, baselineMonth]) {
-        preparedMarkets.push(await this.prepareMarket({ marketId: node.id, month: period }, runId, true));
-      }
       const preparedProducts: PreparedProductObservation[] = [];
-      for (const product of products) preparedProducts.push(await this.prepareProduct(product, runId));
+      for (const node of marketNodes) for (const period of [month, baselineMonth]) {
+        const prepared = await this.prepareMarket({ marketId: node.id, month: period }, runId, true);
+        if (strict) marketSnapshots += transaction(this.database, () => { assertScope(); return this.persistMarket(prepared, runId); });
+        else preparedMarkets.push(prepared);
+      }
+      let lastProductError: unknown;
+      for (const product of products) {
+        let prepared: PreparedProductObservation;
+        try {
+          prepared = await this.prepareProduct(product, runId);
+        } catch (error) {
+          if (strict) throw error;
+          primaryFailures.push({id:product.id,status:'failed'});
+          lastProductError=error;
+          continue;
+        }
+        if (strict) productSnapshots += transaction(this.database, () => { assertScope(); return this.persistProduct(prepared, 'product', runId); });
+        else preparedProducts.push(prepared);
+      }
+      if (primaryFailures.length===products.length) throw lastProductError;
 
       primary = transaction(this.database, () => {
-        requireConfirmedOwnedRoster(this.database, market.marketplace);
-        const currentMarket = this.requireMarket(market.id);
-        if (currentMarket.marketplace !== market.marketplace
-          || currentMarket.sellerSpriteNodePath !== market.sellerSpriteNodePath
-          || sellerSpriteRosterScope(this.database,market.marketplace).digest !== scope.rosterScopeDigest
-          || JSON.stringify(this.activeOwnedProducts(market.marketplace, market.id)) !== JSON.stringify(products)
-          || JSON.stringify(this.criticalMarketNodes(currentMarket, products)) !== JSON.stringify(marketNodes)) {
-          throw new Error('关键同步期间市场节点或自有 SKU 范围发生变化，请重新运行。');
-        }
-        const marketSnapshots = preparedMarkets.reduce(
-          (count, prepared) => count + this.persistMarket(prepared, runId), 0,
-        );
-        let productSnapshots = 0;
-        for (const product of preparedProducts) productSnapshots += this.persistProduct(product, 'product', runId);
+        assertScope();
+        for (const prepared of preparedMarkets) marketSnapshots += this.persistMarket(prepared, runId);
+        for (const prepared of preparedProducts) productSnapshots += this.persistProduct(prepared, 'product', runId);
         const completedAt = new Date().toISOString();
         this.database.prepare(`
           INSERT INTO data_coverage_runs (
             id, marketplace, run_type, coverage_json, is_complete, created_at
           ) VALUES (?, ?, 'critical_sync', ?, 0, ?)
         `).run(runId, market.marketplace, JSON.stringify({
-          ...scope, marketSnapshots, activeOwnedProducts: products.length, productSnapshots,
+          ...scope, marketSnapshots, activeOwnedProducts: products.length, productSnapshots, primaryFailures,
         }), completedAt);
         return { runId, taskId: runId, marketSnapshots, productSnapshots };
       });
@@ -696,7 +738,7 @@ export class SellerSpriteSyncService {
         this.database.prepare(`
           UPDATE data_tasks SET status = 'failed', failed = 1, completed_at = ?, error_log = ?
           WHERE id = ?
-        `).run(completedAt, 'SellerSprite 关键同步失败；本次未更新任何观察，请检查连接和数据范围。', runId);
+        `).run(completedAt, 'SellerSprite 关键同步失败；已验证观察仅保留用于审计，本次运行不可用于 Go Live。', runId);
         this.database.prepare(`
           INSERT INTO data_coverage_runs (
             id, marketplace, run_type, coverage_json, is_complete, created_at
@@ -714,13 +756,13 @@ export class SellerSpriteSyncService {
           throw new Error('Provider scope changed during certification');
         const completedAt = new Date().toISOString();
         const coverageUpdate = this.database.prepare(`
-          UPDATE data_coverage_runs SET is_complete = 1
+          UPDATE data_coverage_runs SET is_complete = ?
           WHERE id = ? AND run_type = 'critical_sync' AND is_complete = 0
-        `).run(runId);
+        `).run(primaryFailures.length===0 ? 1 : 0,runId);
         const taskUpdate = this.database.prepare(`
-          UPDATE data_tasks SET status = 'success', success = total, completed_at = ?
+          UPDATE data_tasks SET status = ?, success = total-?, failed = ?, completed_at = ?
           WHERE id = ? AND sync_run_id = ? AND task_type = 'critical_sync' AND status = 'running'
-        `).run(completedAt, runId, runId);
+        `).run(primaryFailures.length ? 'partial':'success',primaryFailures.length,primaryFailures.length,completedAt,runId,runId);
         if (coverageUpdate.changes !== 1 || taskUpdate.changes !== 1) {
           throw new Error('SellerSprite 关键同步完成状态发生冲突。');
         }
@@ -757,19 +799,24 @@ export class SellerSpriteSyncService {
     let candidates = 0;
     const covered: Array<{ id: string; asin: string; candidates: number }> = [];
     const failures: Array<{ id: string; status: 'failed' }> = [];
+    let fatalError: Error | undefined;
     for (const product of products) {
       try {
         const result = await this.discoverCompetitorsForProduct(product, 20, runId);
         success += 1;
         candidates += result.candidates;
         covered.push({ id: product.id, asin: product.asin, candidates: result.candidates });
-      } catch {
+      } catch (error) {
         failed += 1;
         failures.push({ id: product.id, status: 'failed' });
+        if (currentExecution().syncMode !== 'incremental') {
+          fatalError = new Error(sanitizeMcpError(error));
+          break;
+        }
       }
     }
     const status: SellerSpriteCandidateCoverage['status'] = failed === 0
-      ? 'success' : success === 0 ? 'failed' : 'partial';
+      ? 'success' : fatalError || success === 0 ? 'failed' : 'partial';
     const completedAt = new Date().toISOString();
     transaction(this.database, () => {
       this.database.prepare(`
@@ -779,9 +826,12 @@ export class SellerSpriteSyncService {
         failed > 0 ? `${failed} 个自有 SKU 的竞品候选未更新；未自动确认任何关系。` : null,
         taskId, runId);
       this.mergeRunCoverage(runId, 'candidateDiscovery', {
+        observationVersion: 1,
         taskId, status, total: products.length, success, failed, candidates, covered, failures,
+        unattempted: products.slice(success + failed).map(({ id }) => id),
       });
     });
+    if (fatalError) throw fatalError;
     return { taskId, status, total: products.length, success, failed, candidates };
   }
 
@@ -816,6 +866,7 @@ export class SellerSpriteSyncService {
     let failed = 0;
     const covered: Array<{ id: string; asin: string; snapshots: number }> = [];
     const failures: Array<{ id: string; status: 'failed' }> = [];
+    let fatalError: Error | undefined;
     for (const competitor of competitors) {
       try {
         const prepared = await this.prepareProduct(competitor, runId, true);
@@ -836,13 +887,17 @@ export class SellerSpriteSyncService {
         });
         success += 1;
         covered.push({ id: competitor.id, asin: competitor.asin, snapshots });
-      } catch {
+      } catch (error) {
         failed += 1;
         failures.push({ id: competitor.id, status: 'failed' });
+        if (currentExecution().syncMode !== 'incremental') {
+          fatalError = new Error(sanitizeMcpError(error));
+          break;
+        }
       }
     }
     const status: SellerSpriteCompetitorCoverage['status'] = failed === 0
-      ? 'success' : success === 0 ? 'failed' : 'partial';
+      ? 'success' : fatalError || success === 0 ? 'failed' : 'partial';
     const completedAt = new Date().toISOString();
     transaction(this.database, () => {
       this.database.prepare(`
@@ -854,8 +909,10 @@ export class SellerSpriteSyncService {
       this.mergeRunCoverage(runId, 'secondaryCompetitors', {
         taskId, status, total: competitors.length, success, failed,
         roster: competitors.map(({ id, asin }) => ({ id, asin })), covered, failures,
+        unattempted: competitors.slice(success + failed).map(({ id }) => id),
       });
     });
+    if (fatalError) throw fatalError;
     return { taskId, status, total: competitors.length, success, failed };
   }
 
@@ -1390,10 +1447,11 @@ function normalizeCandidate(candidate: Record<string, unknown>): {
       title: stringOrNull(candidate.title),
       brand: stringOrNull(candidate.brand),
       price: finiteNumber(candidate.price),
-      units: finiteNumber(candidate.units),
+      units: finiteNumber(candidate.units ?? candidate.estimatedSales ?? candidate.sales),
       revenue: finiteNumber(candidate.revenue),
       rating: finiteNumber(candidate.rating),
-      ratings: finiteNumber(candidate.ratings),
+      ratings: finiteNumber(candidate.ratings ?? candidate.reviewCount),
+      bsr: finiteNumber(candidate.bsr ?? candidate.rank),
     },
   };
 }

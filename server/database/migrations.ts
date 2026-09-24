@@ -2307,6 +2307,47 @@ migrations.push({version:34,apply(database:DatabaseSync) { database.exec(`
   ALTER TABLE owned_roster_declarations_v34 RENAME TO owned_roster_declarations;
 `); }});
 
+migrations.push({ version: 35, apply(database: DatabaseSync) {
+  // Narrow legacy fixtures may not include the optional discovery subsystem.
+  if (!database.prepare("SELECT 1 FROM sqlite_master WHERE name='competitor_candidates'").get()) return;
+  if (!database.prepare('PRAGMA table_info(competitor_candidates)').all().some(row => row.name==='sync_run_id')) return;
+  database.exec(`
+  ALTER TABLE competitor_candidates ADD COLUMN first_seen_at TEXT;
+  ALTER TABLE competitor_candidates ADD COLUMN last_seen_at TEXT;
+  UPDATE competitor_candidates SET first_seen_at=created_at,last_seen_at=created_at;
+  CREATE TABLE competitor_candidate_observations (
+    id TEXT PRIMARY KEY,
+    candidate_id TEXT NOT NULL REFERENCES competitor_candidates(id),
+    sync_run_id TEXT REFERENCES data_tasks(id), collected_at TEXT NOT NULL,
+    price REAL, estimated_sales REAL, revenue REAL, rating REAL, review_count REAL, bsr REAL,
+    title TEXT, brand TEXT, normalized_payload_json TEXT NOT NULL CHECK(json_valid(normalized_payload_json)),
+    provenance_json TEXT NOT NULL CHECK(json_valid(provenance_json)), schema_hash TEXT,
+    identity_review_required INTEGER NOT NULL DEFAULT 0 CHECK(identity_review_required IN (0,1)),
+    legacy INTEGER NOT NULL DEFAULT 0 CHECK(legacy IN (0,1))
+  );
+  INSERT INTO competitor_candidate_observations
+    (id,candidate_id,sync_run_id,collected_at,price,estimated_sales,revenue,rating,review_count,
+     title,brand,normalized_payload_json,provenance_json,legacy)
+    SELECT 'legacy:'||id,id,sync_run_id,created_at,json_extract(payload_json,'$.price'),
+      json_extract(payload_json,'$.units'),json_extract(payload_json,'$.revenue'),
+      json_extract(payload_json,'$.rating'),json_extract(payload_json,'$.ratings'),
+      json_extract(payload_json,'$.title'),json_extract(payload_json,'$.brand'),payload_json,
+      json_object('source',source,'sourceType',source_type,'legacy',1),1
+    FROM competitor_candidates;
+  CREATE INDEX candidate_observation_latest ON competitor_candidate_observations(candidate_id,collected_at DESC);
+  CREATE TRIGGER candidate_observation_no_update BEFORE UPDATE ON competitor_candidate_observations
+    BEGIN SELECT RAISE(ABORT,'Candidate observations are immutable'); END;
+  CREATE TRIGGER candidate_observation_no_delete BEFORE DELETE ON competitor_candidate_observations
+    BEGIN SELECT RAISE(ABORT,'Candidate observations are immutable'); END;
+  ALTER TABLE competitor_candidate_run_links ADD COLUMN observation_id TEXT REFERENCES competitor_candidate_observations(id);
+  CREATE TRIGGER failed_mcp_run_terminal BEFORE UPDATE OF status ON data_tasks
+    WHEN OLD.status='failed' AND OLD.source='SellerSprite MCP' AND NEW.status<>'failed'
+    BEGIN SELECT RAISE(ABORT,'Failed MCP runs are terminal'); END;
+  CREATE TRIGGER failed_mcp_coverage_terminal BEFORE UPDATE OF is_complete ON data_coverage_runs
+    WHEN NEW.is_complete=1 AND EXISTS(SELECT 1 FROM data_tasks WHERE id=NEW.id AND status='failed')
+    BEGIN SELECT RAISE(ABORT,'Failed runs cannot satisfy coverage'); END;
+`); } });
+
 export function migrate(database: DatabaseSync): void {
   database.exec(`
     CREATE TABLE IF NOT EXISTS schema_migrations (

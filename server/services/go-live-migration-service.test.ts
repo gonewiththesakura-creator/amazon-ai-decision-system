@@ -286,6 +286,41 @@ describe('GoLiveMigrationService', () => {
     });
   });
 
+  it('requires current-run candidate observations for the new discovery evidence contract', () => {
+    database=openDatabase(':memory:');
+    insertObservationFixture(database,'mcp','mcp');
+    addVerifiedMcpCoverage(database,'market-us','owned-product');
+    const service=new GoLiveMigrationService(database);
+    const runId=service.verify().sellerSpriteCriticalRunId!;
+    const row=database.prepare('SELECT coverage_json FROM data_coverage_runs WHERE id=?').get(runId)!;
+    const coverage=JSON.parse(String(row.coverage_json));
+    coverage.candidateDiscovery.observationVersion=1;
+    database.prepare('UPDATE data_coverage_runs SET coverage_json=? WHERE id=?').run(JSON.stringify(coverage),runId);
+    expect(service.verify().sellerSpriteCriticalRunId).toBeNull();
+    database.prepare(`INSERT INTO competitor_candidate_observations
+      (id,candidate_id,sync_run_id,collected_at,normalized_payload_json,provenance_json)
+      SELECT 'test-observation:'||candidate_id,candidate_id,sync_run_id,created_at,'{}',
+        '{"sourceType":"mcp"}' FROM competitor_candidate_run_links WHERE sync_run_id=?`).run(runId);
+    database.prepare(`UPDATE competitor_candidate_run_links SET observation_id='test-observation:'||candidate_id
+      WHERE sync_run_id=?`).run(runId);
+    expect(service.verify().sellerSpriteCriticalRunId).toBe(runId);
+    database.prepare('UPDATE competitor_candidate_run_links SET observation_id=NULL WHERE sync_run_id=?').run(runId);
+    expect(service.verify().sellerSpriteCriticalRunId).toBeNull();
+  });
+
+  it('never accepts a failed run even with otherwise complete successful evidence and forbids revival', () => {
+    database=openDatabase(':memory:');
+    insertObservationFixture(database,'mcp','mcp');
+    addVerifiedMcpCoverage(database,'market-us','owned-product');
+    const service=new GoLiveMigrationService(database);
+    const runId=service.verify().sellerSpriteCriticalRunId!;
+    expect(runId).toEqual(expect.any(String));
+    database.prepare("UPDATE data_tasks SET status='failed' WHERE id=?").run(runId);
+    expect(service.verify()).toMatchObject({sellerSpriteCriticalRunId:null,readyForDemoCleanup:false});
+    expect(()=>database!.prepare("UPDATE data_tasks SET status='running' WHERE id=?").run(runId)).toThrow(/terminal/);
+    expect(()=>database!.prepare("UPDATE data_tasks SET status='success' WHERE id=?").run(runId)).toThrow(/terminal/);
+  });
+
   it('invalidates a complete run when an owned SKU market node is Mock, cross-site, or out of scope', () => {
     database = openDatabase(':memory:');
     insertObservationFixture(database, 'mcp', 'mcp');

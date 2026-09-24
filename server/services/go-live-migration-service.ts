@@ -809,6 +809,13 @@ export class GoLiveMigrationService {
   ): boolean {
     if (!Number.isSafeInteger(summary.candidates) || (summary.candidates as number) < 0
       || !Array.isArray(summary.covered)) return false;
+    if (summary.observationVersion === 1 && this.database.prepare(`
+      SELECT 1 FROM competitor_candidate_run_links link
+      LEFT JOIN competitor_candidate_observations observation ON observation.id=link.observation_id
+      WHERE link.sync_run_id=? AND (observation.id IS NULL OR observation.candidate_id<>link.candidate_id
+        OR observation.sync_run_id IS NOT link.sync_run_id OR observation.legacy<>0
+        OR json_extract(observation.provenance_json,'$.sourceType') IS NOT 'mcp') LIMIT 1
+    `).get(runId)) return false;
     const expected = new Map<string, number>();
     for (const item of summary.covered) {
       if (!item || typeof item !== 'object' || Array.isArray(item)) return false;
