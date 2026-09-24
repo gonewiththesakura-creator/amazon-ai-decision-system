@@ -171,8 +171,10 @@ describe('SellerSpriteMCPAdapter', () => {
       database.prepare(`UPDATE data_sources SET status = 'connected', last_sync_at = ?
         WHERE id = 'source-sellersprite-mcp'`).run(new Date().toISOString());
 
-      const run = await new SellerSpriteSyncService(database, adapter)
-        .syncCriticalBatch({ marketId: 'market-live', month: '202608' });
+      const sync = new SellerSpriteSyncService(database, adapter);
+      const input = { marketId: 'market-live', month: '202608', syncMode: 'certification' as const };
+      const plan = sync.planCritical(input);
+      const run = await sync.syncCriticalBatch({ ...input, planId: plan.id, confirmed: true });
       const workflowRepository = new WorkflowRepository(database);
       const workflow = new WorkflowOrchestrator(database);
       const marketJob = workflowRepository.createResearchJob({
@@ -605,6 +607,8 @@ describe('SellerSpriteMCPAdapter', () => {
         .rejects.toMatchObject({ code: 'INVALID_SCHEMA' });
       transport.marketItems = [{ ...transport.marketItems[0], month: '202608' }];
       transport.responseData = { items: transport.marketItems };
+      // An operator reviewed the corrected schema/response before resuming this capability.
+      database.prepare("DELETE FROM mcp_schema_pauses WHERE capability='MARKET_RESEARCH'").run();
       await expect(adapter.fetchMarketResearchSummary(input, context))
         .resolves.toMatchObject({ data: { totalProducts: 100 } });
 
@@ -713,6 +717,7 @@ describe('SellerSpriteMCPAdapter', () => {
       expect(database.prepare('SELECT COUNT(*) AS total FROM mcp_response_cache').get()).toEqual({ total: 0 });
 
       transport.responseData = { ...input, products: 100 };
+      database.prepare('DELETE FROM mcp_schema_pauses').run();
       await adapter.fetchMarketStatistics(input, context);
       transport.responseData = [{ ...input, asin: 'B000TEST01', totalUnitsRatio: 0.1 }];
       await adapter.fetchMarketConcentration(input, context);

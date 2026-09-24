@@ -20,6 +20,7 @@ import {
   type SellerSpriteConnectionDiagnostics,
 } from './adapters/index.js';
 import { sellerSpriteSchemaHash } from './adapters/sellersprite-tool-registry.js';
+import { McpBudgetManager, DEFAULT_FRESHNESS, mcpExecution } from './adapters/mcp-policy.js';
 import type { SellerSpriteSyncPort } from './services/sellersprite-sync-service.js';
 import { openDatabase, type AppDatabase } from './database/database.js';
 import { IntelligenceRepository } from './repository/intelligence-repository.js';
@@ -572,6 +573,7 @@ export function createApp(options: CreateAppOptions = {}): express.Express {
       WHERE marketplace = ? AND is_owned = 1 AND is_parent = 0 AND status = 'active'
       ORDER BY id
     `).all(repository.getSettings().marketplace).map((row) => String((row as { id: string }).id));
+    if (new Set(productIds).size > 19) throw httpError(409, '批量 SKU 同步预计超过 20 次调用，请使用关键同步调用计划并确认。');
     const results = [];
     for (const productId of productIds) {
       requireOwnedProduct(repository, productId);
@@ -587,11 +589,52 @@ export function createApp(options: CreateAppOptions = {}): express.Express {
     requireOwnedProduct(repository, input.ownedProductId);
     sendData(response, await sellerSprite.syncConfirmedCompetitor(input), repository, 201);
   }));
-  app.post('/api/integrations/sellersprite/sync/critical', adminOnly, asyncHandler(async (request, response) => {
-    const input = z.object({
-      marketId: z.string().trim().min(1),
-      month: z.string().regex(/^\d{4}-?\d{2}(?:-\d{2})?$/),
+  const criticalInput = z.object({
+    marketId: z.string().trim().min(1), month: z.string().regex(/^\d{4}-?\d{2}(?:-\d{2})?$/),
+    syncMode: z.enum(['incremental', 'certification', 'force']).default('incremental'),
+    planId: z.string().uuid().optional(), confirmed: z.boolean().optional(),
+  });
+  app.get('/api/integrations/sellersprite/quota', (_request, response) => {
+    sendData(response, new McpBudgetManager(database).summary(), repository);
+  });
+  app.get('/api/integrations/sellersprite/usage', adminOnly, (_request, response) => {
+    sendData(response, database.prepare('SELECT * FROM mcp_usage_events ORDER BY created_at DESC LIMIT 200').all(), repository);
+  });
+  app.get('/api/integrations/sellersprite/schema-pauses', adminOnly, (_request, response) => {
+    sendData(response, database.prepare('SELECT * FROM mcp_schema_pauses').all(), repository);
+  });
+  app.post('/api/integrations/sellersprite/capabilities/refresh', adminOnly, asyncHandler(async (request, response) => {
+    z.object({confirmed:z.literal(true)}).parse(request.body);
+    await mcpExecution.run({syncMode:'force',confirmed:true,remaining:4}, () => sellerSpriteAdapter.refreshCapabilities());
+    new McpBudgetManager(database).record('schema', 'manual_refresh');
+    sendData(response, {refreshed:true}, repository);
+  }));
+  app.post('/api/integrations/sellersprite/schema-pauses/acknowledge', adminOnly, (request, response) => {
+    const input = z.object({capability:z.enum(SELLERSPRITE_CAPABILITIES), schemaHash:z.string().regex(/^[a-f0-9]{64}$/), confirmed:z.literal(true)}).parse(request.body);
+    const changed = database.prepare('DELETE FROM mcp_schema_pauses WHERE capability=? AND schema_hash=?').run(input.capability, input.schemaHash);
+    if (!changed.changes) throw httpError(409, 'Schema 已变化，请重新核验。');
+    new McpBudgetManager(database).record(`${input.capability}:${input.schemaHash}`, 'schema_acknowledged');
+    sendData(response, {acknowledged:true}, repository);
+  });
+  app.post('/api/integrations/sellersprite/quota', adminOnly, (request, response) => {
+    const input = z.object({ remaining: z.number().int().min(0).max(10000000),
+      reserve: z.number().int().min(0).max(10000000), confirmed: z.literal(true),
+      policy: z.record(z.enum(Object.keys(DEFAULT_FRESHNESS) as [string, ...string[]]), z.number().int().min(60000).max(31536000000)).optional(),
     }).parse(request.body);
+    const budget = new McpBudgetManager(database);
+    budget.calibrate(input.remaining, input.reserve, input.policy ?? budget.summary().policy);
+    sendData(response, budget.summary(), repository);
+  });
+  app.post('/api/integrations/sellersprite/circuit/reset', adminOnly, (request, response) => {
+    z.object({confirmed: z.literal(true)}).parse(request.body);
+    new McpBudgetManager(database).resetCircuit();
+    sendData(response, {reset: true}, repository);
+  });
+  app.post('/api/integrations/sellersprite/sync/plan', adminOnly, (request, response) => {
+    sendData(response, sellerSprite.planCritical(criticalInput.parse(request.body)), repository);
+  });
+  app.post('/api/integrations/sellersprite/sync/critical', adminOnly, asyncHandler(async (request, response) => {
+    const input = criticalInput.parse(request.body);
     requireMarket(repository, input.marketId);
     sendData(response, await sellerSprite.syncCriticalBatch(input), repository, 201);
   }));

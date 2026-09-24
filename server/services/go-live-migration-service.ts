@@ -543,6 +543,7 @@ export class GoLiveMigrationService {
         if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) continue;
         coverage = parsed as Record<string, unknown>;
       } catch { continue; }
+      if (coverage.syncMode && coverage.syncMode !== 'certification') continue;
       const roster = coverage.ownedProducts;
       const month = coverage.month;
       const baselineMonth = coverage.baselineMonth;

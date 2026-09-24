@@ -1,4 +1,4 @@
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
 import {
@@ -15,6 +15,7 @@ import {
   type McpCallLedgerEntry,
 } from './sellersprite-mcp-store.js';
 import { isCredentialFieldName, redactCredentialAssignments } from './sensitive-field.js';
+import { currentExecution, McpBudgetManager, McpPolicyError, RemoteRequestSingleflight, requestKey } from './mcp-policy.js';
 
 export type SellerSpriteMcpErrorCode =
   | 'AUTH_ERROR' | 'RATE_LIMIT' | 'TIMEOUT' | 'TOOL_NOT_FOUND' | 'INVALID_SCHEMA' | 'REMOTE_ERROR';
@@ -39,7 +40,8 @@ export interface SellerSpriteToolCall {
   arguments: Record<string, unknown>;
   context: { capability?: string; operation?: string;
     entityType?: 'market' | 'product' | 'competitor'; entityId?: string;
-    researchJobId?: string; runId?: string; observationMonth?: string; fresh?: boolean };
+    researchJobId?: string; runId?: string; observationMonth?: string; fresh?: boolean;
+    schemaHash?: string; cacheTtlMs?: number; secondary?: boolean };
 }
 
 export interface SellerSpriteMcpAcquisition {
@@ -53,6 +55,7 @@ export interface SellerSpriteValidated<T> {
 }
 
 interface SellerSpriteMcpClientOptions {
+  budget?: McpBudgetManager;
   transport?: SellerSpriteMcpTransport;
   ledgerStore?: McpCallLedgerStore;
   cacheStore?: McpResponseCacheStore;
@@ -105,6 +108,10 @@ export class SellerSpriteMcpClient {
   private transport?: SellerSpriteMcpTransport;
   private connected = false;
   private catalog?: McpToolDefinition[];
+  private catalogAt = 0;
+  private readonly flights = new RemoteRequestSingleflight();
+  private readonly requests = new RemoteRequestSingleflight();
+  private connecting?: Promise<void>;
   private tokens: number;
   private lastRefill: number;
   private rateQueue: Promise<void> = Promise.resolve();
@@ -137,7 +144,8 @@ export class SellerSpriteMcpClient {
       };
     }
     if (!this.connected) {
-      await this.runWithRetry(() => this.withTimeout((signal) => this.transport!.connect({ signal })));
+      this.connecting ??= this.withTimeout((signal) => this.transport!.connect({ signal }));
+      try { await this.connecting; } finally { this.connecting = undefined; }
       this.connected = true;
     }
     return this.transport;
@@ -150,13 +158,21 @@ export class SellerSpriteMcpClient {
       const tools = await this.listTools({ fresh: true });
       return { connected: true, authenticated: true, toolCount: tools.length };
     } catch (error) {
+      if (error instanceof McpPolicyError) throw error;
       const mapped = mapMcpError(error);
       return { connected: false, authenticated: mapped.code !== 'AUTH_ERROR', toolCount: 0, errorCode: mapped.code };
     }
   }
 
   async listTools(options: { fresh?: boolean; runId?: string } = {}): Promise<McpToolDefinition[]> {
-    if (this.catalog && !options.fresh) return this.catalog;
+    if (this.catalog && !options.fresh && this.now() - this.catalogAt < (this.options.budget?.ttl('LIST_TOOLS') ?? 7 * 86400_000)) {
+      this.options.budget?.record('list_tools', 'cache_hit');
+      return this.catalog;
+    }
+    return this.flights.run(`list:${options.fresh ? options.runId ?? 'manual' : 'incremental'}`, () => this.discoverTools(options));
+  }
+
+  private async discoverTools(options: { fresh?: boolean; runId?: string }): Promise<McpToolDefinition[]> {
     const startedAt = new Date(this.now()).toISOString();
     try {
       const transport = await this.ensureTransport();
@@ -166,7 +182,13 @@ export class SellerSpriteMcpClient {
       do {
         const response = await this.runWithRetry(async () => {
           await this.acquireToken();
-          return this.withTimeout((signal) => transport.listTools({ cursor }, { signal }));
+          this.options.budget?.beforeRemote('list_tools');
+          try {
+            const result = await this.withTimeout((signal) => transport.listTools({ cursor }, { signal }));
+            if (!mcpListToolsResultSchema.safeParse(result).success) throw new SellerSpriteMcpError('INVALID_SCHEMA', 'Invalid SellerSprite MCP tool list');
+            this.options.budget?.result();
+            return result;
+          } catch (error) { this.options.budget?.result(mapMcpError(error).code); throw error; }
         });
         const page = mcpListToolsResultSchema.safeParse(response);
         if (!page.success) throw new SellerSpriteMcpError('INVALID_SCHEMA', 'Invalid SellerSprite MCP tool list');
@@ -178,9 +200,11 @@ export class SellerSpriteMcpClient {
         if (cursor) cursors.add(cursor);
       } while (cursor);
       this.catalog = tools;
+      this.catalogAt = this.now();
       this.recordDiscovery(options.runId, 'success', null, startedAt, tools.length);
       return tools;
     } catch (error) {
+      if (error instanceof McpPolicyError) throw error;
       const mapped = mapMcpError(error);
       this.recordDiscovery(options.runId, 'failed', mapped.code, startedAt, null);
       throw mapped;
@@ -196,12 +220,45 @@ export class SellerSpriteMcpClient {
       result: McpCallToolResult, acquisition: SellerSpriteMcpAcquisition,
     ) => SellerSpriteValidated<T>,
   ): Promise<T | McpCallToolResult> {
+    const key = requestKey([request.tool, request.arguments, request.context.capability,
+      request.context.observationMonth, request.context.schemaHash,
+      request.context.fresh ? request.context.runId ?? currentExecution().syncMode : 'incremental']);
+    return this.requests.run(key, async () => {
+      const database = this.options.budget?.database;
+      if (!database || !this.options.cacheStore || request.context.fresh) return this.executeCall(request, validate);
+      const owner = randomUUID();
+      const leaseMs = Math.max(120000, (this.options.timeoutMs ?? 20000) * 3);
+      const deadline = Date.now() + leaseMs;
+      while (true) {
+        database.prepare('DELETE FROM mcp_request_leases WHERE request_key=? AND expires_at<?').run(key, Date.now());
+        const acquired = database.prepare('INSERT OR IGNORE INTO mcp_request_leases VALUES (?, ?, ?)').run(key, owner, Date.now() + leaseMs);
+        if (acquired.changes === 1) break;
+        if (Date.now() >= deadline) throw new SellerSpriteMcpError('TIMEOUT', 'Waiting for matching MCP acquisition timed out');
+        await new Promise((resolve) => setTimeout(resolve, 25));
+      }
+      const heartbeat = setInterval(() => database.prepare('UPDATE mcp_request_leases SET expires_at=? WHERE request_key=? AND owner=?')
+        .run(Date.now() + leaseMs, key, owner), Math.floor(leaseMs / 3));
+      try { return await this.executeCall(request, validate); }
+      finally {
+        clearInterval(heartbeat);
+        database.prepare('DELETE FROM mcp_request_leases WHERE request_key=? AND owner=?').run(key, owner);
+      }
+    }, () => this.options.budget?.record(key, 'cache_hit'));
+  }
+
+  private async executeCall<T>(
+    request: SellerSpriteToolCall, validate?: (
+      result: McpCallToolResult, acquisition: SellerSpriteMcpAcquisition,
+    ) => SellerSpriteValidated<T>,
+  ): Promise<T | McpCallToolResult> {
     const key = createHash('sha256').update(JSON.stringify([
       request.tool, ordered(request.arguments), request.context.capability ?? '',
+      request.context.observationMonth ?? '', request.context.schemaHash ?? '',
     ])).digest('hex');
     const now = new Date(this.now()).toISOString();
     const cached = request.context.fresh ? null : this.options.cacheStore?.get(key, now);
-    if (cached) {
+    if (cached && (request.context.cacheTtlMs === undefined
+      || this.now() - Date.parse(cached.createdAt) < request.context.cacheTtlMs)) {
       let accepted: { raw: McpCallToolResult; value: T | McpCallToolResult;
         observationCertification?: McpCallLedgerEntry['observationCertification'] } | null = null;
       try {
@@ -216,30 +273,49 @@ export class SellerSpriteMcpClient {
         // A stale or malformed cache entry cannot certify a capability call.
       }
       if (accepted) {
+        this.options.budget?.record(key, 'cache_hit');
         this.record(request, key, 'success', null, true, 0, now, countResult(accepted.raw),
           accepted.observationCertification);
         return accepted.value;
       }
     }
 
-    const attempts = Math.max(1, Math.min(3, this.options.retry?.maxAttempts ?? 3));
+    const attempts = Math.max(1, Math.min(2, this.options.retry?.maxAttempts ?? 2));
     for (let attempt = 1; attempt <= attempts; attempt += 1) {
       const startedAt = new Date(this.now()).toISOString();
+      let remoteFailureRecorded = false;
       try {
         await this.acquireToken();
         const transport = await this.ensureTransport();
-        const raw = await this.withTimeout((signal) => transport.callTool(
-          { name: request.tool, arguments: request.arguments }, { signal },
-        ));
+        const raw = await this.flights.run(`${key}:${request.context.fresh ? request.context.runId ?? currentExecution().syncMode : 'incremental'}`, async () => {
+          this.options.budget?.beforeRemote(key, request.context.secondary);
+          try {
+            const response = await this.withTimeout((signal) => transport.callTool(
+              { name: request.tool, arguments: request.arguments }, { signal },
+            ));
+            const parsedResponse = mcpCallToolResultSchema.safeParse(response);
+            if (!parsedResponse.success) throw new SellerSpriteMcpError('INVALID_SCHEMA', 'Invalid SellerSprite MCP tool response');
+            assertToolSuccess(parsedResponse.data);
+            return response;
+          } catch (error) {
+            if (!(error instanceof McpPolicyError)) {
+              this.options.budget?.result(mapMcpError(error).code);
+              remoteFailureRecorded = true;
+            }
+            throw error;
+          }
+        });
         const parsed = mcpCallToolResultSchema.safeParse(raw);
         if (!parsed.success) throw new SellerSpriteMcpError('INVALID_SCHEMA', 'Invalid SellerSprite MCP tool response');
         assertToolSuccess(parsed.data);
         const acquiredAt = new Date(this.now()).toISOString();
         const accepted: SellerSpriteValidated<T | McpCallToolResult> = validate
           ? validate(parsed.data, { source: 'remote', acquiredAt }) : { value: parsed.data };
+        this.options.budget?.result();
         this.record(request, key, 'success', null, false, attempt, startedAt, countResult(parsed.data),
           accepted.observationCertification);
-        if (this.options.cacheStore && (this.options.cacheTtlMs ?? 300_000) > 0) {
+        const ttl = request.context.cacheTtlMs ?? this.options.cacheTtlMs ?? 86400_000;
+        if (this.options.cacheStore && ttl > 0) {
           try {
             this.options.cacheStore.set({
               cacheKey: key,
@@ -247,7 +323,7 @@ export class SellerSpriteMcpClient {
               toolName: request.tool,
               responseJson: JSON.stringify(scrubSecrets(parsed.data)),
               createdAt: acquiredAt,
-              expiresAt: new Date(this.now() + (this.options.cacheTtlMs ?? 300_000)).toISOString(),
+              expiresAt: new Date(this.now() + ttl).toISOString(),
             });
           } catch {
             // A validated provider response remains usable when the optional cache is unavailable.
@@ -255,7 +331,9 @@ export class SellerSpriteMcpClient {
         }
         return accepted.value;
       } catch (error) {
+        if (error instanceof McpPolicyError) throw error;
         const mapped = mapMcpError(error);
+        if (!remoteFailureRecorded) this.options.budget?.result(mapped.code);
         this.record(request, key, 'failed', mapped.code, false, attempt, startedAt);
         if (attempt === attempts || !['RATE_LIMIT', 'TIMEOUT', 'REMOTE_ERROR'].includes(mapped.code)) throw mapped;
         await this.sleep((this.options.retry?.baseDelayMs ?? 250) * 2 ** (attempt - 1));
@@ -356,10 +434,11 @@ export class SellerSpriteMcpClient {
   }
 
   private async runWithRetry<T>(operation: () => Promise<T>): Promise<T> {
-    const attempts = Math.max(1, Math.min(3, this.options.retry?.maxAttempts ?? 3));
+    const attempts = Math.max(1, Math.min(2, this.options.retry?.maxAttempts ?? 2));
     for (let attempt = 1; attempt <= attempts; attempt += 1) {
       try { return await operation(); }
       catch (error) {
+        if (error instanceof McpPolicyError) throw error;
         const mapped = mapMcpError(error);
         if (attempt === attempts || !['RATE_LIMIT', 'TIMEOUT', 'REMOTE_ERROR'].includes(mapped.code)) throw mapped;
         await this.sleep((this.options.retry?.baseDelayMs ?? 250) * 2 ** (attempt - 1));
@@ -399,7 +478,7 @@ function ordered(value: unknown): unknown {
   return value;
 }
 
-function scrubSecrets(value: unknown): unknown {
+export function scrubSecrets(value: unknown): unknown {
   if (typeof value === 'string') {
     const trimmed = value.trim();
     if (trimmed.startsWith('{') || trimmed.startsWith('[')) {

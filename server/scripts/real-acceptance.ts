@@ -94,6 +94,7 @@ interface AcceptanceArguments {
   baseUrl: URL;
   month: string;
   timeoutMs: number;
+  confirmPlan?: string;
 }
 
 interface AcceptanceSummary {
@@ -158,6 +159,15 @@ export async function runAcceptanceCli(
       && typeof market.sellerSpriteNodePath === 'string'
       && /^\d+(?::\d+)*$/.test(market.sellerSpriteNodePath));
     summary.checks.preflight = true;
+    if (!parsed.confirmPlan) {
+      const plan = z.object({ id: z.string().uuid(), estimatedRemoteCalls: z.number(), maximumRemoteCalls: z.number(),
+        localReuse: z.number(), projectedRemaining: z.number(), blockers: z.array(z.string()) }).parse(await request(
+        '/api/integrations/sellersprite/sync/plan', {method:'POST', body:JSON.stringify({
+          marketId: settings.defaultMarketId, month: parsed.month, syncMode:'certification',
+        })}));
+      writeOutput(`${JSON.stringify({dryRun:true, plan, next:'Review the plan, then pass --confirm-plan <id> within ten minutes.'})}\n`);
+      return 0;
+    }
 
     const connection = connectionSchema.parse(await request(
       '/api/integrations/sellersprite/test', { method: 'POST', body: '{}' },
@@ -171,7 +181,8 @@ export async function runAcceptanceCli(
 
     const critical = criticalRunSchema.parse(await request(
       '/api/integrations/sellersprite/sync/critical',
-      { method: 'POST', body: JSON.stringify({ marketId: settings.defaultMarketId, month: parsed.month }) },
+      { method: 'POST', body: JSON.stringify({ marketId: settings.defaultMarketId, month: parsed.month,
+        syncMode:'certification', planId:parsed.confirmPlan, confirmed:true }) },
     ));
     summary.runId = critical.runId;
     summary.counts.marketSnapshots = critical.marketSnapshots;
@@ -343,7 +354,7 @@ export function isAllowedAcceptanceRequest(method: string, path: string): boolea
     /^\/api\/dashboard\/executive\/run-proof\/[0-9a-fA-F-]{36}$/,
     /^\/api\/research-jobs\/[A-Za-z0-9_-]+\/evidence$/,
   ] : method === 'POST' ? [
-    /^\/api\/integrations\/sellersprite\/(?:test|sync\/critical)$/,
+    /^\/api\/integrations\/sellersprite\/(?:test|sync\/critical|sync\/plan)$/,
     /^\/api\/research-jobs$/,
     /^\/api\/research-jobs\/[A-Za-z0-9_-]+\/run$/,
   ] : [];
@@ -354,6 +365,7 @@ function parseArguments(args: string[]): AcceptanceArguments {
   let baseUrl = DEFAULT_BASE_URL;
   let month: string | undefined;
   let timeoutMs = DEFAULT_TIMEOUT_MS;
+  let confirmPlan: string | undefined;
   for (let index = 0; index < args.length; index += 1) {
     const argument = args[index];
     const value = args[index + 1];
@@ -362,6 +374,9 @@ function parseArguments(args: string[]): AcceptanceArguments {
       index += 1;
     } else if (argument === '--month' && value) {
       month = value;
+      index += 1;
+    } else if (argument === '--confirm-plan' && value) {
+      confirmPlan = z.string().uuid().parse(value);
       index += 1;
     } else if (argument === '--timeout-ms' && value) {
       timeoutMs = Number(value);
@@ -379,7 +394,7 @@ function parseArguments(args: string[]): AcceptanceArguments {
   requireCondition(['127.0.0.1', 'localhost', '[::1]'].includes(parsedBaseUrl.hostname));
   requireCondition(!parsedBaseUrl.username && !parsedBaseUrl.password
     && !parsedBaseUrl.search && !parsedBaseUrl.hash && parsedBaseUrl.pathname === '/');
-  return { baseUrl: parsedBaseUrl, month, timeoutMs };
+  return { baseUrl: parsedBaseUrl, month, timeoutMs, confirmPlan };
 }
 
 function requireCondition(condition: unknown): asserts condition {

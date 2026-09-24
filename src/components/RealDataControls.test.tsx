@@ -188,7 +188,7 @@ describe('real-data administration controls', () => {
 
     await screen.findByText('Market Snapshots: 2');
     expect(screen.getByRole('button', { name: '连接测试' })).toBeDisabled();
-    expect(screen.getByRole('button', { name: '同步关键数据' })).toBeDisabled();
+    expect(screen.queryByRole('button', { name: '预览调用计划' })).not.toBeInTheDocument();
     expect(screen.getByRole('button', { name: '备份数据库' })).toBeDisabled();
     expect(screen.getByRole('button', { name: '清除演示数据' })).toBeDisabled();
     expect(screen.getByRole('button', { name: '切换 Live' })).toBeDisabled();
@@ -198,7 +198,7 @@ describe('real-data administration controls', () => {
     vi.stubGlobal('fetch', fetchMock);
     render(<RealDataControls isViewer={false} marketId="market-1" />);
     await screen.findByText('Market Snapshots: 2');
-    expect(screen.getByRole('button', { name: '同步关键数据' })).toBeDisabled();
+    expect(screen.getByRole('button', { name: '预览调用计划' })).toBeDisabled();
     expect(screen.getByRole('button', { name: '保存映射' })).toBeDisabled();
     fireEvent.click(screen.getByLabelText('已核对站点和类目范围'));
     fireEvent.click(screen.getByRole('button', { name: '保存映射' }));
@@ -209,6 +209,6 @@ describe('real-data administration controls', () => {
         }),
       }),
     ));
-    expect(screen.getByRole('button', { name: '同步关键数据' })).toBeEnabled();
+    expect(screen.getByRole('button', { name: '预览调用计划' })).toBeEnabled();
   });
 });

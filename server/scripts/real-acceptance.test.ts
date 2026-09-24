@@ -7,9 +7,11 @@ import {
 } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { afterEach, describe, expect, it } from 'vitest';
-import { isAllowedAcceptanceRequest, runAcceptanceCli } from './real-acceptance.js';
+import { isAllowedAcceptanceRequest, runAcceptanceCli as rawRunAcceptanceCli } from './real-acceptance.js';
 
 const RUN_ID = '11111111-1111-4111-8111-111111111111';
+const runAcceptanceCli: typeof rawRunAcceptanceCli = (args, dependencies) =>
+  rawRunAcceptanceCli([...args, '--confirm-plan', RUN_ID], dependencies);
 const OTHER_RUN_ID = '22222222-2222-4222-8222-222222222222';
 const HASHES = ['a', 'b', 'c', 'd', 'e'].map((value) => value.repeat(64));
 const PRIVATE_CANARY = 'PRIVATE_ASIN_B0SECRET01';
@@ -25,6 +27,15 @@ afterEach(async () => {
 });
 
 describe('real SellerSprite acceptance runner', () => {
+  it('defaults to a call plan with no connection test or remote execution', async () => {
+    const api = await startApi();
+    const output: string[] = [];
+    expect(await rawRunAcceptanceCli(['--base-url', api.baseUrl, '--month', '202609'], {
+      writeOutput: (value) => output.push(value),
+    })).toBe(0);
+    expect(JSON.parse(output[0]!)).toMatchObject({dryRun:true});
+    expect(api.requests).not.toContain('POST /api/integrations/sellersprite/test');
+  });
   it('allows only the intended read and validation write routes', () => {
     for (const [method, path] of [
       ['POST', '/api/go-live/backup'],
@@ -528,6 +539,11 @@ async function startApi(options: ApiOptions = {}): Promise<{
           ?? { status: 'success', total: 1, success: 1, failed: 0 },
         private: PRIVATE_CANARY,
       }, 201);
+      return;
+    }
+    if (route === 'POST /api/integrations/sellersprite/sync/plan') {
+      respondData(response, {id:RUN_ID, estimatedRemoteCalls:23, maximumRemoteCalls:48,
+        localReuse:0, projectedRemaining:477, blockers:[]});
       return;
     }
     if (route === `GET /api/integrations/sellersprite/sync/critical/${RUN_ID}/roster`) {

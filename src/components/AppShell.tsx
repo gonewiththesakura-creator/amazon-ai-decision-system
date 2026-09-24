@@ -24,8 +24,6 @@ import {
   X,
 } from 'lucide-react';
 import type { LucideIcon } from 'lucide-react';
-import type { DataTask } from '../../shared/types';
-import { api } from '../lib/api';
 import { useApp } from '../lib/AppContext';
 import { formatFreshness } from '../lib/format';
 import { ExecutiveAiDrawer } from './ExecutiveAiDrawer';
@@ -158,7 +156,7 @@ function SidebarNavigation({ onNavigate }: { onNavigate?: () => void }) {
 
 export function AppShell() {
   const location = useLocation();
-  const { settings, error: settingsError, refreshAll, reloadSettings, setDemoMode, updateSettings } = useApp();
+  const { settings, error: settingsError, refreshAll, setDemoMode, updateSettings } = useApp();
   const [mobileOpen, setMobileOpen] = useState(false);
   const [syncing, setSyncing] = useState(false);
   const [marketplaceBusy, setMarketplaceBusy] = useState(false);
@@ -233,15 +231,8 @@ export function AppShell() {
   const manualRefresh = async () => {
     setSyncing(true);
     try {
-      if (settings.mode !== 'empty' && settings.role === 'admin') {
-        const task = await api.post<DataTask>('/api/data-tasks/run', { taskType: 'dashboard_core_refresh', target: 'all' });
-        if (task.status === 'failed' || task.status === 'partial') {
-          throw new Error(task.errorLog || (task.status === 'failed' ? '刷新任务执行失败' : '刷新任务仅部分完成'));
-        }
-        await reloadSettings();
-      }
       refreshAll();
-      setNotice(settings.mode === 'empty' ? '已重新检查数据连接' : '刷新任务已提交');
+      setNotice('已刷新本地数据。需要采集时，请在数据源设置中预览调用计划。');
     } catch (requestError) {
       setNotice(requestError instanceof Error ? requestError.message : '刷新失败');
     } finally {

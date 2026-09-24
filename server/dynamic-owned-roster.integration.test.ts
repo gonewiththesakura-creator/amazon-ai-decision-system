@@ -73,7 +73,9 @@ describe('dynamic owned roster integration', () => {
         reason: 'Dynamic roster human confirmation',
       });
 
-      const run = await fixture.sync.syncCriticalBatch({ marketId: MARKET_ID, month: '202608' });
+      const input = { marketId: MARKET_ID, month: '202608', syncMode: 'certification' as const };
+      const plan = fixture.sync.planCritical(input);
+      const run = await fixture.sync.syncCriticalBatch({ ...input, planId: plan.id, confirmed: true });
 
       expect(run).toMatchObject({
         taskId: run.runId,

@@ -866,8 +866,8 @@ export class IntelligenceService {
     try {
       if (routeError) throw routeError;
       if (!adapter) throw new Error('当前任务没有可用真实数据源，请先配置数据源。');
-      if (settings.mode === 'live' && adapter.id === 'source-sellersprite-mcp') {
-        throw new Error('SellerSprite MCP 必须通过设置 -> 数据源中的关键同步或专用同步运行，通用数据任务无法创建运行级追溯。');
+      if (adapter.id === 'source-sellersprite-mcp') {
+        throw new Error('SellerSprite MCP 不支持旧版刷新；请通过设置 -> 数据源中的 V2.2 关键同步调用计划或专用同步运行。请检查 SELLERSPRITE_MCP_URL 配置。');
       }
       const refreshed = await this.refreshTarget(taskType, target, input.watchlistId, adapter);
       const completedAt = new Date().toISOString();

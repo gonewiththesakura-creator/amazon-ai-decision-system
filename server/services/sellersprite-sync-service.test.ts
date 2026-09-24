@@ -881,7 +881,7 @@ describe('SellerSprite real-data sync', () => {
     expect(first).toMatchObject({ runId: expect.any(String), taskId: first.runId, candidates: 1 });
     expect(second).toMatchObject({ runId: expect.any(String), taskId: second.runId, candidates: 1 });
     expect(second.runId).not.toBe(first.runId);
-    expect(observedRunIds).toEqual([first.runId, second.runId]);
+    expect(observedRunIds).toEqual([first.runId]);
     expect(database.prepare(`
       SELECT id, sync_run_id AS syncRunId, status, total, success, failed
       FROM data_tasks WHERE task_type = 'competitor_discovery' ORDER BY created_at, id
@@ -944,8 +944,10 @@ describe('SellerSprite real-data sync', () => {
       },
     });
 
-    const result = await new SellerSpriteSyncService(database, changed)
-      .syncCriticalBatch({ marketId: 'market-1', month: '202608' });
+    const sync = new SellerSpriteSyncService(database, changed);
+    const input = { marketId: 'market-1', month: '202608', syncMode: 'certification' as const };
+    const plan = sync.planCritical(input);
+    const result = await sync.syncCriticalBatch({ ...input, planId: plan.id, confirmed: true });
 
     expect(result.candidateCoverage).toMatchObject({ status: 'failed', total: 1, success: 0, failed: 1 });
     expect(database.prepare(`

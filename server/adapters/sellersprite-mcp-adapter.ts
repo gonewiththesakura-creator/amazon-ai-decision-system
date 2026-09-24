@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { z } from 'zod';
 import type { Product, ProductSnapshot, Provenance } from '../../shared/types.js';
 import type { AppDatabase } from '../database/database.js';
-import { SellerSpriteMcpClient, SellerSpriteMcpError } from './sellersprite-mcp-client.js';
+import { SellerSpriteMcpClient, SellerSpriteMcpError, scrubSecrets } from './sellersprite-mcp-client.js';
 import {
   sellerSpriteAsinIdentitySchema,
   sellerSpriteAsinTrendSchema,
@@ -26,6 +26,8 @@ import type {
   MarketOverviewRecord, ProductDetailRecord, ProductInput,
 } from './types.js';
 import { AdapterUnavailableError } from './types.js';
+import { freshExecution, McpBudgetManager, McpPolicyError, requestKey,
+  type SellerSpriteSyncMode } from './mcp-policy.js';
 
 const object = sellerSpriteObjectSchema;
 
@@ -57,6 +59,8 @@ export interface SellerSpriteAsinRequest { marketplace: string; asin: string }
 export interface SellerSpriteSyncContext {
   runId?: string;
   requireObservationMonth?: boolean;
+  syncMode?: SellerSpriteSyncMode;
+  secondary?: boolean;
 }
 export type SellerSpriteData<T> = { data: T; provenance: Provenance };
 export type SellerSpriteStatistics = Record<string, unknown>;
@@ -89,18 +93,25 @@ export class SellerSpriteMCPAdapter implements MarketDataAdapter {
   readonly sourceType = 'mcp' as const;
 
   private readonly client: SellerSpriteMcpClient;
-  private readonly registry: SellerSpriteToolRegistry;
+  private registry: SellerSpriteToolRegistry;
+  private discoveryInvalidated = false;
   private readonly capabilityStore?: McpCapabilityStore;
   private readonly runRegistries = new Map<string, Promise<SellerSpriteToolRegistry>>();
   private readonly injectedClient: boolean;
   private discovered = false;
+  private readonly database?: AppDatabase;
+  private readonly budget?: McpBudgetManager;
+  private discoveredAt = 0;
 
   constructor(options: {
     client?: SellerSpriteMcpClient;
     registry?: SellerSpriteToolRegistry;
     database?: AppDatabase;
   } = {}) {
+    this.database = options.database;
+    this.budget = options.database ? new McpBudgetManager(options.database) : undefined;
     this.client = options.client ?? new SellerSpriteMcpClient(options.database ? {
+      budget: this.budget,
       ledgerStore: new SqliteMcpCallLedgerStore(options.database),
       cacheStore: new SqliteMcpResponseCacheStore(options.database),
     } : {});
@@ -110,6 +121,14 @@ export class SellerSpriteMCPAdapter implements MarketDataAdapter {
   }
 
   async testConnection(): Promise<SellerSpriteConnectionDiagnostics> {
+    const previous = this.capabilityStore?.latest();
+    if (previous && Date.now() - Date.parse(previous.discoveredAt) < (this.budget?.ttl('CONNECTION') ?? 1800_000) && !freshExecution()) {
+      this.budget?.record('connection', 'local_hit');
+      return { connected: true, authenticated: true, toolCount: previous.tools.length,
+        requiredCapabilityCount: SELLERSPRITE_CAPABILITIES.length,
+        availableRequiredCapabilityCount: SELLERSPRITE_CAPABILITIES.length - previous.missingCapabilities.length,
+        missingCapabilities: previous.missingCapabilities, latencyMs: 0 };
+    }
     const startedAt = Date.now();
     const status = await this.client.connectionTest();
     let missingCapabilities = [...SELLERSPRITE_CAPABILITIES] as SellerSpriteCapability[];
@@ -290,17 +309,50 @@ export class SellerSpriteMCPAdapter implements MarketDataAdapter {
     this.runRegistries.clear();
   }
 
-  private async registryForRun(runId: string): Promise<SellerSpriteToolRegistry> {
-    const existing = this.runRegistries.get(runId);
+  async refreshCapabilities() {
+    const previous = this.capabilityStore?.latest();
+    const next = await this.registry.refresh(() => this.client.listTools({fresh:true}));
+    for (const capability of SELLERSPRITE_CAPABILITIES) {
+      if (previous?.capabilitySchemaHashes?.[capability]
+        && previous.capabilitySchemaHashes[capability] !== next.capabilitySchemaHashes?.[capability]) {
+        this.database?.prepare('INSERT OR REPLACE INTO mcp_schema_pauses VALUES (?, ?, ?)')
+          .run(capability, next.capabilitySchemaHashes?.[capability] ?? '', new Date().toISOString());
+      }
+    }
+    this.runRegistries.clear();
+    this.discovered = true;
+    this.discoveryInvalidated = false;
+    this.discoveredAt = Date.now();
+    return next;
+  }
+
+  private async registryForRun(runId: string, fresh: boolean): Promise<SellerSpriteToolRegistry> {
+    const registryKey = `${runId}:${fresh}`;
+    const existing = this.runRegistries.get(registryKey);
     if (existing) return existing;
-    const registry = new SellerSpriteToolRegistry({ store: this.capabilityStore });
+    const previous = this.capabilityStore?.latest();
+    const reusable = !fresh && !this.discoveryInvalidated && previous && Date.now() - Date.parse(previous.discoveredAt) < (this.budget?.ttl('LIST_TOOLS') ?? 7 * 86400_000)
+      && !previous.tools.some((tool) => tool.inputSchema.required?.includes('[PII_PATH]'));
+    const registry = new SellerSpriteToolRegistry(reusable ? {} : { store: this.capabilityStore });
     const discovery = registry.refresh(
-      () => this.client.listTools({ fresh: true, runId }), runId,
-    ).then(() => registry);
-    this.runRegistries.set(runId, discovery);
+      () => reusable ? Promise.resolve(previous.tools) : this.client.listTools({ fresh: true, runId }),
+      reusable ? null : runId,
+    ).then((next) => {
+      this.discoveryInvalidated = false;
+      if (!reusable && previous && this.database) {
+        for (const capability of SELLERSPRITE_CAPABILITIES) {
+          if (previous.capabilitySchemaHashes?.[capability] && previous.capabilitySchemaHashes[capability] !== next.capabilitySchemaHashes?.[capability]) {
+            this.database.prepare('INSERT OR REPLACE INTO mcp_schema_pauses VALUES (?, ?, ?)')
+              .run(capability, next.capabilitySchemaHashes?.[capability] ?? '', new Date().toISOString());
+          }
+        }
+      }
+      return registry;
+    });
+    this.runRegistries.set(registryKey, discovery);
     try { return await discovery; }
     catch (error) {
-      if (this.runRegistries.get(runId) === discovery) this.runRegistries.delete(runId);
+      if (this.runRegistries.get(registryKey) === discovery) this.runRegistries.delete(registryKey);
       throw error;
     }
   }
@@ -315,15 +367,29 @@ export class SellerSpriteMCPAdapter implements MarketDataAdapter {
     if (!this.injectedClient && !process.env.SELLERSPRITE_MCP_URL) {
       throw new AdapterUnavailableError('未配置 SELLERSPRITE_MCP_URL，请在服务端环境变量中设置。');
     }
-    let registry: SellerSpriteToolRegistry;
+    let registry = this.registry;
+    const fresh = context?.syncMode ? context.syncMode !== 'incremental' : freshExecution();
+    if (fresh && this.database && !freshExecution()) throw new McpPolicyError('CONFIRMATION_REQUIRED');
     if (context?.runId) {
-      registry = await this.registryForRun(context.runId);
+      registry = await this.registryForRun(context.runId, fresh);
     } else {
-      if (!this.discovered) {
-        await this.registry.refresh(() => this.client.listTools());
+      if (!this.discovered || Date.now() - this.discoveredAt > (this.budget?.ttl('LIST_TOOLS') ?? 7 * 86400_000) || fresh) {
+        const previous = this.capabilityStore?.latest();
+        const reusable = !fresh && !this.discoveryInvalidated && previous && Date.now() - Date.parse(previous.discoveredAt) < (this.budget?.ttl('LIST_TOOLS') ?? 7 * 86400_000)
+          && !previous.tools.some((tool) => tool.inputSchema.required?.includes('[PII_PATH]'));
+        if (reusable) {
+          const restored = new SellerSpriteToolRegistry();
+          await restored.refresh(() => Promise.resolve(previous.tools));
+          registry = restored;
+          this.registry = restored;
+        } else await this.refreshCapabilities();
         this.discovered = true;
+        this.discoveredAt = Date.now();
       }
-      registry = this.registry;
+      registry ??= this.registry;
+    }
+    if (!fresh && this.database?.prepare('SELECT 1 FROM mcp_schema_pauses WHERE capability=?').get(capability)) {
+      throw new McpPolicyError('SCHEMA_PAUSED');
     }
     const tool = registry.resolve(capability);
     if (!tool) throw new SellerSpriteMcpError('TOOL_NOT_FOUND', `SellerSprite capability unavailable: ${capability}`);
@@ -352,13 +418,38 @@ export class SellerSpriteMCPAdapter implements MarketDataAdapter {
         || (capability === 'PRODUCT_CONCENTRATION' && tool.name === 'market_product_concentration')
         || (capability === 'MARKET_RESEARCH' && tool.name === 'market_research'))
       && registry.supportsStringArgument(capability, 'month');
+    const schemaHash = (!fresh && this.capabilityStore?.latest()?.capabilitySchemaHashes?.[capability])
+      || sellerSpriteSchemaHash(tool.inputSchema);
+    const localKey = requestKey(['sellersprite', capability, toolArgs, schemaHash]);
+    const ttl = this.budget?.ttl(capability === 'ASIN_DETAIL' ? 'PENDING_IDENTITY'
+      : context?.secondary && capability === 'ASIN_SALES_TREND' ? 'CORE_COMPETITOR' : capability)
+      ?? 86400_000;
+    const local = !fresh ? this.database?.prepare(`SELECT * FROM mcp_local_observations WHERE request_key=?
+      AND (historical_stable=1 OR expires_at>?)`).get(localKey, new Date().toISOString()) as
+      { payload_json: string; collected_at: string; historical_stable: number } | undefined : undefined;
+    if (local) {
+      let payload: unknown;
+      try { payload = JSON.parse(local.payload_json); } catch { payload = null; }
+      const parsed = schema.safeParse(payload);
+      const effectiveTtl = capability === 'ASIN_DETAIL' && payload && typeof payload === 'object' && 'parent' in payload && payload.parent
+        ? this.budget?.ttl('ASIN_DETAIL') ?? ttl : ttl;
+      if (parsed.success && (local.historical_stable === 1 || Date.now() - Date.parse(local.collected_at) < effectiveTtl)) {
+        validateCapabilityScope(capability, parsed.data, request, criticalMarket, documentedRequest);
+        validate?.(parsed.data);
+        this.budget?.record(localKey, 'local_hit');
+        this.budget?.record(localKey, 'freshness_skip');
+        return { data: parsed.data, provenance: { source: 'SellerSprite MCP', sourceType: 'mcp',
+          collectedAt: local.collected_at, period: 'monthly', isEstimated: true, confidence: 0.75 } };
+      }
+    }
     const accepted = await this.client.callTool({ tool: tool.name, arguments: toolArgs, context: {
       capability, operation, entityType,
       ...(typeof entityId === 'string' ? { entityId: entityId.toUpperCase() } : {}),
       ...(isMarketObservationCapability(capability)
         && typeof request.month === 'string' ? { observationMonth: request.month } : {}),
       ...(context?.runId ? { runId: context.runId } : {}),
-      ...(context?.runId ? { fresh: true } : {}),
+      fresh, schemaHash, cacheTtlMs: ttl,
+      secondary: context?.secondary || capability === 'ASIN_COMPETITOR_DISCOVERY',
     } }, (result, acquisition) => {
       let payload: unknown;
       try { payload = sellerSpriteEnvelope(result); }
@@ -375,7 +466,28 @@ export class SellerSpriteMCPAdapter implements MarketDataAdapter {
           schemaHash: sellerSpriteSchemaHash(tool.inputSchema),
         },
       } : {}) };
+    }).catch((error: unknown) => {
+      if (error instanceof SellerSpriteMcpError && ['TOOL_NOT_FOUND', 'INVALID_SCHEMA'].includes(error.code)) {
+        this.discoveryInvalidated = true;
+        this.discovered = false;
+        this.runRegistries.clear();
+        this.database?.prepare('INSERT OR REPLACE INTO mcp_schema_pauses VALUES (?, ?, ?)')
+          .run(capability, schemaHash, new Date().toISOString());
+      }
+      throw error;
     });
+    const stable = criticalMarket && typeof request.month === 'string'
+      && request.month < new Date().toISOString().slice(0, 7).replace('-', '')
+      && new Date(accepted.acquisition.acquiredAt).toISOString().slice(0, 7).replace('-', '') > request.month;
+    const localTtl = capability === 'ASIN_DETAIL' && accepted.data && typeof accepted.data === 'object'
+      && 'parent' in accepted.data && accepted.data.parent ? this.budget?.ttl('ASIN_DETAIL') ?? ttl : ttl;
+    this.database?.prepare(`INSERT INTO mcp_local_observations VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(request_key) DO UPDATE SET payload_json=excluded.payload_json,
+      collected_at=excluded.collected_at, expires_at=excluded.expires_at,
+      historical_stable=excluded.historical_stable, backfill_complete=excluded.backfill_complete`)
+      .run(localKey, JSON.stringify(scrubSecrets(accepted.data)), accepted.acquisition.acquiredAt,
+        new Date(Date.parse(accepted.acquisition.acquiredAt) + localTtl).toISOString(), stable ? 1 : 0, stable ? 1 : 0, schemaHash,
+        capability, requestKey([request.marketplace, entityId, request.month ?? null]));
     return {
       data: accepted.data,
       provenance: {

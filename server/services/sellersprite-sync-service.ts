@@ -13,10 +13,16 @@ import { transaction } from '../database/database.js';
 import { ProductIdentityResolver } from '../domain/product-identity-resolver.js';
 import { sanitizeMcpError } from '../adapters/sellersprite-mcp-client.js';
 import { requireConfirmedOwnedRoster } from './owned-roster-declaration.js';
+import { LocalObservationResolver } from './local-observation-resolver.js';
+import { currentExecution, mcpExecution, McpBudgetManager, McpPolicyError, requestKey,
+  type SellerSpriteSyncMode } from '../adapters/mcp-policy.js';
 
 export interface SellerSpriteMarketSyncInput {
   marketId: string;
   month: string;
+  syncMode?: SellerSpriteSyncMode;
+  planId?: string;
+  confirmed?: boolean;
 }
 
 export interface SellerSpriteOwnedProductSyncInput {
@@ -100,7 +106,7 @@ export interface SellerSpriteSyncPort {
   fetchAsinSalesTrend(input: {
     marketplace: string;
     asin: string;
-  }, context?: { runId?: string }): Promise<SellerSpriteData<SellerSpriteAsinTrend>>;
+  }, context?: { runId?: string; secondary?: boolean }): Promise<SellerSpriteData<SellerSpriteAsinTrend>>;
   discoverAsinCompetitors(input: {
     marketplace: string;
     asin: string;
@@ -255,8 +261,19 @@ export class SellerSpriteSyncService {
   async discoverCompetitors(
     input: SellerSpriteCompetitorDiscoveryInput,
   ): Promise<SellerSpriteCandidateDiscoveryResult> {
+    if (!mcpExecution.getStore()) {
+      const id = randomUUID();
+      this.database.prepare('INSERT INTO mcp_call_plans VALUES (?, ?, ?, ?, ?)').run(id,
+        JSON.stringify(input), JSON.stringify({syncMode:'incremental',estimatedRemoteCalls:2,maximumRemoteCalls:4}),
+        new Date().toISOString(),new Date().toISOString());
+      return mcpExecution.run({syncMode:'incremental',remaining:4},async()=>{
+        new McpBudgetManager(this.database).record(id,'incremental_plan_executed');
+        return this.discoverCompetitors(input);
+      });
+    }
     const product = this.requireOwnedProduct(input.ownedProductId);
     const runId = randomUUID();
+    currentExecution().runId = runId;
     const startedAt = new Date().toISOString();
     this.database.prepare(`
       INSERT INTO data_tasks (
@@ -302,6 +319,22 @@ export class SellerSpriteSyncService {
     runId: string,
     complete?: () => void,
   ): Promise<{ candidates: number }> {
+    const budget = new McpBudgetManager(this.database);
+    const discoveryKey = requestKey([product.id, product.asin, product.marketplace, size ?? 20]);
+    const state = this.database.prepare('SELECT collected_at FROM mcp_discovery_state WHERE scope_key=?').get(discoveryKey);
+    const fresh = state && Date.now() - Date.parse(String(state.collected_at)) < budget.ttl('ASIN_COMPETITOR_DISCOVERY');
+    if (currentExecution().syncMode === 'incremental' && (fresh || budget.summary().estimatedRemaining < 150)) {
+      const candidates = this.database.prepare("SELECT id FROM competitor_candidates WHERE source_product_id=? AND marketplace=? AND source_type='mcp'").all(product.id, product.marketplace);
+      transaction(this.database, () => {
+        for (const candidate of candidates) this.database.prepare(`INSERT OR IGNORE INTO competitor_candidate_run_links
+          (sync_run_id,candidate_id,source_product_id,disposition,created_at) VALUES (?, ?, ?, 'reused', ?)`)
+          .run(runId, candidate.id, product.id, new Date().toISOString());
+        budget.record(discoveryKey, fresh ? 'freshness_skip' : 'budget_blocked');
+        if (fresh) budget.record(discoveryKey, 'local_hit');
+        complete?.();
+      });
+      return {candidates: candidates.length};
+    }
     const response = await this.port.discoverAsinCompetitors({
       marketplace: product.marketplace,
       asin: product.asin,
@@ -365,6 +398,7 @@ export class SellerSpriteSyncService {
         `).run(runId, linkedCandidateId, product.id, disposition, new Date().toISOString());
         observed += Number(link.changes);
       }
+      this.database.prepare('INSERT OR REPLACE INTO mcp_discovery_state VALUES (?, ?)').run(discoveryKey, response.provenance.collectedAt);
       if (complete) complete();
       return { candidates: observed };
     });
@@ -486,7 +520,89 @@ export class SellerSpriteSyncService {
     });
   }
 
-  async syncCriticalBatch(input: SellerSpriteMarketSyncInput): Promise<{
+  planCritical(input: SellerSpriteMarketSyncInput) {
+    const market = this.requireMarket(input.marketId);
+    const products = this.activeOwnedProducts(market.marketplace, market.id);
+    const nodes = this.criticalMarketNodes(market, products);
+    const month = compactMonth(input.month);
+    const mode = input.syncMode ?? 'incremental';
+    const resolver = new LocalObservationResolver(this.database);
+    const budget = new McpBudgetManager(this.database);
+    const quota = budget.summary();
+    const entries: Array<{ target: string; remote: number; local: number; reason: string }> = [];
+    const cached = (capability: string, entity: string, period: string | null = null) => mode === 'incremental'
+      && Boolean(this.database.prepare(`SELECT 1 FROM mcp_local_observations WHERE capability=? AND scope_key=?
+        AND (historical_stable=1 OR expires_at>?)`).get(capability, requestKey([market.marketplace, entity, period]), new Date().toISOString()));
+    for (const node of nodes) for (const period of [previousMonth(month), month]) {
+      const local = mode === 'incremental' && resolver.market(node.id, monthEnd(period));
+      const reuse = local ? 3 : ['MARKET_RESEARCH', 'MARKET_STATISTICS', 'PRODUCT_CONCENTRATION'].filter((cap) => cached(cap, node.sellerSpriteNodePath, period)).length;
+      entries.push({ target: `market:${node.id}:${period}`, remote: 3 - reuse, local: reuse,
+        reason: reuse === 3 ? 'freshness_skip' : 'missing_or_expired' });
+    }
+    for (const product of products) {
+      const local = mode === 'incremental' && (resolver.product(product.id).length > 0 || cached('ASIN_SALES_TREND', product.asin));
+      entries.push({ target: `owned:${product.id}`, remote: local ? 0 : 1, local: local ? 1 : 0,
+        reason: local ? 'freshness_skip' : 'missing_or_expired' });
+      const state = this.database.prepare('SELECT collected_at FROM mcp_discovery_state WHERE scope_key=?').get(requestKey([product.id, product.asin, product.marketplace, 20]));
+      const reuse = mode === 'incremental' && ((state && Date.now() - Date.parse(String(state.collected_at)) < budget.ttl('ASIN_COMPETITOR_DISCOVERY')) || cached('ASIN_COMPETITOR_DISCOVERY', product.asin));
+      entries.push({ target: `discovery:${product.id}`, remote: reuse || (quota.estimatedRemaining < 150 && mode === 'incremental') ? 0 : 1,
+        local: reuse ? 1 : 0, reason: reuse ? 'freshness_skip' : quota.estimatedRemaining < 150 ? 'budget_blocked' : 'missing_or_expired' });
+    }
+    const competitors = this.database.prepare(`SELECT DISTINCT p.id FROM products p
+      JOIN competitor_relations r ON r.competitor_product_id=p.id
+      JOIN products owned ON owned.id=r.owned_product_id
+      WHERE p.marketplace=? AND p.status='active' AND r.relation_type='direct'
+        AND p.is_owned=0 AND p.is_parent=0 AND p.source_type<>'mock'
+        AND owned.marketplace=p.marketplace AND owned.is_owned=1 AND owned.is_parent=0
+        AND owned.status='active' AND owned.source_type<>'mock' ORDER BY p.id`).all(market.marketplace);
+    for (const product of competitors) {
+      const local = mode === 'incremental' && resolver.product(String(product.id), true).length > 0;
+      entries.push({ target: `competitor:${product.id}`, remote: local || (mode === 'incremental' && quota.estimatedRemaining < 150) ? 0 : 1,
+        local: local ? 1 : 0, reason: local ? 'freshness_skip' : mode === 'incremental' && quota.estimatedRemaining < 150 ? 'budget_blocked' : 'missing_or_expired' });
+    }
+    const tools = this.database.prepare("SELECT collected_at, capabilities_json FROM provider_capability_snapshots WHERE provider_id='sellersprite' ORDER BY collected_at DESC LIMIT 1").get();
+    const legacyMasked = tools && (JSON.parse(String(tools.capabilities_json)) as {tools?: Array<{inputSchema?:{required?:string[]}}>}).tools
+      ?.some((tool) => tool.inputSchema?.required?.includes('[PII_PATH]'));
+    const toolFresh = tools && !legacyMasked && Date.now() - Date.parse(String(tools.collected_at)) < budget.ttl('LIST_TOOLS');
+    const remote = entries.reduce((n, e) => n + e.remote, 0) + (mode !== 'incremental' || !toolFresh ? 1 : 0);
+    const blockers: string[] = [];
+    try { requireConfirmedOwnedRoster(this.database, market.marketplace); } catch { blockers.push('自有 SKU 清单尚未确认'); }
+    if (products.length === 0) blockers.push('没有启用的自有 SKU');
+    if (nodes.some((node) => !/^\d+(?::\d+)*$/.test(node.sellerSpriteNodePath))) blockers.push('市场节点路径尚未确认');
+    if (mode === 'incremental' && remote > Math.max(0, quota.estimatedRemaining - quota.reserve)) blockers.push('预计调用超过可用额度');
+    const fingerprint = requestKey([market, products, nodes, competitors, quota.policy, quota.reserve]);
+    const plan = { id: randomUUID(), syncMode: mode, entries, estimatedRemoteCalls: remote,
+      localReuse: entries.reduce((n, e) => n + e.local, 0), cacheReuse: 0,
+      maximumRemoteCalls: remote * 2 + 2, estimatedRemaining: quota.estimatedRemaining,
+      projectedRemaining: Math.max(0, quota.estimatedRemaining - remote),
+      requiresConfirmation: mode !== 'incremental' || remote > 20, blockers, fingerprint };
+    this.database.prepare('INSERT INTO mcp_call_plans VALUES (?, ?, ?, ?, NULL)').run(plan.id,
+      JSON.stringify({ marketId: input.marketId, month, syncMode: mode }), JSON.stringify(plan), new Date().toISOString());
+    return plan;
+  }
+
+  async syncCriticalBatch(input: SellerSpriteMarketSyncInput) {
+    const mode = input.syncMode ?? 'incremental';
+    const current = this.planCritical(input);
+    let plan = current;
+    if (input.planId) {
+      const saved = this.database.prepare('SELECT * FROM mcp_call_plans WHERE id=? AND consumed_at IS NULL').get(input.planId);
+      if (!saved || Date.now() - Date.parse(String(saved.created_at)) > 600_000
+        || saved.input_json !== JSON.stringify({marketId: input.marketId, month: compactMonth(input.month), syncMode: mode})) throw new Error('调用计划已失效，请重新预览。');
+      plan = JSON.parse(String(saved.plan_json)) as typeof current;
+      if (plan.fingerprint !== current.fingerprint || current.estimatedRemoteCalls > plan.estimatedRemoteCalls) throw new Error('数据范围或新鲜度已变化，请重新预览。');
+    }
+    if (current.blockers.length) throw new Error(current.blockers.join('；'));
+    if (plan.requiresConfirmation && (!input.planId || !input.confirmed)) throw new McpPolicyError('CONFIRMATION_REQUIRED');
+    const consumed = this.database.prepare('UPDATE mcp_call_plans SET consumed_at=? WHERE id=? AND consumed_at IS NULL').run(new Date().toISOString(), plan.id);
+    if (consumed.changes !== 1) throw new Error('调用计划已执行，请重新预览。');
+    return mcpExecution.run({syncMode: mode, confirmed: Boolean(input.planId && input.confirmed), remaining: plan.maximumRemoteCalls}, async () => {
+      new McpBudgetManager(this.database).record(plan.id, `${mode}_plan_executed`);
+      return this.executeCriticalBatch(input);
+    });
+  }
+
+  private async executeCriticalBatch(input: SellerSpriteMarketSyncInput): Promise<{
     runId: string;
     taskId: string;
     marketSnapshots: number;
@@ -501,8 +617,10 @@ export class SellerSpriteSyncService {
     const products = this.activeOwnedProducts(market.marketplace, market.id);
     const marketNodes = this.criticalMarketNodes(market, products);
     const runId = randomUUID();
+    currentExecution().runId = runId;
     const startedAt = new Date().toISOString();
     const scope = {
+      syncMode: currentExecution().syncMode,
       marketId: market.id, nodeIdPath: market.sellerSpriteNodePath, month, baselineMonth,
       marketMonths: [baselineMonth, month],
       marketNodes: marketNodes.map((node) => ({ id: node.id, nodeIdPath: node.sellerSpriteNodePath })),
@@ -521,10 +639,10 @@ export class SellerSpriteSyncService {
     try {
       if (products.length === 0) throw new Error('关键同步需要至少一个启用中的自有 SKU。');
       // Remote calls finish outside the write transaction; a failure cannot commit half a batch.
-      const preparedMarkets = await Promise.all(marketNodes.flatMap((node) => [
-        this.prepareMarket({ marketId: node.id, month }, runId, true),
-        this.prepareMarket({ marketId: node.id, month: baselineMonth }, runId, true),
-      ]));
+      const preparedMarkets: PreparedMarketObservation[] = [];
+      for (const node of marketNodes) for (const period of [month, baselineMonth]) {
+        preparedMarkets.push(await this.prepareMarket({ marketId: node.id, month: period }, runId, true));
+      }
       const preparedProducts: PreparedProductObservation[] = [];
       for (const product of products) preparedProducts.push(await this.prepareProduct(product, runId));
 
@@ -678,7 +796,7 @@ export class SellerSpriteSyncService {
     const failures: Array<{ id: string; status: 'failed' }> = [];
     for (const competitor of competitors) {
       try {
-        const prepared = await this.prepareProduct(competitor, runId);
+        const prepared = await this.prepareProduct(competitor, runId, true);
         const snapshots = transaction(this.database, () => {
           if (!this.isCurrentDirectCompetitor(competitor.id, marketplace)) {
             throw new Error('核心竞品关系在同步期间发生变化。');
@@ -729,16 +847,22 @@ export class SellerSpriteSyncService {
       throw new Error('请先确认并映射 SellerSprite 市场节点路径。');
     }
     const observationDate = monthEnd(input.month);
+    const local = new LocalObservationResolver(this.database).market(market.id, observationDate);
+    if (local) {
+      new McpBudgetManager(this.database).record(`market:${market.id}:${observationDate}`, 'local_hit');
+      new McpBudgetManager(this.database).record(`market:${market.id}:${observationDate}`, 'freshness_skip');
+      return { market, observationDate, provenance: localProvenance(local),
+        metrics: Object.fromEntries(Object.entries(MARKET_METRIC_COLUMNS).map(([metric, column]) => [metric, local[column]])) as Record<MarketMetric, number | null>,
+        concentration: JSON.parse(String(local.concentration_json)) as PreparedMarketObservation['concentration'] };
+    }
     const request = {
       marketplace: market.marketplace,
       nodeIdPath: market.sellerSpriteNodePath,
       month: compactMonth(input.month),
     };
-    const [research, statistics, concentration] = await Promise.all([
-      this.port.fetchMarketResearchSummary(request, { runId, requireObservationMonth }),
-      this.port.fetchMarketStatistics(request, { runId, requireObservationMonth }),
-      this.port.fetchMarketConcentration(request, { runId, requireObservationMonth }),
-    ]);
+    const research = await this.port.fetchMarketResearchSummary(request, { runId, requireObservationMonth });
+    const statistics = await this.port.fetchMarketStatistics(request, { runId, requireObservationMonth });
+    const concentration = await this.port.fetchMarketConcentration(request, { runId, requireObservationMonth });
     ensureCompatibleProvenance(research.provenance, statistics.provenance);
     ensureCompatibleProvenance(statistics.provenance, concentration.provenance);
     ensureResponseScope(research.data, market.marketplace, request.nodeIdPath, request.month);
@@ -806,11 +930,24 @@ export class SellerSpriteSyncService {
     };
   }
 
-  private async prepareProduct(product: ProductRow, runId?: string): Promise<PreparedProductObservation> {
+  private async prepareProduct(product: ProductRow, runId?: string, secondary = false): Promise<PreparedProductObservation> {
+    const local = new LocalObservationResolver(this.database).product(product.id, secondary);
+    if (local.length) {
+      new McpBudgetManager(this.database).record(`product:${product.id}`, 'local_hit');
+      new McpBudgetManager(this.database).record(`product:${product.id}`, 'freshness_skip');
+      return { product, parentAsin: null, provenance: localProvenance(local[0]!), points: local.map((row) => ({
+        observationDate: String(row.observation_date), ...Object.fromEntries(PRODUCT_METRICS.map((key) => [key, row[PRODUCT_METRIC_COLUMNS[key]]])),
+      })) as PreparedProductObservation['points'] };
+    }
+    if (secondary && currentExecution().syncMode === 'incremental'
+      && new McpBudgetManager(this.database).summary().estimatedRemaining < 150) {
+      new McpBudgetManager(this.database).record(`product:${product.id}`, 'budget_blocked');
+      throw new McpPolicyError('BUDGET_BLOCKED');
+    }
     const response = await this.port.fetchAsinSalesTrend({
       marketplace: product.marketplace,
       asin: product.asin,
-    }, { runId });
+    }, { runId, secondary });
     ensureMcpProvenance(response.provenance);
     const info = response.data.asin;
     ensureResponseScope(info, product.marketplace);
@@ -1041,7 +1178,21 @@ export class SellerSpriteSyncService {
     input: { name: string; taskType: string; target: string; marketplace: string },
     prepare: (runId: string) => Promise<() => number>,
   ): Promise<SellerSpriteTrackedSyncResult> {
+    if (!mcpExecution.getStore()) {
+      const budget = new McpBudgetManager(this.database);
+      const estimatedRemoteCalls = input.taskType === 'market_refresh' ? 4 : 2;
+      const planId = randomUUID();
+      this.database.prepare('INSERT INTO mcp_call_plans VALUES (?, ?, ?, ?, ?)').run(planId,
+        JSON.stringify(input), JSON.stringify({syncMode:'incremental',estimatedRemoteCalls,
+          maximumRemoteCalls:estimatedRemoteCalls*2, note:'Conservative bound before local/cache resolution'}),
+        new Date().toISOString(), new Date().toISOString());
+      return mcpExecution.run({syncMode:'incremental',remaining:estimatedRemoteCalls*2}, async()=>{
+        budget.record(planId,'incremental_plan_executed');
+        return this.runTrackedObservationSync(input,prepare);
+      });
+    }
     const runId = randomUUID();
+    currentExecution().runId = runId;
     const startedAt = new Date().toISOString();
     this.database.prepare(`
       INSERT INTO data_tasks (
@@ -1293,6 +1444,11 @@ function previousMonth(value: string): string {
   const normalized = compactMonth(value);
   const date = new Date(Date.UTC(Number(normalized.slice(0, 4)), Number(normalized.slice(4)) - 2, 1));
   return `${date.getUTCFullYear()}${String(date.getUTCMonth() + 1).padStart(2, '0')}`;
+}
+
+function localProvenance(row: Record<string, unknown>): Provenance {
+  return { source: String(row.source), sourceType: 'mcp', collectedAt: String(row.collected_at),
+    period: String(row.period), isEstimated: row.is_estimated === 1, confidence: Number(row.confidence) };
 }
 
 function monthEnd(value: string): string {

@@ -2220,6 +2220,40 @@ const migrations = [
   },
 ];
 
+migrations.push({
+  version: 32,
+  sql: `
+    CREATE TABLE provider_quota_state (
+      provider_id TEXT PRIMARY KEY, baseline_remaining INTEGER NOT NULL CHECK(baseline_remaining >= 0),
+      baseline_at TEXT NOT NULL, estimated_remote_calls_since_baseline INTEGER NOT NULL DEFAULT 0,
+      reserved_calls INTEGER NOT NULL DEFAULT 100, period_end TEXT,
+      updated_at TEXT NOT NULL, policy_json TEXT NOT NULL DEFAULT '{}',
+      failure_code TEXT, failure_count INTEGER NOT NULL DEFAULT 0, open_until TEXT,
+      half_open_until TEXT
+    );
+    INSERT INTO provider_quota_state(provider_id, baseline_remaining, baseline_at, updated_at)
+      VALUES ('sellersprite', 500, strftime('%Y-%m-%dT%H:%M:%fZ','now'), strftime('%Y-%m-%dT%H:%M:%fZ','now'));
+    CREATE TABLE mcp_usage_events (
+      id TEXT PRIMARY KEY, request_key TEXT NOT NULL, outcome TEXT NOT NULL,
+      sync_mode TEXT NOT NULL, run_id TEXT, created_at TEXT NOT NULL
+    );
+    CREATE INDEX idx_mcp_usage_time ON mcp_usage_events(created_at);
+    CREATE TABLE mcp_local_observations (
+      request_key TEXT PRIMARY KEY, payload_json TEXT NOT NULL, collected_at TEXT NOT NULL,
+      expires_at TEXT NOT NULL, historical_stable INTEGER NOT NULL DEFAULT 0,
+      backfill_complete INTEGER NOT NULL DEFAULT 0, schema_hash TEXT NOT NULL,
+      capability TEXT, scope_key TEXT
+    );
+    CREATE TABLE mcp_call_plans (
+      id TEXT PRIMARY KEY, input_json TEXT NOT NULL, plan_json TEXT NOT NULL,
+      created_at TEXT NOT NULL, consumed_at TEXT
+    );
+    CREATE TABLE mcp_schema_pauses (capability TEXT PRIMARY KEY, schema_hash TEXT NOT NULL, created_at TEXT NOT NULL);
+    CREATE TABLE mcp_discovery_state (scope_key TEXT PRIMARY KEY, collected_at TEXT NOT NULL);
+    CREATE TABLE mcp_request_leases (request_key TEXT PRIMARY KEY, owner TEXT NOT NULL, expires_at INTEGER NOT NULL);
+  `,
+});
+
 export function migrate(database: DatabaseSync): void {
   database.exec(`
     CREATE TABLE IF NOT EXISTS schema_migrations (

@@ -313,12 +313,13 @@ function safeSchemaProperty(value: unknown): Record<string, unknown> {
     if (key === 'properties' || key === '$defs' || key === 'definitions') {
       if (!item || typeof item !== 'object' || Array.isArray(item)) return [safeKey, REDACTED_SCHEMA_VALUE];
       return [safeKey, Object.fromEntries(Object.entries(item).map(([propertyName, property]) => [
-        safeSchemaPath(propertyName), isSensitiveSchemaPath(propertyName)
+        propertyName === 'asin' ? 'asin' : safeSchemaPath(propertyName), propertyName === 'asin'
+          ? { type: 'string' } : isSensitiveSchemaPath(propertyName)
           ? REDACTED_SCHEMA_VALUE : safeSchemaProperty(property),
       ]))];
     }
     if (Array.isArray(item)) return [safeKey, item.map((entry) => {
-      if (typeof entry === 'string') return key === 'required' ? safeSchemaPath(entry) : REDACTED_SCHEMA_VALUE;
+      if (typeof entry === 'string') return key === 'required' ? entry === 'asin' ? 'asin' : safeSchemaPath(entry) : REDACTED_SCHEMA_VALUE;
       if (entry && typeof entry === 'object') return safeSchemaProperty(entry);
       return REDACTED_SCHEMA_VALUE;
     })];

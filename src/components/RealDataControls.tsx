@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react';
 import { DatabaseBackup, PlugZap, RefreshCw, Save, ShieldCheck, Trash2 } from 'lucide-react';
 import { api, ApiError } from '../lib/api';
+import McpQuotaControls from './McpQuotaControls';
 
 interface ConnectionDiagnostics {
   connected: boolean;
@@ -221,20 +222,9 @@ export default function RealDataControls({
             <input className="input" type="month" value={month} disabled={busy || isViewer}
               onChange={(event) => setMonth(event.target.value)} />
           </label>
-          <button className="button button-primary" type="button" disabled={busy || isViewer || !marketId
-            || !/^\d+(?::\d+)*$/.test(mappedPath) || !month}
-            onClick={() => void run(async () => {
-              await api.post('/api/integrations/sellersprite/sync/critical', {
-                marketId,
-                month: month.replace('-', ''),
-              });
-              setBackupName(null);
-              setNotice('关键市场与自有 SKU 历史已同步。');
-              await refresh();
-            })}>
-            <RefreshCw size={16} />同步关键数据
-          </button>
         </div>
+        <McpQuotaControls marketId={/^\d+(?::\d+)*$/.test(mappedPath) ? marketId : ''} month={month.replace('-', '')} isViewer={isViewer}
+          onComplete={async () => { setBackupName(null); await refresh(); }} />
       </section>
 
       <section className="real-data-band" aria-label="Go Live 迁移">

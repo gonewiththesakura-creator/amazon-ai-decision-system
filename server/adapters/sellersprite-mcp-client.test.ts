@@ -253,7 +253,6 @@ describe('SellerSpriteMcpClient', () => {
     const transport = new FakeTransport({
       callOutcomes: [
         httpError(429, 'rate limited at https://mcp.example.test?secretKey=secret-value'),
-        httpError(429, 'retry token=secret-value'),
         callResult({ rows: [{ asin: 'B000TEST01', sales: 120 }] }),
       ],
     });
@@ -272,9 +271,8 @@ describe('SellerSpriteMcpClient', () => {
     });
 
     expect(result.structuredContent).toEqual({ rows: [{ asin: 'B000TEST01', sales: 120 }] });
-    expect(delays).toEqual([10, 20]);
+    expect(delays).toEqual([10]);
     expect(ledger.entries.map(({ status, errorCode }) => ({ status, errorCode }))).toEqual([
-      { status: 'failed', errorCode: 'RATE_LIMIT' },
       { status: 'failed', errorCode: 'RATE_LIMIT' },
       { status: 'success', errorCode: null },
     ]);
