@@ -1,20 +1,25 @@
-import { useCallback, useEffect, useMemo, useState } from 'react';
-import { useSearchParams } from 'react-router-dom';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { Link, useLocation, useSearchParams } from 'react-router-dom';
 import {
   AlertCircle,
   CheckCircle2,
   ChevronRight,
   Clock3,
   DatabaseZap,
+  FileSpreadsheet,
   Loader2,
   RefreshCw,
   RotateCcw,
   Search,
+  Upload,
   X,
   XCircle,
 } from 'lucide-react';
-import type { ApiResponse, DataTask, TaskStatus } from '../../shared/types';
+import type { ApiResponse, DataCoverageCounter, DataCoverageReport, DataTask, TaskStatus } from '../../shared/types';
 import { useApp } from '../lib/AppContext';
+import {
+  confirmImport, previewImport, selectImportPreviewType, useApi, type ImportPreviewResult,
+} from '../lib/api';
 
 const statusLabels: Record<TaskStatus, string> = {
   pending: '等待中',
@@ -71,9 +76,25 @@ function duration(task: DataTask): string {
   return minutes < 60 ? `${minutes} 分 ${seconds % 60} 秒` : `${Math.floor(minutes / 60)} 小时 ${minutes % 60} 分`;
 }
 
+function isRunManagedTask(task: DataTask): boolean {
+  return task.syncRunId !== null || task.taskType === 'critical_sync' || task.taskType === 'competitor_discovery';
+}
+
+function canRetryTask(task: DataTask): boolean {
+  return (task.status === 'failed' || task.status === 'partial')
+    && !task.researchJobId
+    && task.taskType !== 'post_import_analysis'
+    && !isRunManagedTask(task);
+}
+
 export default function DataTasksPage() {
-  const { settings } = useApp();
+  const { settings, refreshKey } = useApp();
+  const coverageQuery = useApi<DataCoverageReport>(
+    `/api/data-coverage?marketplace=${encodeURIComponent(settings.marketplace)}`,
+    refreshKey,
+  );
   const [searchParams] = useSearchParams();
+  const { hash } = useLocation();
   const canEdit = settings.role === 'admin';
   const [tasks, setTasks] = useState<DataTask[]>([]);
   const [loading, setLoading] = useState(true);
@@ -84,6 +105,22 @@ export default function DataTasksPage() {
   const [marketplaceFilter, setMarketplaceFilter] = useState('all');
   const [detailTask, setDetailTask] = useState<DataTask | null>(null);
   const [retryingId, setRetryingId] = useState<string | null>(null);
+  const [importFile, setImportFile] = useState<File | null>(null);
+  const [importPreview, setImportPreview] = useState<ImportPreviewResult | null>(null);
+  const [acceptPartialImport, setAcceptPartialImport] = useState(false);
+  const [importing, setImporting] = useState(false);
+  const [selectedImportType, setSelectedImportType] = useState('');
+  const [importSource, setImportSource] = useState<'import' | 'amazon'>('import');
+  const [reportStartDate, setReportStartDate] = useState('');
+  const [reportEndDate, setReportEndDate] = useState('');
+  const importFileRef = useRef<HTMLInputElement>(null);
+
+  useEffect(() => {
+    if (hash !== '#import-center-title' || !canEdit) return;
+    const heading = document.getElementById('import-center-title');
+    heading?.focus({ preventScroll: true });
+    heading?.scrollIntoView?.({ block: 'start' });
+  }, [canEdit, hash]);
 
   const loadTasks = useCallback(async (showLoading = true) => {
     if (showLoading) setLoading(true);
@@ -148,11 +185,73 @@ export default function DataTasksPage() {
     }
   }
 
+  async function inspectImport(file: File | null) {
+    setImportFile(file);
+    setImportPreview(null);
+    setAcceptPartialImport(false);
+    setSelectedImportType('');
+    if (!file) return;
+    if (importSource === 'amazon' && (!reportStartDate || !reportEndDate || reportStartDate > reportEndDate)) {
+      setError('请选择有效的 Amazon 报表起止日期。');
+      return;
+    }
+    setImporting(true);
+    setError(null);
+    try {
+      setImportPreview(await previewImport(file, {
+        sourceType: importSource,
+        marketplace: settings.marketplace,
+        ...(importSource === 'amazon' ? { reportStartDate, reportEndDate } : {}),
+      }));
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : '文件预览失败');
+    } finally {
+      setImporting(false);
+    }
+  }
+
+  async function confirmPreview() {
+    if (!importPreview || importPreview.newCount + (importPreview.updateCount ?? 0) === 0 || !importPreview.entityType
+      || (importPreview.errorCount > 0 && !acceptPartialImport)) return;
+    setImporting(true);
+    setError(null);
+    try {
+      const result = await confirmImport(importPreview.token);
+      setNotice(`已确认导入 ${result.successCount} 行，${result.failureCount} 行未写入。`);
+      setImportPreview(null);
+      setAcceptPartialImport(false);
+      setImportFile(null);
+      setSelectedImportType('');
+      if (importFileRef.current) importFileRef.current.value = '';
+      await loadTasks(false);
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : '确认导入失败');
+    } finally {
+      setImporting(false);
+    }
+  }
+
+  async function selectUnknownImportType(entityType: string) {
+    setSelectedImportType(entityType);
+    setAcceptPartialImport(false);
+    if (!importPreview || !entityType) return;
+    setImporting(true);
+    setError(null);
+    try {
+      setImportPreview(await selectImportPreviewType(importPreview.token, entityType));
+      setSelectedImportType('');
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : '重新预览文件失败');
+    } finally {
+      setImporting(false);
+    }
+  }
+
   return (
     <main className="page data-tasks-page">
       <header className="page-header">
         <div><div className="eyebrow">数据基础设施 · 全局审计</div><h1>全部站点任务</h1><p>集中查看所有 Marketplace 的采集、同步和导入记录；顶部站点切换不会缩小这份审计列表。</p></div>
-        <button className="button button-secondary" type="button" onClick={() => void loadTasks()} disabled={loading}><RefreshCw className={loading ? 'spin' : ''} size={16} /> 刷新状态</button>
+        <button className="button button-secondary" type="button" onClick={() => { void loadTasks(); coverageQuery.reload(); }} disabled={loading}><RefreshCw className={loading ? 'spin' : ''} size={16} /> 刷新状态</button>
       </header>
 
       {error && <div className="alert alert-error" role="alert">{error}<button type="button" onClick={() => void loadTasks()}>重试</button></div>}
@@ -166,6 +265,90 @@ export default function DataTasksPage() {
         <button className={`metric ${statusFilter === 'partial' ? 'selected' : ''}`} type="button" onClick={() => setStatusFilter(statusFilter === 'partial' ? 'all' : 'partial')}><span>部分成功</span><strong>{counts.partial}</strong><small>存在失败记录</small></button>
         <button className={`metric ${statusFilter === 'failed' ? 'selected' : ''}`} type="button" onClick={() => setStatusFilter(statusFilter === 'failed' ? 'all' : 'failed')}><span>失败</span><strong>{counts.failed}</strong><small>可查看日志并重试</small></button>
       </section>
+
+      <section className="panel data-coverage" aria-labelledby="data-coverage-title">
+        <div className="panel-header"><div><span className="eyebrow">CURRENT MARKETPLACE · {settings.marketplace}</span><h2 id="data-coverage-title">真实数据覆盖</h2></div><DatabaseZap size={20} aria-hidden="true" /></div>
+        {coverageQuery.loading && !coverageQuery.data ? (
+          <p role="status" aria-label="正在检查真实数据覆盖">正在检查真实数据覆盖…</p>
+        ) : coverageQuery.error && !coverageQuery.data ? (
+          <div className="alert alert-error" role="alert">覆盖检查失败：{coverageQuery.error.message}<button type="button" onClick={coverageQuery.reload} aria-label="重试覆盖检查">重试</button></div>
+        ) : coverageQuery.data ? (
+          <ul className="data-coverage__list">
+            {([
+              ['主市场', coverageQuery.data.primaryMarket],
+              ['活跃自有产品', coverageQuery.data.activeOwnedProducts],
+              ['核心竞品', coverageQuery.data.coreCompetitors],
+              ['主市场 90 天历史', coverageQuery.data.primaryMarketHistory90d],
+              ['自有 SKU 90 天历史', coverageQuery.data.ownedProductHistory90d],
+              ['自有 SKU 180 天历史', coverageQuery.data.ownedProductHistory180d],
+              ['核心竞品 90 天历史', coverageQuery.data.coreCompetitorHistory90d],
+              ['人工确认 Direct 竞品目标（每 SKU 3-5）', coverageQuery.data.coreDirectCompetitorTarget],
+              ['Amazon 实际数据', coverageQuery.data.amazonActual],
+            ] as Array<[string, DataCoverageCounter]>).map(([label, counter]) => (
+              <li key={label} aria-label={`${label}覆盖：${counter.covered} / ${counter.total}，${counter.label}`}>
+                <span>{label}</span><strong>{counter.covered} / {counter.total}</strong>
+                <span className={`status-badge ${coverageTone(counter.status)}`}>{counter.label}</span>
+              </li>
+            ))}
+          </ul>
+        ) : null}
+      </section>
+
+      {canEdit && (
+        <section className="panel" aria-labelledby="import-center-title">
+          <div className="panel-header"><div><span className="eyebrow">IMPORT CENTER V2</span><h2 id="import-center-title" tabIndex={-1} style={{ scrollMarginTop: 96 }}>审核文件导入</h2></div><FileSpreadsheet size={22} /></div>
+          <div className="real-data-actions">
+            <label className="field"><span>文件来源</span><select className="input" aria-label="文件来源"
+              value={importSource} disabled={importing} onChange={(event) => {
+                setImportSource(event.target.value as 'import' | 'amazon');
+                setImportPreview(null);
+                setAcceptPartialImport(false);
+              }}><option value="import">SellerSprite / 产品主数据</option><option value="amazon">Amazon Business Report</option></select></label>
+            {importSource === 'amazon' ? <>
+              <label className="field"><span>报表开始日期</span><input className="input" type="date" value={reportStartDate}
+                disabled={importing}
+                onChange={(event) => { setReportStartDate(event.target.value); setImportPreview(null); setAcceptPartialImport(false); }} /></label>
+              <label className="field"><span>报表结束日期</span><input className="input" type="date" value={reportEndDate}
+                disabled={importing}
+                onChange={(event) => { setReportEndDate(event.target.value); setImportPreview(null); setAcceptPartialImport(false); }} /></label>
+              <span className="result-count">Amazon {settings.marketplace}</span>
+            </> : null}
+          </div>
+          <div className="toolbar">
+            <label className="button button-secondary" htmlFor="import-center-file" aria-disabled={importing}><Upload size={16} />{importFile?.name ?? '选择 CSV / XLSX'}</label>
+            <input ref={importFileRef} id="import-center-file" className="sr-only" type="file" accept=".csv,.xlsx,.xls" disabled={importing} onChange={(event) => void inspectImport(event.target.files?.[0] ?? null)} />
+            {importFile && !importPreview ? <button className="button button-secondary" type="button"
+              disabled={importing || (importSource === 'amazon' && (!reportStartDate || !reportEndDate || reportStartDate > reportEndDate))}
+              onClick={() => void inspectImport(importFile)}><Search size={16} />预览文件</button> : null}
+            {importPreview && <><span className="status-badge neutral">{importPreview.detectedType}</span><span className="result-count">{importPreview.totalCount} 行 · {importPreview.newCount} 新增 · {importPreview.updateCount ?? 0} 更新 · {importPreview.duplicateCount} 重复 · {importPreview.errorCount} 拒绝</span>{importPreview.detectedType === 'unknown' && !importPreview.entityType && <label className="select-field"><select aria-label="选择未知文件类型" value={selectedImportType} disabled={importing} onChange={(event) => void selectUnknownImportType(event.target.value)}><option value="">选择导入类型</option><option value="product">产品快照</option><option value="market">市场快照</option><option value="review">评论</option><option value="owned_product_master">产品主数据</option></select></label>}<button className="button button-primary" type="button" disabled={importing || importPreview.newCount + (importPreview.updateCount ?? 0) === 0 || !importPreview.entityType || (importPreview.errorCount > 0 && !acceptPartialImport)} onClick={() => void confirmPreview()}>{importing ? <Loader2 className="spin" size={16} /> : <CheckCircle2 size={16} />}确认导入</button></>}
+          </div>
+          {importPreview && (
+            <div className="import-preview-review">
+              <section aria-labelledby="import-mappings-title">
+                <h3 id="import-mappings-title">字段映射</h3>
+                {importPreview.mappings.length ? <div className="data-table-wrap"><table className="data-table"><thead><tr><th>文件列</th><th>系统字段</th></tr></thead><tbody>
+                  {importPreview.mappings.map((mapping) => <tr key={mapping.sourceHeader}><td>{mapping.sourceHeader}</td><td>{mapping.targetField}</td></tr>)}
+                </tbody></table></div> : <p className="muted">未识别到字段映射。</p>}
+              </section>
+              <section aria-labelledby="import-sample-title">
+                <h3 id="import-sample-title">样例行</h3>
+                <p className="muted">展示 {importPreview.previewedCount}/{importPreview.totalCount} 行样例，尚未人工逐行审核。{importPreview.rowsOmitted > 0 ? `另有 ${importPreview.rowsOmitted} 行未展开；确认导入将处理整个文件。` : ''}</p>
+                {importPreview.rows.length ? <div className="data-table-wrap"><table className="data-table"><thead><tr><th>文件行</th>{importPreview.mappings.map((mapping) => <th key={mapping.sourceHeader}>{mapping.sourceHeader}</th>)}</tr></thead><tbody>
+                  {importPreview.rows.map((row) => <tr key={row.rowNumber}><td>{row.rowNumber}</td>{importPreview.mappings.map((mapping) => <td key={mapping.sourceHeader}>{formatImportValue(row.values[mapping.sourceHeader])}</td>)}</tr>)}
+                </tbody></table></div> : <p className="muted">没有可展示的样例行。</p>}
+              </section>
+              {importPreview.errorCount > 0 && <section aria-labelledby="import-errors-title">
+                <h3 id="import-errors-title">拒绝明细（{importPreview.errorCount} 行）</h3>
+                <div className="alert alert-warning"><ul>{importPreview.errors.map((reason, index) => <li key={`${index}-${reason}`}>{reason}</li>)}</ul></div>
+                {importPreview.entityType === 'owned_product_master'
+                  ? <p className="muted">产品主数据必须整批通过校验；请修正拒绝行后重新预览。</p>
+                  : importPreview.newCount + (importPreview.updateCount ?? 0) > 0 && <label className="field"><span><input type="checkbox" checked={acceptPartialImport} onChange={(event) => setAcceptPartialImport(event.target.checked)} /> 只导入有效行；我已查看拒绝原因，错误行不会写入。</span></label>}
+              </section>}
+              {importPreview.duplicateCount > 0 && <p className="muted">{importPreview.duplicateCount} 行重复记录不会再次写入。</p>}
+            </div>
+          )}
+        </section>
+      )}
 
       <div className="toolbar filter-toolbar">
         <label className="search-field"><Search size={16} /><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="搜索任务、目标或数据源" /></label>
@@ -195,7 +378,7 @@ export default function DataTasksPage() {
                     <td><div className="task-progress"><div className="progress-track"><i style={{ width: `${progress}%` }} /></div><span>{processed}/{task.total}</span></div><small className={task.failed ? 'negative' : ''}>{task.success} 成功 · {task.failed} 失败</small></td>
                     <td><span>{formatDate(task.startedAt)}</span><small>{formatDate(task.completedAt)}</small></td>
                     <td>{duration(task)}</td>
-                    <td>{task.errorLog ? <button className="icon-button" type="button" aria-label={`查看 ${task.name} 错误详情`} onClick={() => setDetailTask(task)}><ChevronRight size={18} /></button> : (task.status === 'failed' || task.status === 'partial') ? <button className="button button-small" type="button" disabled={!canEdit || retryingId !== null} onClick={() => void retryTask(task)}>{retryingId === task.id ? <Loader2 className="spin" size={14} /> : <RotateCcw size={14} />}重试</button> : null}</td>
+                    <td>{task.errorLog ? <button className="icon-button" type="button" aria-label={`查看 ${task.name} 错误详情`} onClick={() => setDetailTask(task)}><ChevronRight size={18} /></button> : canRetryTask(task) ? <button className="button button-small" type="button" disabled={!canEdit || retryingId !== null} onClick={() => void retryTask(task)}>{retryingId === task.id ? <Loader2 className="spin" size={14} /> : <RotateCcw size={14} />}重试</button> : null}</td>
                   </tr>
                 );
               })}</tbody>
@@ -210,11 +393,28 @@ export default function DataTasksPage() {
             <div className="modal-header"><div><span className="eyebrow">任务错误详情</span><h2 id="task-error-title">{detailTask.name}</h2></div><button className="icon-button" type="button" aria-label="关闭" onClick={() => setDetailTask(null)}><X size={18} /></button></div>
             <div className="task-error-summary"><span className={`status-badge ${statusTone(detailTask.status)}`}><StatusIcon status={detailTask.status} />{statusLabels[detailTask.status]}</span><span>{detailTask.success} 成功</span><span className="negative">{detailTask.failed} 失败</span></div>
             <pre className="error-log">{detailTask.errorLog ?? '没有记录具体错误日志。'}</pre>
-            <p className="muted">重试会创建一个新任务，原任务及错误日志将继续保留。</p>
-            <div className="modal-actions"><button className="button button-secondary" type="button" onClick={() => setDetailTask(null)}>关闭</button><button className="button button-primary" type="button" disabled={!canEdit || retryingId !== null} onClick={() => void retryTask(detailTask)}>{retryingId === detailTask.id ? <Loader2 className="spin" size={16} /> : <RotateCcw size={16} />}创建重试任务</button></div>
+            {detailTask.researchJobId
+              ? <p className="muted">该任务由 Research Job 工作流管理，请在对应 Research Job 中补充缺失数据或执行重试。</p>
+              : isRunManagedTask(detailTask)
+                ? <p className="muted">该任务属于运行级追溯链，请在设置 → 数据源重新运行 SellerSprite 关键同步。</p>
+                : <p className="muted">重试会创建一个新任务，原任务及错误日志将继续保留。</p>}
+            <div className="modal-actions"><button className="button button-secondary" type="button" onClick={() => setDetailTask(null)}>关闭</button>{detailTask.researchJobId ? <Link className="button button-primary" to={`/research-jobs/${encodeURIComponent(detailTask.researchJobId)}`}>打开 Research Job</Link> : canRetryTask(detailTask) && <button className="button button-primary" type="button" disabled={!canEdit || retryingId !== null} onClick={() => void retryTask(detailTask)}>{retryingId === detailTask.id ? <Loader2 className="spin" size={16} /> : <RotateCcw size={16} />}创建重试任务</button>}</div>
           </section>
         </div>
       )}
     </main>
   );
+}
+
+function coverageTone(status: DataCoverageCounter['status']): string {
+  if (status === 'complete') return 'success';
+  if (status === 'partial') return 'warning';
+  if (status === 'missing') return 'danger';
+  return 'neutral';
+}
+
+function formatImportValue(value: unknown): string {
+  if (value === null || value === undefined) return '缺失';
+  if (typeof value === 'object') return JSON.stringify(value);
+  return String(value);
 }

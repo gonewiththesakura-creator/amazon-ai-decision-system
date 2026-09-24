@@ -68,6 +68,11 @@ export interface Provenance {
   confidence: number;
 }
 
+export interface MetricProvenance extends Provenance {
+  sourceRecordId: string;
+  sourceRecordType: 'metric_fact' | 'snapshot';
+}
+
 export interface EvidenceMetric {
   name: string;
   label: string;
@@ -116,6 +121,7 @@ export interface MarketNode {
   level: number;
   marketplace: string;
   categoryId?: string;
+  sellerSpriteNodePath?: string;
   keywords: string[];
   status: string;
   snapshotAvailable: boolean;
@@ -171,6 +177,7 @@ export interface MarketDetail {
   concentration: Array<{ tier: string; share: number; avgPrice: number; avgSales: number }>;
   insight: Insight;
   provenance: Provenance;
+  metricProvenance?: Record<string, MetricProvenance>;
 }
 
 export interface ProductSnapshot {
@@ -190,6 +197,7 @@ export interface ProductSnapshot {
   growth30dAvailable: boolean;
   growth90d: number | null;
   provenance: Provenance;
+  metricProvenance?: Record<string, MetricProvenance>;
 }
 
 export interface Product {
@@ -362,6 +370,7 @@ export interface WorkflowEvidence {
   source: string;
   sourceType: 'mock' | 'import' | 'mcp' | 'amazon' | 'manual';
   sourceRecordId?: string;
+  syncRunId?: string | null;
   collectedAt: string;
   period: string;
   isEstimated: boolean;
@@ -535,6 +544,7 @@ export interface WatchlistItem {
 
 export interface DataTask {
   id: string;
+  syncRunId: string | null;
   name: string;
   taskType: string;
   target: string;
@@ -791,6 +801,7 @@ export interface ExecutiveDashboardViewModel {
   kpis: ExecutiveDashboardKpis;
   trendComparison: IndexedTrendSeries[];
   trendComparisonMeta: IndexedTrendComparisonMeta;
+  comparisonSkuIds: string[];
   ownedSkuPerformance: ExecutiveSkuPerformance[];
   marketDistribution: ExecutiveMarketDistribution;
   fastGrowthCompetitors: ExecutiveCompetitorGrowth[];
@@ -800,6 +811,35 @@ export interface ExecutiveDashboardViewModel {
   coreBusinessFreshness: CoreBusinessFreshness;
   systemSyncStatus: SystemSyncStatus;
   skuFocus: ExecutiveSkuFocus | null;
+}
+
+export type DataCoverageStatus = 'complete' | 'partial' | 'missing' | 'not_applicable';
+
+export interface DataCoverageCounter {
+  covered: number;
+  total: number;
+  status: DataCoverageStatus;
+  label: '完整' | '部分覆盖' | '缺失' | '不适用';
+}
+
+export interface DirectCompetitorTargetCoverage extends DataCoverageCounter {
+  minimumPerOwnedProduct: number;
+  preferredMaximumPerOwnedProduct: number;
+}
+
+export interface DataCoverageReport {
+  generatedAt: string;
+  marketplace: string;
+  primaryMarket: DataCoverageCounter;
+  activeOwnedProducts: DataCoverageCounter;
+  coreCompetitors: DataCoverageCounter;
+  history90d: DataCoverageCounter;
+  primaryMarketHistory90d: DataCoverageCounter;
+  ownedProductHistory90d: DataCoverageCounter;
+  ownedProductHistory180d: DataCoverageCounter;
+  coreCompetitorHistory90d: DataCoverageCounter;
+  coreDirectCompetitorTarget: DirectCompetitorTargetCoverage;
+  amazonActual: DataCoverageCounter;
 }
 
 export interface AppSettings {

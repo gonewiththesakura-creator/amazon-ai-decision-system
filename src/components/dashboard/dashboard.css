@@ -225,6 +225,44 @@
   border-radius: 2px;
 }
 
+.dashboard-trend-comparison-selector {
+  min-width: 0;
+  margin: 0 0 10px;
+  border-top: 1px solid #e9eeec;
+  border-bottom: 1px solid #e9eeec;
+}
+
+.dashboard-trend-comparison-selector summary {
+  display: flex;
+  align-items: center;
+  min-height: 34px;
+  color: var(--ink, #17211f);
+  cursor: pointer;
+  font-size: 11px;
+  font-weight: 700;
+}
+
+.dashboard-trend-comparison-selector__options {
+  display: flex;
+  max-height: 180px;
+  flex-wrap: wrap;
+  gap: 5px 12px;
+  padding: 0 0 8px;
+  overflow: auto;
+}
+
+.dashboard-trend-comparison-selector label {
+  display: inline-flex;
+  min-width: 0;
+  align-items: center;
+  gap: 4px;
+  color: var(--ink-soft, #52605d);
+  font-size: 10px;
+}
+
+.dashboard-trend-comparison-selector input { margin: 0; }
+.dashboard-trend-comparison-selector small { display: block; padding-bottom: 8px; color: var(--amber, #a86120); font-size: 10px; }
+
 .dashboard-chart-frame {
   width: 100%;
   min-width: 0;

@@ -1,5 +1,32 @@
 import type { DatabaseSync } from 'node:sqlite';
 
+function assertVariationFamilyIntegrity(database: DatabaseSync, version: number): void {
+  const orphan = database.prepare(`
+    SELECT product.id FROM products product
+    LEFT JOIN variation_families family ON family.id = product.variation_family_id
+    WHERE product.variation_family_id IS NOT NULL
+      AND (family.id IS NULL OR family.marketplace <> product.marketplace)
+    LIMIT 1
+  `).get() as { id: string } | undefined;
+  if (orphan) {
+    throw new Error(`V${version} found missing/cross-market variation family for product ${orphan.id}; review legacy identity before migration.`);
+  }
+
+  const inconsistentParent = database.prepare(`
+    SELECT product.id FROM products product
+    LEFT JOIN variation_families family ON family.id = product.variation_family_id
+    WHERE (product.variation_family_id IS NULL
+        AND product.parent_asin IS NOT NULL AND TRIM(product.parent_asin) <> '')
+      OR (product.variation_family_id IS NOT NULL
+        AND UPPER(TRIM(COALESCE(product.parent_asin, '')))
+          <> UPPER(TRIM(COALESCE(family.parent_asin, ''))))
+    LIMIT 1
+  `).get() as { id: string } | undefined;
+  if (inconsistentParent) {
+    throw new Error(`V${version} found parent ASIN inconsistent with variation family for product ${inconsistentParent.id}; review legacy identity before migration.`);
+  }
+}
+
 const migrations = [
   {
     version: 1,
@@ -1390,7 +1417,936 @@ const migrations = [
       );
     `,
   },
+  {
+    version: 20,
+    apply(database: DatabaseSync): void {
+      // Some narrow historical test fixtures intentionally model only the V13
+      // workflow tables while marking later migrations applied. A real V19
+      // database always has this foundational table pair.
+      const hasProductSnapshots = database.prepare(`
+        SELECT 1 AS present FROM sqlite_master WHERE type = 'table' AND name = 'product_snapshots'
+      `).get();
+      if (!hasProductSnapshots) {
+        throw new Error('V20 requires the V19 product_snapshots table. Refusing to mark a partial schema migrated.');
+      }
+
+      database.exec(`
+        ALTER TABLE products ADD COLUMN status TEXT NOT NULL DEFAULT 'active'
+          CHECK (status IN ('active', 'inactive'));
+        ALTER TABLE products ADD COLUMN updated_at TEXT;
+        ALTER TABLE products ADD COLUMN variation_family_id TEXT;
+        ALTER TABLE products ADD COLUMN parent_asin TEXT;
+        ALTER TABLE products ADD COLUMN is_parent INTEGER NOT NULL DEFAULT 0;
+        ALTER TABLE products ADD COLUMN variation_attributes_json TEXT NOT NULL DEFAULT '{}';
+
+        CREATE TABLE variation_families (
+          id TEXT PRIMARY KEY,
+          marketplace TEXT NOT NULL,
+          parent_asin TEXT NOT NULL,
+          variation_theme TEXT,
+          attributes_json TEXT NOT NULL DEFAULT '{}',
+          status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'inactive')),
+          created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL,
+          UNIQUE(marketplace, parent_asin)
+        );
+        CREATE INDEX idx_variation_families_market_parent
+          ON variation_families(marketplace, parent_asin);
+        CREATE INDEX idx_products_identity_asin
+          ON products(marketplace, asin);
+        CREATE INDEX idx_products_identity_sku
+          ON products(marketplace, sku);
+        -- Preserve every legacy product row. The deterministic oldest row keeps
+        -- its canonical SKU; later case-insensitive collisions become archival.
+        UPDATE products
+        SET sku = sku || '#legacy-' || id
+        WHERE sku IS NOT NULL AND rowid NOT IN (
+          SELECT MIN(rowid) FROM products
+          WHERE sku IS NOT NULL AND TRIM(sku) <> ''
+          GROUP BY marketplace, UPPER(TRIM(sku))
+        );
+        CREATE UNIQUE INDEX idx_products_marketplace_normalized_sku
+          ON products(marketplace, UPPER(TRIM(sku)))
+          WHERE sku IS NOT NULL AND TRIM(sku) <> '';
+        CREATE INDEX idx_products_variation_family
+          ON products(variation_family_id);
+
+        ALTER TABLE market_snapshots ADD COLUMN observation_date TEXT;
+        ALTER TABLE market_snapshots ADD COLUMN dedup_key TEXT;
+        ALTER TABLE product_snapshots ADD COLUMN observation_date TEXT;
+        ALTER TABLE product_snapshots ADD COLUMN dedup_key TEXT;
+
+        -- V7's immutable triggers protect business observations. This migration
+        -- only fills new identity columns before rebuilding the same rows below.
+        DROP TRIGGER IF EXISTS trg_market_snapshots_immutable;
+        DROP TRIGGER IF EXISTS trg_product_snapshots_immutable;
+
+        UPDATE market_snapshots
+        SET observation_date = date,
+            dedup_key = 'market|'
+              || COALESCE((SELECT marketplace FROM market_nodes WHERE market_nodes.id = market_snapshots.market_node_id), '')
+              || '|' || market_node_id || '|' || date || '|' || lower(trim(source_type))
+              || '|' || lower(trim(source)) || '|' || period
+              || CASE WHEN rowid = (
+                SELECT MIN(candidate.rowid) FROM market_snapshots candidate
+                WHERE candidate.market_node_id = market_snapshots.market_node_id
+                  AND candidate.date = market_snapshots.date
+                  AND lower(trim(candidate.source_type)) = lower(trim(market_snapshots.source_type))
+                  AND lower(trim(candidate.source)) = lower(trim(market_snapshots.source))
+                  AND candidate.period = market_snapshots.period
+              ) THEN '' ELSE '|archival|' || id END
+        WHERE observation_date IS NULL OR dedup_key IS NULL;
+        CREATE UNIQUE INDEX idx_market_snapshots_dedup_key
+          ON market_snapshots(dedup_key) WHERE dedup_key IS NOT NULL;
+        CREATE INDEX idx_market_snapshots_observation
+          ON market_snapshots(market_node_id, observation_date DESC);
+
+        UPDATE product_snapshots
+        SET observation_date = date,
+            dedup_key = 'product|'
+              || COALESCE((SELECT marketplace FROM products WHERE products.id = product_snapshots.product_id), '')
+              || '|' || product_id || '|' || date || '|' || lower(trim(source_type))
+              || '|' || lower(trim(source)) || '|' || period
+              || CASE WHEN rowid = (
+                SELECT MIN(candidate.rowid) FROM product_snapshots candidate
+                WHERE candidate.product_id = product_snapshots.product_id
+                  AND candidate.date = product_snapshots.date
+                  AND lower(trim(candidate.source_type)) = lower(trim(product_snapshots.source_type))
+                  AND lower(trim(candidate.source)) = lower(trim(product_snapshots.source))
+                  AND candidate.period = product_snapshots.period
+              ) THEN '' ELSE '|archival|' || id END
+        WHERE observation_date IS NULL OR dedup_key IS NULL;
+        CREATE UNIQUE INDEX idx_product_snapshots_dedup_key
+          ON product_snapshots(dedup_key) WHERE dedup_key IS NOT NULL;
+        CREATE INDEX idx_product_snapshots_observation
+          ON product_snapshots(product_id, observation_date DESC);
+
+        DROP INDEX IF EXISTS idx_market_snapshots_node_date;
+        DROP INDEX IF EXISTS idx_market_snapshots_dedup_key;
+        DROP INDEX IF EXISTS idx_market_snapshots_observation;
+        DROP INDEX IF EXISTS idx_product_snapshots_product_date;
+        DROP INDEX IF EXISTS idx_product_snapshots_dedup_key;
+        DROP INDEX IF EXISTS idx_product_snapshots_observation;
+        ALTER TABLE market_snapshots RENAME TO market_snapshots_v19;
+        ALTER TABLE product_snapshots RENAME TO product_snapshots_v19;
+
+        CREATE TABLE market_snapshots (
+          id TEXT PRIMARY KEY,
+          market_node_id TEXT NOT NULL REFERENCES market_nodes(id) ON DELETE CASCADE,
+          date TEXT NOT NULL,
+          product_count INTEGER,
+          seller_count INTEGER,
+          brand_count INTEGER,
+          monthly_sales REAL,
+          monthly_revenue REAL,
+          avg_price REAL,
+          median_price REAL,
+          avg_rating REAL,
+          median_reviews REAL,
+          top10_share REAL,
+          top20_share REAL,
+          new_product_share REAL,
+          price_bands_json TEXT,
+          concentration_json TEXT,
+          source TEXT NOT NULL,
+          source_type TEXT NOT NULL,
+          collected_at TEXT NOT NULL,
+          period TEXT NOT NULL,
+          is_estimated INTEGER NOT NULL,
+          confidence REAL NOT NULL,
+          observation_date TEXT NOT NULL,
+          dedup_key TEXT NOT NULL
+        );
+        INSERT INTO market_snapshots (
+          id, market_node_id, date, product_count, seller_count, brand_count, monthly_sales,
+          monthly_revenue, avg_price, median_price, avg_rating, median_reviews, top10_share,
+          top20_share, new_product_share, price_bands_json, concentration_json, source,
+          source_type, collected_at, period, is_estimated, confidence, observation_date, dedup_key
+        ) SELECT
+          id, market_node_id, date, product_count, seller_count, brand_count, monthly_sales,
+          monthly_revenue, avg_price, median_price, avg_rating, median_reviews, top10_share,
+          top20_share, new_product_share, price_bands_json, concentration_json, source,
+          source_type, collected_at, period, is_estimated, confidence, observation_date, dedup_key
+        FROM market_snapshots_v19;
+        DROP TABLE market_snapshots_v19;
+        CREATE INDEX idx_market_snapshots_node_date
+          ON market_snapshots(market_node_id, date DESC);
+        CREATE UNIQUE INDEX idx_market_snapshots_dedup_key
+          ON market_snapshots(dedup_key);
+        CREATE INDEX idx_market_snapshots_observation
+          ON market_snapshots(market_node_id, observation_date DESC);
+        CREATE TRIGGER trg_market_snapshots_immutable
+        BEFORE UPDATE ON market_snapshots
+        BEGIN
+          SELECT RAISE(ABORT, 'market_snapshots are immutable; append a new snapshot');
+        END;
+
+        CREATE TABLE product_snapshots (
+          id TEXT PRIMARY KEY,
+          product_id TEXT NOT NULL REFERENCES products(id) ON DELETE CASCADE,
+          date TEXT NOT NULL,
+          price REAL,
+          rating REAL,
+          review_count INTEGER,
+          bsr INTEGER,
+          estimated_sales REAL,
+          estimated_revenue REAL,
+          seller_count INTEGER,
+          growth_7d REAL,
+          growth_30d REAL,
+          growth_90d REAL,
+          source TEXT NOT NULL,
+          source_type TEXT NOT NULL,
+          collected_at TEXT NOT NULL,
+          period TEXT NOT NULL,
+          is_estimated INTEGER NOT NULL,
+          confidence REAL NOT NULL,
+          observation_date TEXT NOT NULL,
+          dedup_key TEXT NOT NULL
+        );
+        INSERT INTO product_snapshots (
+          id, product_id, date, price, rating, review_count, bsr, estimated_sales,
+          estimated_revenue, seller_count, growth_7d, growth_30d, growth_90d, source,
+          source_type, collected_at, period, is_estimated, confidence, observation_date, dedup_key
+        ) SELECT
+          id, product_id, date, price, rating, review_count, bsr, estimated_sales,
+          estimated_revenue, seller_count, growth_7d, growth_30d, growth_90d, source,
+          source_type, collected_at, period, is_estimated, confidence, observation_date, dedup_key
+        FROM product_snapshots_v19;
+        DROP TABLE product_snapshots_v19;
+        CREATE INDEX idx_product_snapshots_product_date
+          ON product_snapshots(product_id, date DESC);
+        CREATE UNIQUE INDEX idx_product_snapshots_dedup_key
+          ON product_snapshots(dedup_key);
+        CREATE INDEX idx_product_snapshots_observation
+          ON product_snapshots(product_id, observation_date DESC);
+        CREATE TRIGGER trg_product_snapshots_immutable
+        BEFORE UPDATE ON product_snapshots
+        BEGIN
+          SELECT RAISE(ABORT, 'product_snapshots are immutable; append a new snapshot');
+        END;
+
+        CREATE TABLE provider_capability_snapshots (
+          id TEXT PRIMARY KEY,
+          provider_id TEXT NOT NULL,
+          capabilities_json TEXT NOT NULL,
+          collected_at TEXT NOT NULL,
+          expires_at TEXT
+        );
+        CREATE INDEX idx_provider_capabilities_provider_collected
+          ON provider_capability_snapshots(provider_id, collected_at DESC);
+
+        CREATE TABLE mcp_call_logs (
+          id TEXT PRIMARY KEY,
+          provider_id TEXT NOT NULL,
+          capability TEXT NOT NULL,
+          actual_tool TEXT,
+          request_hash TEXT NOT NULL,
+          parameter_hash TEXT,
+          research_job_id TEXT,
+          entity_type TEXT,
+          entity_id TEXT,
+          status TEXT NOT NULL,
+          cache_hit INTEGER NOT NULL DEFAULT 0,
+          result_count INTEGER,
+          response_metadata_json TEXT NOT NULL DEFAULT '{}',
+          error_code TEXT,
+          started_at TEXT NOT NULL,
+          completed_at TEXT,
+          duration_ms INTEGER
+        );
+        CREATE INDEX idx_mcp_call_logs_provider_started
+          ON mcp_call_logs(provider_id, started_at DESC);
+
+        CREATE TABLE mcp_response_cache (
+          cache_key TEXT PRIMARY KEY,
+          provider_id TEXT NOT NULL,
+          response_json TEXT NOT NULL,
+          created_at TEXT NOT NULL,
+          expires_at TEXT NOT NULL
+        );
+        CREATE INDEX idx_mcp_response_cache_expiry ON mcp_response_cache(expires_at);
+
+        CREATE TABLE competitor_candidates (
+          id TEXT PRIMARY KEY,
+          marketplace TEXT NOT NULL,
+          asin TEXT NOT NULL,
+          source_product_id TEXT NOT NULL REFERENCES products(id) ON DELETE CASCADE,
+          source TEXT NOT NULL,
+          source_type TEXT NOT NULL,
+          payload_json TEXT NOT NULL DEFAULT '{}',
+          status TEXT NOT NULL CHECK (status IN ('pending_review', 'confirmed', 'rejected')),
+          created_at TEXT NOT NULL,
+          reviewed_at TEXT,
+          UNIQUE(marketplace, source_product_id, asin)
+        );
+        CREATE INDEX idx_competitor_candidates_review
+          ON competitor_candidates(marketplace, status, created_at DESC);
+
+        CREATE TABLE data_coverage_runs (
+          id TEXT PRIMARY KEY,
+          marketplace TEXT NOT NULL,
+          run_type TEXT NOT NULL,
+          coverage_json TEXT NOT NULL,
+          is_complete INTEGER NOT NULL,
+          created_at TEXT NOT NULL
+        );
+        CREATE INDEX idx_data_coverage_runs_market_created
+          ON data_coverage_runs(marketplace, created_at DESC);
+
+        -- Facts are independently persisted so a provider's missing metric is
+        -- represented as NULL rather than inventing a 0 for legacy snapshots.
+        CREATE TABLE metric_facts (
+          id TEXT PRIMARY KEY,
+          entity_type TEXT NOT NULL CHECK (entity_type IN ('product', 'market', 'competitor')),
+          entity_id TEXT NOT NULL,
+          marketplace TEXT NOT NULL,
+          metric_name TEXT NOT NULL,
+          numeric_value REAL,
+          source TEXT NOT NULL,
+          source_id TEXT,
+          source_type TEXT NOT NULL,
+          is_estimated INTEGER NOT NULL,
+          confidence REAL NOT NULL,
+          observation_date TEXT NOT NULL,
+          collected_at TEXT NOT NULL,
+          dedup_key TEXT
+        );
+        CREATE UNIQUE INDEX idx_metric_facts_dedup_key
+          ON metric_facts(dedup_key) WHERE dedup_key IS NOT NULL;
+        CREATE INDEX idx_metric_facts_authority
+          ON metric_facts(entity_type, entity_id, metric_name, observation_date DESC);
+
+        CREATE TABLE demo_seed_records (
+          seed_id TEXT NOT NULL,
+          table_name TEXT NOT NULL,
+          record_id TEXT NOT NULL,
+          created_at TEXT NOT NULL,
+          PRIMARY KEY (seed_id, table_name, record_id)
+        );
+        CREATE INDEX idx_demo_seed_records_table ON demo_seed_records(table_name, record_id);
+      `);
+    },
+  },
+  {
+    version: 21,
+    apply(database: DatabaseSync): void {
+      // V20 may already have been applied before the Demo registry existed.
+      database.exec(`
+        CREATE TABLE IF NOT EXISTS demo_seed_records (
+          seed_id TEXT NOT NULL,
+          table_name TEXT NOT NULL,
+          record_id TEXT NOT NULL,
+          created_at TEXT NOT NULL,
+          PRIMARY KEY (seed_id, table_name, record_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_demo_seed_records_table
+          ON demo_seed_records(table_name, record_id);
+      `);
+
+      const seedTime = '2026-09-09T10:20:00+08:00';
+      const source = '演示数据 / Mock Adapter';
+      const register = (
+        table: string, id: string, predicate: string, ...parameters: Array<string | number>
+      ): void => {
+        database.prepare(`
+          INSERT OR IGNORE INTO demo_seed_records (seed_id, table_name, record_id, created_at)
+          SELECT 'v2-demo-seed', ?, id, ? FROM ${table}
+          WHERE id = ? AND ${predicate}
+        `).run(table, seedTime, id, ...parameters);
+      };
+      const marketIds = [
+        'mkt-pillow', 'mkt-memory-foam', 'mkt-cervical', 'mkt-contour',
+        'mkt-ergonomic', 'mkt-neck-support', 'mkt-side-sleeper', 'mkt-back-sleeper',
+        'mkt-other-memory', 'mkt-lumbar', 'mkt-travel', 'mkt-seat-cushion',
+      ];
+      for (const id of marketIds) {
+        register('market_nodes', id, 'source_type = ? AND created_at = ?', 'mock', seedTime);
+      }
+      const products = [
+        ['owned-sku-01', 'B0DEMO0001'], ['owned-sku-02', 'B0DEMO0002'],
+        ['owned-sku-03', 'B0DEMO0003'], ['owned-sku-04', 'B0DEMO0004'],
+        ['competitor-01', 'B0DEMO1001'], ['competitor-02', 'B0DEMO1002'],
+        ['competitor-03', 'B0DEMO1003'], ['competitor-04', 'B0DEMO1004'],
+        ['competitor-05', 'B0DEMO1005'], ['competitor-06', 'B0DEMO1006'],
+        ['competitor-07', 'B0DEMO1007'], ['competitor-08', 'B0DEMO1008'],
+      ] as const;
+      for (const [id, asin] of products) {
+        register('products', id, 'asin = ? AND source_type = ? AND created_at = ?', asin, 'mock', seedTime);
+      }
+      const registerMarketSnapshot = (id: string, marketId: string, date: string): void => {
+        register(
+          'market_snapshots', id,
+          'market_node_id = ? AND date = ? AND source = ? AND source_type = ? AND collected_at = ?',
+          marketId, date, source, 'mock', `${date}T10:20:00+08:00`,
+        );
+      };
+      for (const date of [
+        '2026-04-12', '2026-05-12', '2026-06-11',
+        '2026-07-11', '2026-08-10', '2026-09-09',
+      ]) registerMarketSnapshot(`ms-mfm-${date}`, 'mkt-memory-foam', date);
+      for (const marketId of marketIds.filter((id) => id !== 'mkt-memory-foam')) {
+        registerMarketSnapshot(`ms-${marketId}-prev`, marketId, '2026-08-10');
+        registerMarketSnapshot(`ms-${marketId}-current`, marketId, '2026-09-09');
+      }
+      for (const [id] of products) {
+        const dates = id.startsWith('owned-sku-')
+          ? ['2026-06-11', '2026-07-11', '2026-08-10', '2026-09-09']
+          : ['2026-08-10', '2026-09-09'];
+        dates.forEach((date, index) => register(
+          'product_snapshots', `ps-${id}-${index + 1}`,
+          'product_id = ? AND date = ? AND source = ? AND source_type = ? AND collected_at = ?',
+          id, date, source, 'mock', `${date}T10:20:00+08:00`,
+        ));
+      }
+      const relations = [
+        ['owned-sku-01', 'competitor-03'], ['owned-sku-01', 'competitor-08'],
+        ['owned-sku-01', 'competitor-01'], ['owned-sku-02', 'competitor-07'],
+        ['owned-sku-02', 'competitor-01'], ['owned-sku-02', 'competitor-04'],
+        ['owned-sku-03', 'competitor-02'], ['owned-sku-03', 'competitor-06'],
+        ['owned-sku-03', 'competitor-05'], ['owned-sku-04', 'competitor-05'],
+        ['owned-sku-04', 'competitor-03'], ['owned-sku-04', 'competitor-08'],
+      ] as const;
+      relations.forEach(([owned, competitor], index) => register(
+        'competitor_relations', `relation-${index + 1}`,
+        'owned_product_id = ? AND competitor_product_id = ? AND created_at = ?',
+        owned, competitor, seedTime,
+      ));
+      for (const id of [
+        'insight-market-memory', 'insight-owned-sku-01', 'insight-owned-sku-02',
+        'insight-owned-sku-03', 'insight-owned-sku-04', 'insight-dev-lumbar',
+        'insight-dev-travel', 'insight-dev-seat',
+      ]) register(
+        'ai_insights', id, 'input_hash = ? AND data_version = ? AND generated_at = ?',
+        `seed-${id}`, 'demo-2026-09-09', seedTime,
+      );
+      for (const [id, insightId] of [
+        ['dev-lumbar', 'insight-dev-lumbar'],
+        ['dev-travel', 'insight-dev-travel'],
+        ['dev-seat', 'insight-dev-seat'],
+      ]) register('development_projects', id, 'insight_id = ? AND updated_at = ?', insightId, seedTime);
+      for (const id of ['opp-school-kit', 'opp-travel-desk', 'opp-cooling-lumbar']) {
+        register('opportunities', id, 'updated_at = ?', seedTime);
+      }
+      register('research_results', 'research-demo-school', 'generated_at = ?', seedTime);
+      for (const id of ['watch-market', 'watch-sku03', 'watch-comp04', 'watch-lumbar']) {
+        register('watchlist_items', id, 'created_at = ?', '2026-08-30T10:00:00+08:00');
+      }
+      for (const id of ['task-demo-1', 'task-demo-2', 'task-demo-3']) {
+        register('data_tasks', id, 'source_id = ? AND source = ?', 'source-mock', source);
+      }
+    },
+  },
+  {
+    version: 22,
+    sql: `
+      ALTER TABLE mcp_call_logs ADD COLUMN sync_run_id TEXT REFERENCES data_tasks(id);
+      ALTER TABLE market_snapshots ADD COLUMN sync_run_id TEXT REFERENCES data_tasks(id);
+      ALTER TABLE product_snapshots ADD COLUMN sync_run_id TEXT REFERENCES data_tasks(id);
+      ALTER TABLE metric_facts ADD COLUMN sync_run_id TEXT REFERENCES data_tasks(id);
+      ALTER TABLE data_tasks ADD COLUMN sync_run_id TEXT;
+      ALTER TABLE evidence_records ADD COLUMN sync_run_id TEXT REFERENCES data_tasks(id);
+
+      CREATE TABLE mcp_sync_observation_links (
+        sync_run_id TEXT NOT NULL REFERENCES data_tasks(id),
+        snapshot_kind TEXT NOT NULL CHECK (snapshot_kind IN ('market', 'product')),
+        snapshot_id TEXT NOT NULL,
+        entity_id TEXT NOT NULL,
+        disposition TEXT NOT NULL CHECK (disposition IN ('inserted', 'reused')),
+        PRIMARY KEY (sync_run_id, snapshot_kind, snapshot_id)
+      );
+      CREATE INDEX idx_mcp_sync_links_run_entity
+        ON mcp_sync_observation_links(sync_run_id, snapshot_kind, entity_id);
+      CREATE INDEX idx_mcp_call_logs_sync_run ON mcp_call_logs(sync_run_id, capability, entity_id);
+      CREATE INDEX idx_market_snapshots_sync_run ON market_snapshots(sync_run_id);
+      CREATE INDEX idx_product_snapshots_sync_run ON product_snapshots(sync_run_id);
+      CREATE INDEX idx_metric_facts_sync_run ON metric_facts(sync_run_id);
+      CREATE INDEX idx_evidence_records_sync_run ON evidence_records(sync_run_id);
+    `,
+  },
+  {
+    version: 23,
+    sql: `
+      DROP INDEX IF EXISTS idx_mcp_sync_links_run_entity;
+      ALTER TABLE mcp_sync_observation_links RENAME TO mcp_sync_observation_links_v22;
+      CREATE TABLE mcp_sync_observation_links (
+        sync_run_id TEXT NOT NULL REFERENCES data_tasks(id),
+        snapshot_kind TEXT NOT NULL CHECK (snapshot_kind IN ('market', 'product', 'fact')),
+        snapshot_id TEXT NOT NULL,
+        entity_id TEXT NOT NULL,
+        disposition TEXT NOT NULL CHECK (disposition IN ('inserted', 'reused')),
+        PRIMARY KEY (sync_run_id, snapshot_kind, snapshot_id)
+      );
+      INSERT INTO mcp_sync_observation_links (
+        sync_run_id, snapshot_kind, snapshot_id, entity_id, disposition
+      ) SELECT sync_run_id, snapshot_kind, snapshot_id, entity_id, disposition
+        FROM mcp_sync_observation_links_v22;
+      DROP TABLE mcp_sync_observation_links_v22;
+      CREATE INDEX idx_mcp_sync_links_run_entity
+        ON mcp_sync_observation_links(sync_run_id, snapshot_kind, entity_id);
+    `,
+  },
+  {
+    version: 24,
+    sql: `
+      ALTER TABLE competitor_candidates
+        ADD COLUMN sync_run_id TEXT REFERENCES data_tasks(id);
+      CREATE INDEX idx_competitor_candidates_sync_run
+        ON competitor_candidates(sync_run_id, source_product_id);
+
+      CREATE TABLE competitor_candidate_run_links (
+        sync_run_id TEXT NOT NULL REFERENCES data_tasks(id),
+        candidate_id TEXT NOT NULL REFERENCES competitor_candidates(id),
+        source_product_id TEXT NOT NULL REFERENCES products(id),
+        disposition TEXT NOT NULL CHECK (disposition IN ('inserted', 'reused')),
+        created_at TEXT NOT NULL,
+        PRIMARY KEY (sync_run_id, candidate_id)
+      );
+      CREATE INDEX idx_candidate_run_links_run_product
+        ON competitor_candidate_run_links(sync_run_id, source_product_id, disposition);
+      CREATE INDEX idx_candidate_run_links_candidate
+        ON competitor_candidate_run_links(candidate_id, created_at DESC);
+    `,
+  },
+  {
+    version: 25,
+    sql: `
+      ALTER TABLE provider_capability_snapshots
+        ADD COLUMN sync_run_id TEXT REFERENCES data_tasks(id);
+      CREATE INDEX idx_provider_capabilities_sync_run
+        ON provider_capability_snapshots(sync_run_id, collected_at DESC);
+      CREATE INDEX idx_data_tasks_sync_run
+        ON data_tasks(sync_run_id, task_type, status);
+    `,
+  },
+  {
+    version: 26,
+    apply(database: DatabaseSync) {
+      const table = database.prepare(`SELECT 1 AS found FROM sqlite_master
+        WHERE type = 'table' AND name = 'mcp_call_logs'`).get() as { found: number } | undefined;
+      if (!table) return;
+      const columns = database.prepare('PRAGMA table_info(mcp_call_logs)').all()
+        .map((column) => String(column.name));
+      if (!columns.includes('observation_month')) {
+        database.exec(`ALTER TABLE mcp_call_logs
+          ADD COLUMN observation_month TEXT CHECK (observation_month IS NULL
+            OR (observation_month GLOB '[0-9][0-9][0-9][0-9][0-9][0-9]'
+              AND substr(observation_month, 5, 2) BETWEEN '01' AND '12'))`);
+      }
+      if (columns.includes('sync_run_id')) {
+        database.exec(`CREATE INDEX IF NOT EXISTS idx_mcp_call_logs_run_market_month
+          ON mcp_call_logs(sync_run_id, capability, entity_id, observation_month)`);
+      }
+    },
+  },
+  {
+    version: 27,
+    apply(database: DatabaseSync) {
+      const table = database.prepare(`SELECT 1 AS found FROM sqlite_master
+        WHERE type = 'table' AND name = 'market_nodes'`).get() as { found: number } | undefined;
+      if (!table) return;
+      const columns = database.prepare('PRAGMA table_info(market_nodes)').all()
+        .map((column) => String(column.name));
+      if (!columns.includes('sellersprite_confirmed_node_path')) {
+        database.exec(`ALTER TABLE market_nodes
+          ADD COLUMN sellersprite_confirmed_node_path TEXT CHECK (
+            sellersprite_confirmed_node_path IS NULL OR (
+              sellersprite_confirmed_node_path <> ''
+              AND sellersprite_confirmed_node_path NOT GLOB '*[^0-9:]*'
+              AND substr(sellersprite_confirmed_node_path, 1, 1) <> ':'
+              AND substr(sellersprite_confirmed_node_path, -1, 1) <> ':'
+              AND instr(sellersprite_confirmed_node_path, '::') = 0
+            )
+          )`);
+      }
+      if (columns.includes('category_id') && columns.includes('source_type')) {
+        database.exec(`UPDATE market_nodes
+          SET sellersprite_confirmed_node_path = category_id
+          WHERE source_type = 'mcp'
+            AND sellersprite_confirmed_node_path IS NULL
+            AND category_id IS NOT NULL
+            AND category_id <> ''
+            AND category_id NOT GLOB '*[^0-9:]*'
+            AND substr(category_id, 1, 1) <> ':'
+            AND substr(category_id, -1, 1) <> ':'
+            AND instr(category_id, '::') = 0`);
+      }
+    },
+  },
+  {
+    version: 28,
+    apply(database: DatabaseSync) {
+      const tables = new Set((database.prepare(`
+        SELECT name FROM sqlite_master WHERE type = 'table'
+          AND name IN ('products', 'variation_families')
+      `).all() as Array<{ name: string }>).map((row) => row.name));
+      if (!tables.has('products') || !tables.has('variation_families')) return;
+
+      const familyColumns = database.prepare('PRAGMA table_info(variation_families)').all()
+        .map((column) => String(column.name));
+      if (!familyColumns.includes('family_key')) {
+        const invalidFamily = database.prepare(`
+          SELECT id, parent_asin AS parentAsin FROM variation_families
+          WHERE LENGTH(TRIM(parent_asin)) <> 10
+            OR UPPER(TRIM(parent_asin)) GLOB '*[^A-Z0-9]*'
+          LIMIT 1
+        `).get() as { id: string; parentAsin: string } | undefined;
+        if (invalidFamily) {
+          throw new Error(`V28 requires a verified parent ASIN for legacy family ${invalidFamily.id}; review its placeholder/invalid value before migration.`);
+        }
+        const duplicateParent = database.prepare(`
+          SELECT marketplace, UPPER(TRIM(parent_asin)) AS parentAsin,
+            COUNT(*) AS count FROM variation_families
+          GROUP BY marketplace, UPPER(TRIM(parent_asin)) HAVING COUNT(*) > 1 LIMIT 1
+        `).get() as { marketplace: string; parentAsin: string; count: number } | undefined;
+        if (duplicateParent) {
+          throw new Error(`V28 found duplicate normalized parent ASIN ${duplicateParent.parentAsin} in ${duplicateParent.marketplace}; review legacy families before migration.`);
+        }
+        assertVariationFamilyIntegrity(database, 28);
+        const invalidProductParent = database.prepare(`
+          SELECT id FROM products WHERE parent_asin IS NOT NULL
+            AND TRIM(parent_asin) <> ''
+            AND (LENGTH(TRIM(parent_asin)) <> 10
+              OR UPPER(TRIM(parent_asin)) GLOB '*[^A-Z0-9]*')
+          LIMIT 1
+        `).get() as { id: string } | undefined;
+        if (invalidProductParent) {
+          throw new Error(`V28 found invalid parent ASIN for product ${invalidProductParent.id}; review legacy identity before migration.`);
+        }
+        database.exec(`
+          DROP INDEX IF EXISTS idx_variation_families_market_parent;
+          ALTER TABLE variation_families RENAME TO variation_families_v27;
+          CREATE TABLE variation_families (
+            id TEXT PRIMARY KEY,
+            marketplace TEXT NOT NULL,
+            parent_asin TEXT,
+            family_key TEXT NOT NULL CHECK (TRIM(family_key) <> ''),
+            variation_theme TEXT,
+            attributes_json TEXT NOT NULL DEFAULT '{}',
+            status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'inactive')),
+            identity_status TEXT NOT NULL CHECK (identity_status IN ('pending', 'verified')),
+            source_type TEXT NOT NULL CHECK (TRIM(source_type) <> ''),
+            verified_at TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            CHECK (
+              (identity_status = 'pending' AND parent_asin IS NULL AND verified_at IS NULL)
+              OR
+              (identity_status = 'verified' AND parent_asin IS NOT NULL
+                AND TRIM(parent_asin) <> '' AND verified_at IS NOT NULL)
+            )
+          );
+          INSERT INTO variation_families (
+            id, marketplace, parent_asin, family_key, variation_theme,
+            attributes_json, status, identity_status, source_type, verified_at,
+            created_at, updated_at
+          )
+          SELECT legacy.id, legacy.marketplace, UPPER(TRIM(legacy.parent_asin)),
+            UPPER(TRIM(legacy.parent_asin)),
+            legacy.variation_theme, legacy.attributes_json, legacy.status,
+            'verified', 'import', legacy.updated_at,
+            legacy.created_at, legacy.updated_at
+          FROM variation_families_v27 legacy;
+          DROP TABLE variation_families_v27;
+          CREATE UNIQUE INDEX idx_variation_families_market_family_key
+            ON variation_families(marketplace, UPPER(TRIM(family_key)));
+          CREATE UNIQUE INDEX idx_variation_families_market_parent
+            ON variation_families(marketplace, UPPER(TRIM(parent_asin)))
+            WHERE parent_asin IS NOT NULL AND TRIM(parent_asin) <> '';
+        `);
+      }
+
+      const productColumns = database.prepare('PRAGMA table_info(products)').all()
+        .map((column) => String(column.name));
+      if (!productColumns.includes('parent_lookup_status')) {
+        database.exec(`
+          ALTER TABLE products ADD COLUMN parent_lookup_status TEXT NOT NULL DEFAULT 'unknown'
+            CHECK (parent_lookup_status IN ('unknown', 'pending', 'verified', 'standalone'));
+          UPDATE products SET parent_asin = UPPER(TRIM(parent_asin))
+            WHERE parent_asin IS NOT NULL AND TRIM(parent_asin) <> '';
+          UPDATE products SET parent_lookup_status = CASE
+            WHEN parent_asin IS NOT NULL AND TRIM(parent_asin) <> '' THEN 'verified'
+            WHEN variation_family_id IS NOT NULL THEN 'pending'
+            ELSE 'unknown'
+          END;
+        `);
+      }
+
+      database.exec(`
+        CREATE TABLE IF NOT EXISTS product_identity_events (
+          id TEXT PRIMARY KEY,
+          product_id TEXT NOT NULL REFERENCES products(id),
+          old_family_id TEXT REFERENCES variation_families(id),
+          new_family_id TEXT REFERENCES variation_families(id),
+          old_parent_asin TEXT,
+          new_parent_asin TEXT,
+          old_lookup_status TEXT CHECK (old_lookup_status IS NULL OR old_lookup_status IN (
+            'unknown', 'pending', 'verified', 'standalone'
+          )),
+          new_lookup_status TEXT NOT NULL CHECK (new_lookup_status IN (
+            'unknown', 'pending', 'verified', 'standalone'
+          )),
+          source_type TEXT NOT NULL CHECK (TRIM(source_type) <> ''),
+          sync_run_id TEXT REFERENCES data_tasks(id),
+          import_batch_id TEXT REFERENCES import_batches(id),
+          created_at TEXT NOT NULL,
+          CHECK (
+            old_family_id IS NOT new_family_id
+            OR old_parent_asin IS NOT new_parent_asin
+            OR old_lookup_status IS NOT new_lookup_status
+          )
+        );
+        CREATE INDEX IF NOT EXISTS idx_product_identity_events_product
+          ON product_identity_events(product_id, created_at, id);
+        CREATE INDEX IF NOT EXISTS idx_product_identity_events_family
+          ON product_identity_events(new_family_id, created_at, id);
+        CREATE TRIGGER IF NOT EXISTS trg_product_identity_events_immutable_update
+        BEFORE UPDATE ON product_identity_events
+        BEGIN
+          SELECT RAISE(ABORT, 'product_identity_events are immutable; append a new event');
+        END;
+        CREATE TRIGGER IF NOT EXISTS trg_product_identity_events_immutable_delete
+        BEFORE DELETE ON product_identity_events
+        BEGIN
+          SELECT RAISE(ABORT, 'product_identity_events are immutable; append a new event');
+        END;
+      `);
+    },
+  },
+  {
+    version: 29,
+    apply(database: DatabaseSync) {
+      const tables = new Set((database.prepare(`
+        SELECT name FROM sqlite_master WHERE type = 'table'
+          AND name IN ('products', 'variation_families')
+      `).all() as Array<{ name: string }>).map((row) => row.name));
+      if (!tables.has('products') || !tables.has('variation_families')) return;
+      assertVariationFamilyIntegrity(database, 29);
+      database.exec(`
+        CREATE TRIGGER trg_products_variation_family_insert
+        BEFORE INSERT ON products
+        WHEN NEW.variation_family_id IS NOT NULL AND NOT EXISTS (
+          SELECT 1 FROM variation_families family
+          WHERE family.id = NEW.variation_family_id AND family.marketplace = NEW.marketplace
+        )
+        BEGIN
+          SELECT RAISE(ABORT, 'variation family must exist in product marketplace');
+        END;
+
+        CREATE TRIGGER trg_products_variation_family_update
+        BEFORE UPDATE OF variation_family_id, marketplace ON products
+        WHEN NEW.variation_family_id IS NOT NULL AND NOT EXISTS (
+          SELECT 1 FROM variation_families family
+          WHERE family.id = NEW.variation_family_id AND family.marketplace = NEW.marketplace
+        )
+        BEGIN
+          SELECT RAISE(ABORT, 'variation family must exist in product marketplace');
+        END;
+
+        CREATE TRIGGER trg_variation_families_marketplace_update
+        BEFORE UPDATE OF id, marketplace ON variation_families
+        WHEN EXISTS (
+          SELECT 1 FROM products product
+          WHERE product.variation_family_id = OLD.id
+            AND (NEW.id <> OLD.id OR product.marketplace <> NEW.marketplace)
+        )
+        BEGIN
+          SELECT RAISE(ABORT, 'variation family must remain in product marketplace');
+        END;
+
+        CREATE TRIGGER trg_variation_families_referenced_delete
+        BEFORE DELETE ON variation_families
+        WHEN EXISTS (
+          SELECT 1 FROM products product WHERE product.variation_family_id = OLD.id
+        )
+        BEGIN
+          SELECT RAISE(ABORT, 'variation family is still referenced by products');
+        END;
+      `);
+    },
+  },
+  {
+    version: 30,
+    sql: `
+      CREATE TABLE owned_roster_declarations (
+        marketplace TEXT PRIMARY KEY,
+        declared_count INTEGER NOT NULL CHECK (declared_count > 0),
+        declared_digest TEXT NOT NULL CHECK (LENGTH(declared_digest) = 64),
+        expected_count INTEGER CHECK (expected_count IS NULL OR expected_count >= 0),
+        expected_digest TEXT CHECK (expected_digest IS NULL OR LENGTH(expected_digest) = 64),
+        preview_digest TEXT NOT NULL CHECK (LENGTH(preview_digest) = 64),
+        status TEXT NOT NULL CHECK (status IN ('pending_validation', 'confirmed')),
+        import_batch_id TEXT REFERENCES import_batches(id),
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        CHECK ((status = 'pending_validation' AND expected_count IS NULL
+          AND expected_digest IS NULL AND import_batch_id IS NULL)
+          OR (status = 'confirmed' AND expected_count IS NOT NULL
+            AND expected_digest IS NOT NULL AND import_batch_id IS NOT NULL))
+      );
+    `,
+  },
+  {
+    version: 31,
+    sql: `
+      CREATE TABLE owned_roster_declaration_events (
+        id TEXT PRIMARY KEY,
+        marketplace TEXT NOT NULL,
+        event_type TEXT NOT NULL CHECK (
+          event_type IN ('declared', 'refreshed', 'superseded', 'confirmed')
+        ),
+        declared_count INTEGER NOT NULL CHECK (declared_count > 0),
+        declared_digest TEXT NOT NULL CHECK (LENGTH(declared_digest) = 64),
+        preview_digest TEXT NOT NULL CHECK (LENGTH(preview_digest) = 64),
+        previous_preview_digest TEXT CHECK (
+          previous_preview_digest IS NULL OR LENGTH(previous_preview_digest) = 64
+        ),
+        import_batch_id TEXT REFERENCES import_batches(id),
+        created_at TEXT NOT NULL
+      );
+      CREATE INDEX idx_owned_roster_events_marketplace
+        ON owned_roster_declaration_events(marketplace, created_at, id);
+      CREATE TRIGGER trg_owned_roster_events_immutable_update
+      BEFORE UPDATE ON owned_roster_declaration_events
+      BEGIN
+        SELECT RAISE(ABORT, 'owned roster declaration events are immutable');
+      END;
+      CREATE TRIGGER trg_owned_roster_events_immutable_delete
+      BEFORE DELETE ON owned_roster_declaration_events
+      BEGIN
+        SELECT RAISE(ABORT, 'owned roster declaration events are immutable');
+      END;
+    `,
+  },
 ];
+
+migrations.push({
+  version: 32,
+  sql: `
+    CREATE TABLE provider_quota_state (
+      provider_id TEXT PRIMARY KEY, baseline_remaining INTEGER NOT NULL CHECK(baseline_remaining >= 0),
+      baseline_at TEXT NOT NULL, estimated_remote_calls_since_baseline INTEGER NOT NULL DEFAULT 0,
+      reserved_calls INTEGER NOT NULL DEFAULT 100, period_end TEXT,
+      updated_at TEXT NOT NULL, policy_json TEXT NOT NULL DEFAULT '{}',
+      failure_code TEXT, failure_count INTEGER NOT NULL DEFAULT 0, open_until TEXT,
+      half_open_until TEXT
+    );
+    INSERT INTO provider_quota_state(provider_id, baseline_remaining, baseline_at, updated_at)
+      VALUES ('sellersprite', 500, strftime('%Y-%m-%dT%H:%M:%fZ','now'), strftime('%Y-%m-%dT%H:%M:%fZ','now'));
+    CREATE TABLE mcp_usage_events (
+      id TEXT PRIMARY KEY, request_key TEXT NOT NULL, outcome TEXT NOT NULL,
+      sync_mode TEXT NOT NULL, run_id TEXT, created_at TEXT NOT NULL
+    );
+    CREATE INDEX idx_mcp_usage_time ON mcp_usage_events(created_at);
+    CREATE TABLE mcp_local_observations (
+      request_key TEXT PRIMARY KEY, payload_json TEXT NOT NULL, collected_at TEXT NOT NULL,
+      expires_at TEXT NOT NULL, historical_stable INTEGER NOT NULL DEFAULT 0,
+      backfill_complete INTEGER NOT NULL DEFAULT 0, schema_hash TEXT NOT NULL,
+      capability TEXT, scope_key TEXT
+    );
+    CREATE TABLE mcp_call_plans (
+      id TEXT PRIMARY KEY, input_json TEXT NOT NULL, plan_json TEXT NOT NULL,
+      created_at TEXT NOT NULL, consumed_at TEXT
+    );
+    CREATE TABLE mcp_schema_pauses (capability TEXT PRIMARY KEY, schema_hash TEXT NOT NULL, created_at TEXT NOT NULL);
+    CREATE TABLE mcp_discovery_state (scope_key TEXT PRIMARY KEY, collected_at TEXT NOT NULL);
+    CREATE TABLE mcp_request_leases (request_key TEXT PRIMARY KEY, owner TEXT NOT NULL, expires_at INTEGER NOT NULL);
+  `,
+});
+
+migrations.push({ version: 33, sql: `
+  CREATE TABLE mcp_market_reuse_lineage (
+    sync_run_id TEXT NOT NULL REFERENCES data_tasks(id),
+    snapshot_id TEXT NOT NULL REFERENCES market_snapshots(id),
+    lineage_json TEXT NOT NULL CHECK(json_valid(lineage_json)),
+    created_at TEXT NOT NULL,
+    PRIMARY KEY(sync_run_id,snapshot_id)
+  );
+  CREATE TRIGGER immutable_market_reuse_update BEFORE UPDATE ON mcp_market_reuse_lineage
+    BEGIN SELECT RAISE(ABORT, 'Reuse lineage is immutable'); END;
+  CREATE TRIGGER immutable_market_reuse_delete BEFORE DELETE ON mcp_market_reuse_lineage
+    BEGIN SELECT RAISE(ABORT, 'Reuse lineage is immutable'); END;
+` });
+
+migrations.push({version:34,apply(database:DatabaseSync) { database.exec(`
+  CREATE TABLE owned_roster_manual_confirmations (
+    id TEXT PRIMARY KEY, marketplace TEXT NOT NULL, roster_digest TEXT NOT NULL,
+    product_count INTEGER NOT NULL, evidence_json TEXT NOT NULL CHECK(json_valid(evidence_json)),
+    confirmed_at TEXT NOT NULL
+  );
+  CREATE TRIGGER manual_roster_no_update BEFORE UPDATE ON owned_roster_manual_confirmations
+    BEGIN SELECT RAISE(ABORT,'Manual roster evidence is immutable'); END;
+  CREATE TRIGGER manual_roster_no_delete BEFORE DELETE ON owned_roster_manual_confirmations
+    BEGIN SELECT RAISE(ABORT,'Manual roster evidence is immutable'); END;
+  CREATE TABLE product_provider_enrichment (
+    product_id TEXT PRIMARY KEY REFERENCES products(id),
+    status TEXT NOT NULL CHECK(status IN ('pending','unavailable','available')),
+    provider_status TEXT, remote_enabled INTEGER NOT NULL CHECK(remote_enabled IN (0,1)),
+    node_id_path TEXT, title TEXT, evidence_json TEXT NOT NULL CHECK(json_valid(evidence_json)),
+    updated_at TEXT NOT NULL
+  );
+  CREATE TABLE owned_roster_declarations_v34 (
+    marketplace TEXT PRIMARY KEY, declared_count INTEGER NOT NULL CHECK(declared_count>0),
+    declared_digest TEXT NOT NULL CHECK(length(declared_digest)=64),
+    expected_count INTEGER,expected_digest TEXT,preview_digest TEXT NOT NULL CHECK(length(preview_digest)=64),
+    status TEXT NOT NULL CHECK(status IN ('pending_validation','confirmed')),
+    import_batch_id TEXT REFERENCES import_batches(id),created_at TEXT NOT NULL,updated_at TEXT NOT NULL,
+    manual_confirmation_id TEXT REFERENCES owned_roster_manual_confirmations(id),
+    CHECK((status='pending_validation' AND expected_count IS NULL AND expected_digest IS NULL
+      AND import_batch_id IS NULL AND manual_confirmation_id IS NULL)
+      OR (status='confirmed' AND expected_count IS NOT NULL AND expected_digest IS NOT NULL
+        AND expected_count>=0 AND length(expected_digest)=64
+        AND (import_batch_id IS NOT NULL OR manual_confirmation_id IS NOT NULL)))
+  );
+  `);
+  if (Number(database.prepare('SELECT COUNT(*) n FROM owned_roster_declarations').get()!.n)>0) {
+    database.exec('INSERT INTO owned_roster_declarations_v34 SELECT *,NULL FROM owned_roster_declarations');
+  }
+  database.exec(`
+  DROP TABLE owned_roster_declarations;
+  ALTER TABLE owned_roster_declarations_v34 RENAME TO owned_roster_declarations;
+`); }});
+
+migrations.push({ version: 35, apply(database: DatabaseSync) {
+  // Narrow legacy fixtures may not include the optional discovery subsystem.
+  if (!database.prepare("SELECT 1 FROM sqlite_master WHERE name='competitor_candidates'").get()) return;
+  if (!database.prepare('PRAGMA table_info(competitor_candidates)').all().some(row => row.name==='sync_run_id')) return;
+  database.exec(`
+  ALTER TABLE competitor_candidates ADD COLUMN first_seen_at TEXT;
+  ALTER TABLE competitor_candidates ADD COLUMN last_seen_at TEXT;
+  UPDATE competitor_candidates SET first_seen_at=created_at,last_seen_at=created_at;
+  CREATE TABLE competitor_candidate_observations (
+    id TEXT PRIMARY KEY,
+    candidate_id TEXT NOT NULL REFERENCES competitor_candidates(id),
+    sync_run_id TEXT REFERENCES data_tasks(id), collected_at TEXT NOT NULL,
+    price REAL, estimated_sales REAL, revenue REAL, rating REAL, review_count REAL, bsr REAL,
+    title TEXT, brand TEXT, normalized_payload_json TEXT NOT NULL CHECK(json_valid(normalized_payload_json)),
+    provenance_json TEXT NOT NULL CHECK(json_valid(provenance_json)), schema_hash TEXT,
+    identity_review_required INTEGER NOT NULL DEFAULT 0 CHECK(identity_review_required IN (0,1)),
+    legacy INTEGER NOT NULL DEFAULT 0 CHECK(legacy IN (0,1))
+  );
+  INSERT INTO competitor_candidate_observations
+    (id,candidate_id,sync_run_id,collected_at,price,estimated_sales,revenue,rating,review_count,
+     title,brand,normalized_payload_json,provenance_json,legacy)
+    SELECT 'legacy:'||id,id,sync_run_id,created_at,json_extract(payload_json,'$.price'),
+      json_extract(payload_json,'$.units'),json_extract(payload_json,'$.revenue'),
+      json_extract(payload_json,'$.rating'),json_extract(payload_json,'$.ratings'),
+      json_extract(payload_json,'$.title'),json_extract(payload_json,'$.brand'),payload_json,
+      json_object('source',source,'sourceType',source_type,'legacy',1),1
+    FROM competitor_candidates;
+  CREATE INDEX candidate_observation_latest ON competitor_candidate_observations(candidate_id,collected_at DESC);
+  CREATE TRIGGER candidate_observation_no_update BEFORE UPDATE ON competitor_candidate_observations
+    BEGIN SELECT RAISE(ABORT,'Candidate observations are immutable'); END;
+  CREATE TRIGGER candidate_observation_no_delete BEFORE DELETE ON competitor_candidate_observations
+    BEGIN SELECT RAISE(ABORT,'Candidate observations are immutable'); END;
+  ALTER TABLE competitor_candidate_run_links ADD COLUMN observation_id TEXT REFERENCES competitor_candidate_observations(id);
+  CREATE TRIGGER failed_mcp_run_terminal BEFORE UPDATE OF status ON data_tasks
+    WHEN OLD.status='failed' AND OLD.source='SellerSprite MCP' AND NEW.status<>'failed'
+    BEGIN SELECT RAISE(ABORT,'Failed MCP runs are terminal'); END;
+  CREATE TRIGGER failed_mcp_coverage_terminal BEFORE UPDATE OF is_complete ON data_coverage_runs
+    WHEN NEW.is_complete=1 AND EXISTS(SELECT 1 FROM data_tasks WHERE id=NEW.id AND status='failed')
+    BEGIN SELECT RAISE(ABORT,'Failed runs cannot satisfy coverage'); END;
+`); } });
 
 export function migrate(database: DatabaseSync): void {
   database.exec(`
@@ -1407,7 +2363,9 @@ export function migrate(database: DatabaseSync): void {
     if (applied.has(migration.version)) continue;
     database.exec('BEGIN IMMEDIATE');
     try {
-      database.exec(migration.sql);
+      if ('apply' in migration && typeof migration.apply === 'function') migration.apply(database);
+      else if (typeof migration.sql === 'string') database.exec(migration.sql);
+      else throw new Error(`Migration ${migration.version} has no apply function or SQL.`);
       database.prepare('INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)')
         .run(migration.version, new Date().toISOString());
       database.exec('COMMIT');

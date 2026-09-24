@@ -5,6 +5,7 @@ import type {
   TaskStatus,
 } from '../../shared/types.js';
 import type { AppDatabase } from '../database/database.js';
+import { isLiveObservationReadable } from './live-observation-readability.js';
 
 interface SnapshotClock {
   entityId: string;
@@ -44,13 +45,13 @@ export class DashboardFreshnessService {
 
   getStatus(input: DashboardFreshnessInput): DashboardFreshnessResult {
     const marketClock = input.marketId
-      ? this.latestMarketSnapshot(input.marketId, input.marketplace)
+      ? this.latestMarketSnapshot(input.marketId, input.marketplace, input.mode)
       : null;
     const ownedClocks = input.ownedProductIds.map((id) => (
-      this.latestProductSnapshot(id, input.marketplace) ?? missingClock(id)
+      this.latestProductSnapshot(id, input.marketplace, input.mode) ?? missingClock(id)
     ));
     const competitorClocks = input.competitorProductIds.map((id) => (
-      this.latestProductSnapshot(id, input.marketplace) ?? missingClock(id)
+      this.latestProductSnapshot(id, input.marketplace, input.mode) ?? missingClock(id)
     ));
     const requiredClocks = [
       ...(input.marketId ? [marketClock ?? missingClock(input.marketId)] : []),
@@ -129,10 +130,10 @@ export class DashboardFreshnessService {
     };
   }
 
-  private latestMarketSnapshot(marketId: string, marketplace: string): SnapshotClock | null {
-    const row = this.database.prepare(`
-      SELECT snapshot.market_node_id AS entity_id, snapshot.date AS observation_date,
-        snapshot.collected_at
+  private latestMarketSnapshot(marketId: string, marketplace: string, mode: DataMode): SnapshotClock | null {
+    const rows = this.database.prepare(`
+      SELECT snapshot.id, snapshot.market_node_id AS entity_id, snapshot.date AS observation_date,
+        snapshot.collected_at, snapshot.source_type, snapshot.sync_run_id
       FROM market_snapshots snapshot
       JOIN market_nodes market ON market.id = snapshot.market_node_id
       WHERE snapshot.market_node_id = ? AND market.marketplace = ?
@@ -140,12 +141,17 @@ export class DashboardFreshnessService {
         AND date(snapshot.date) IS NOT NULL
         AND julianday(snapshot.collected_at) IS NOT NULL
       ORDER BY julianday(snapshot.collected_at) DESC, date(snapshot.date) DESC, snapshot.rowid DESC
-      LIMIT 1
-    `).get(marketId, marketplace) as {
+    `).all(marketId, marketplace) as Array<{
+      id: string;
       entity_id: string;
       observation_date: string;
       collected_at: string;
-    } | undefined;
+      source_type: string;
+      sync_run_id: string | null;
+    }>;
+    const row = rows.find((candidate) => mode !== 'live' || isLiveObservationReadable(
+      this.database, 'market', candidate.id, candidate.source_type, candidate.sync_run_id,
+    ));
     return row ? {
       entityId: row.entity_id,
       observationDate: row.observation_date,
@@ -153,10 +159,10 @@ export class DashboardFreshnessService {
     } : null;
   }
 
-  private latestProductSnapshot(productId: string, marketplace: string): SnapshotClock | null {
-    const row = this.database.prepare(`
-      SELECT snapshot.product_id AS entity_id, snapshot.date AS observation_date,
-        snapshot.collected_at
+  private latestProductSnapshot(productId: string, marketplace: string, mode: DataMode): SnapshotClock | null {
+    const rows = this.database.prepare(`
+      SELECT snapshot.id, snapshot.product_id AS entity_id, snapshot.date AS observation_date,
+        snapshot.collected_at, snapshot.source_type, snapshot.sync_run_id
       FROM product_snapshots snapshot
       JOIN products product ON product.id = snapshot.product_id
       WHERE snapshot.product_id = ? AND product.marketplace = ?
@@ -164,12 +170,17 @@ export class DashboardFreshnessService {
         AND date(snapshot.date) IS NOT NULL
         AND julianday(snapshot.collected_at) IS NOT NULL
       ORDER BY julianday(snapshot.collected_at) DESC, date(snapshot.date) DESC, snapshot.rowid DESC
-      LIMIT 1
-    `).get(productId, marketplace) as {
+    `).all(productId, marketplace) as Array<{
+      id: string;
       entity_id: string;
       observation_date: string;
       collected_at: string;
-    } | undefined;
+      source_type: string;
+      sync_run_id: string | null;
+    }>;
+    const row = rows.find((candidate) => mode !== 'live' || isLiveObservationReadable(
+      this.database, 'product', candidate.id, candidate.source_type, candidate.sync_run_id,
+    ));
     return row ? {
       entityId: row.entity_id,
       observationDate: row.observation_date,
@@ -231,6 +242,9 @@ function affectedEntityIds(
     ...input.ownedProductIds,
     ...input.competitorProductIds,
   ];
+  if (taskType === 'critical_sync') {
+    return input.marketId === target ? [target, ...input.ownedProductIds] : [];
+  }
   if (taskType === 'dashboard_core_refresh') return allDependencies;
   if (taskType === 'manual_refresh') {
     if (target === 'all') return allDependencies;

@@ -1,20 +1,61 @@
-import { readFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import request from 'supertest';
 import type { AppSettings, DashboardData, MarketDetail, OwnedProductSummary } from '../shared/types.js';
+import type { SellerSpriteConnectionDiagnostics } from './adapters/sellersprite-mcp-adapter.js';
+import { sellerSpriteSchemaHash } from './adapters/sellersprite-tool-registry.js';
 import { createApp } from './app.js';
 import { openDatabase, type AppDatabase } from './database/database.js';
+import { previewAndConfirmCsv } from './test-utils/import-api.js';
+import { addVerifiedMcpCoverage } from './test-utils/verified-mcp-coverage.js';
+import type { SellerSpriteSyncPort } from './services/sellersprite-sync-service.js';
 
 let database: AppDatabase | undefined;
+let temporaryDirectory: string | undefined;
 
 afterEach(() => {
   database?.close();
   database = undefined;
+  if (temporaryDirectory) rmSync(temporaryDirectory, { recursive: true, force: true });
+  temporaryDirectory = undefined;
 });
 
 function testApp() {
   database = openDatabase(':memory:');
   return createApp({ database });
+}
+
+function liveSyncPort(): SellerSpriteSyncPort {
+  const provenance = {
+    source: 'SellerSprite MCP', sourceType: 'mcp' as const,
+    collectedAt: '2026-09-19T03:00:00.000Z', period: '1M',
+    isEstimated: true, confidence: 0.85,
+  };
+  return {
+    async fetchMarketResearchSummary(input) {
+      return { data: { marketplace: input.marketplace, nodeIdPath: input.nodeIdPath,
+        totalProducts: 1, totalUnits: 10, totalRevenue: 390,
+        top10ProductCrn: 100, top20ProductCrn: 100 }, provenance };
+    },
+    async fetchMarketStatistics(input) {
+      return { data: { marketplace: input.marketplace, nodeIdPath: input.nodeIdPath,
+        products: 1, brands: 1, sellers: 1, avgPrice: 39, avgRating: 4.5 }, provenance };
+    },
+    async fetchMarketConcentration() {
+      return { data: [{ asin: 'B0PUBLIC01', price: 39, ratings: 12, totalUnits: 10,
+        totalRevenue: 390, totalUnitsRatio: 1 }], provenance };
+    },
+    async fetchAsinSalesTrend(input) {
+      return { data: { asin: { asin: input.asin, ratings: 10 }, salesTrendPoints: [
+        { month: '2026-08', price: 39, childUnitSales: 10, childSalesRevenue: 390 },
+      ] }, provenance };
+    },
+    async discoverAsinCompetitors() {
+      return { data: [{ asin: 'B0PUBLIC02', title: 'Candidate', brand: 'Other' }], provenance };
+    },
+  };
 }
 
 function productResearchFixture(): Record<string, unknown> {
@@ -37,6 +78,480 @@ function completeProductValues(
 ): string {
   return [price, 4.4, 120, 8000, sales, 1, 1.2, growth30d, 9.4, 0.8, true, date].join(',');
 }
+
+describe('V2.2 real-data administration routes', () => {
+  it('guards Go Live cleanup with dry-run, backup, exact confirmation, and coverage verification', async () => {
+    database = openDatabase(':memory:');
+    temporaryDirectory = mkdtempSync(join(tmpdir(), 'ys-go-live-api-'));
+    const app = createApp({ database, backupDirectory: temporaryDirectory });
+    await request(app).post('/api/settings/demo').send({ enabled: true }).expect(200);
+
+    const preview = await request(app).get('/api/go-live/preview').expect(200);
+    expect(preview.body.data.delete).toMatchObject({
+      marketSnapshots: expect.any(Number),
+      productSnapshots: expect.any(Number),
+    });
+    await request(app).post('/api/go-live/cleanup')
+      .send({ confirmation: 'wrong' }).expect(409);
+    const backup = await request(app).post('/api/go-live/backup').send({}).expect(201);
+    expect(backup.body.data).toMatchObject({ created: true, filename: expect.stringMatching(/\.db$/) });
+    await request(app).post('/api/go-live/cleanup')
+      .send({ confirmation: 'CLEAR DEMO DATA' }).expect(409);
+    expect((await request(app).get('/api/go-live/verify').expect(200)).body.data)
+      .toMatchObject({ readyForDemoCleanup: false, hasMinimumRealCoverage: false });
+    addVerifiedMcpCoverage(database);
+    expect((await request(app).get('/api/go-live/verify').expect(200)).body.data)
+      .toMatchObject({ readyForDemoCleanup: true, hasMinimumRealCoverage: false });
+    await request(app).post('/api/go-live/cleanup')
+      .send({ confirmation: 'CLEAR DEMO DATA' }).expect(409);
+    const freshBackup = await request(app).post('/api/go-live/backup').send({}).expect(201);
+    expect(freshBackup.body.data.filename).not.toBe(backup.body.data.filename);
+    await request(app).post('/api/go-live/cleanup')
+      .send({ confirmation: 'CLEAR DEMO DATA' }).expect(200);
+    const verification = await request(app).get('/api/go-live/verify').expect(200);
+    expect(verification.body.data).toMatchObject({ mockObservations: 0, hasMinimumRealCoverage: true });
+    await request(app).post('/api/go-live/activate')
+      .send({ confirmation: 'ACTIVATE LIVE' }).expect(200);
+  });
+
+  it('expires a Go Live backup when another database connection writes afterward', async () => {
+    temporaryDirectory = mkdtempSync(join(tmpdir(), 'ys-go-live-external-write-'));
+    database = openDatabase(join(temporaryDirectory, 'business.db'));
+    const app = createApp({ database, backupDirectory: temporaryDirectory });
+    await request(app).post('/api/go-live/backup').send({}).expect(201);
+    const otherConnection = openDatabase(join(temporaryDirectory, 'business.db'));
+    try {
+      otherConnection.prepare(`UPDATE app_settings SET refresh_frequency = 'weekly' WHERE id = 1`).run();
+    } finally {
+      otherConnection.close();
+    }
+    const cleanup = await request(app).post('/api/go-live/cleanup')
+      .send({ confirmation: 'CLEAR DEMO DATA' }).expect(409);
+    expect(cleanup.body.error).toMatch(/备份已过期/);
+  });
+
+  it('returns only sanitized SellerSprite connection and capability diagnostics', async () => {
+    database = openDatabase(':memory:');
+    const diagnostic: SellerSpriteConnectionDiagnostics = {
+      connected: true,
+      authenticated: true,
+      toolCount: 49,
+      requiredCapabilityCount: 5,
+      availableRequiredCapabilityCount: 5,
+      missingCapabilities: [],
+      latencyMs: 42,
+    };
+    const app = createApp({
+      database,
+      sellerSpritePort: liveSyncPort(),
+      sellerSpriteDiagnostics: { async testConnection() { return diagnostic; } },
+    });
+
+    const response = await request(app).post('/api/integrations/sellersprite/test').send({}).expect(200);
+    expect(response.body.data).toEqual(diagnostic);
+    expect(JSON.stringify(response.body)).not.toMatch(/secret|authorization|https?:\/\//i);
+    const capabilities = await request(app).get('/api/integrations/sellersprite/capabilities').expect(200);
+    expect(capabilities.body.data).toMatchObject({ toolCount: 0, collectedAt: null });
+    expect(capabilities.body.data.required).toHaveLength(5);
+  });
+
+  it('returns deterministic SellerSprite schema hashes without exposing schema metadata', async () => {
+    database = openDatabase(':memory:');
+    const safeLegacySchema = {
+      type: 'object',
+      properties: {
+        request: {
+          type: 'object',
+          properties: {
+            marketplace: { type: 'string' },
+            month: { type: 'string' },
+            nodeIdPath: { type: 'string' },
+          },
+          required: ['marketplace', 'nodeIdPath', 'month'],
+        },
+      },
+      required: ['request'],
+    };
+    const capabilitiesJson = JSON.stringify({
+      tools: [{
+        name: 'market_research_statistics',
+        description: 'PRIVATE_SCHEMA_CANARY',
+        schemaHash: 'f'.repeat(64),
+        inputSchema: safeLegacySchema,
+      }],
+      capabilities: { MARKET_STATISTICS: 'market_research_statistics' },
+      missingCapabilities: [
+        'MARKET_RESEARCH', 'PRODUCT_CONCENTRATION',
+        'ASIN_SALES_TREND', 'ASIN_COMPETITOR_DISCOVERY',
+      ],
+    });
+    database.prepare(`
+      INSERT INTO provider_capability_snapshots (
+        id, provider_id, capabilities_json, collected_at
+      ) VALUES ('schema-hash-test', 'sellersprite', ?, '2026-09-21T00:00:00.000Z')
+    `).run(capabilitiesJson);
+    const app = createApp({ database });
+
+    const response = await request(app).get('/api/integrations/sellersprite/capabilities').expect(200);
+    const statistic = response.body.data.required.find(
+      (item: { capability: string }) => item.capability === 'MARKET_STATISTICS',
+    );
+
+    expect(statistic).toMatchObject({ available: true });
+    expect(statistic.schemaHash).toBe(sellerSpriteSchemaHash(safeLegacySchema));
+    expect(statistic.schemaHash).not.toBe('f'.repeat(64));
+    expect(JSON.stringify(response.body)).not.toMatch(
+      /PRIVATE_SCHEMA_CANARY|market_research_statistics|nodeIdPath|inputSchema/,
+    );
+  });
+
+  it('uses capability-bound schema hashes when sanitized tool names collide', async () => {
+    database = openDatabase(':memory:');
+    const statisticsHash = 'a'.repeat(64);
+    const concentrationHash = 'b'.repeat(64);
+    const capabilitiesJson = JSON.stringify({
+      tools: [
+        { name: '[REDACTED]', schemaHash: statisticsHash, inputSchema: { type: 'object' } },
+        { name: '[REDACTED]', schemaHash: concentrationHash, inputSchema: { type: 'object' } },
+      ],
+      capabilities: {
+        MARKET_STATISTICS: '[REDACTED]',
+        PRODUCT_CONCENTRATION: '[REDACTED]',
+      },
+      capabilitySchemaHashes: {
+        MARKET_STATISTICS: statisticsHash,
+        PRODUCT_CONCENTRATION: concentrationHash,
+      },
+      missingCapabilities: [
+        'MARKET_RESEARCH', 'ASIN_SALES_TREND', 'ASIN_COMPETITOR_DISCOVERY',
+      ],
+    });
+    database.prepare(`
+      INSERT INTO provider_capability_snapshots (
+        id, provider_id, capabilities_json, collected_at
+      ) VALUES ('sanitized-name-collision', 'sellersprite', ?, '2026-09-21T00:00:00.000Z')
+    `).run(capabilitiesJson);
+    const app = createApp({ database });
+
+    const response = await request(app).get('/api/integrations/sellersprite/capabilities').expect(200);
+    const byCapability = Object.fromEntries(response.body.data.required.map(
+      (item: { capability: string; schemaHash: string | null }) => [item.capability, item],
+    ));
+
+    expect(byCapability.MARKET_STATISTICS).toMatchObject({
+      available: true, schemaHash: statisticsHash,
+    });
+    expect(byCapability.PRODUCT_CONCENTRATION).toMatchObject({
+      available: true, schemaHash: concentrationHash,
+    });
+
+    database.prepare(`
+      UPDATE provider_capability_snapshots SET capabilities_json = ?
+      WHERE id = 'sanitized-name-collision'
+    `).run(JSON.stringify({
+      tools: [
+        { name: '[REDACTED]', schemaHash: statisticsHash, inputSchema: { type: 'object' } },
+        { name: '[REDACTED]', schemaHash: concentrationHash, inputSchema: { type: 'object' } },
+      ],
+      capabilities: {
+        MARKET_STATISTICS: '[REDACTED]',
+        PRODUCT_CONCENTRATION: '[REDACTED]',
+      },
+      missingCapabilities: [
+        'MARKET_RESEARCH', 'ASIN_SALES_TREND', 'ASIN_COMPETITOR_DISCOVERY',
+      ],
+    }));
+    const ambiguousLegacy = (await request(app)
+      .get('/api/integrations/sellersprite/capabilities').expect(200)).body.data;
+    const ambiguousByCapability = Object.fromEntries(ambiguousLegacy.required.map(
+      (item: { capability: string; schemaHash: string | null }) => [item.capability, item],
+    ));
+    expect(ambiguousByCapability.MARKET_STATISTICS).toMatchObject({
+      available: false, schemaHash: null,
+    });
+    expect(ambiguousByCapability.PRODUCT_CONCENTRATION).toMatchObject({
+      available: false, schemaHash: null,
+    });
+  });
+
+  it('selects only the critical run capability schema when a run ID is supplied', async () => {
+    database = openDatabase(':memory:');
+    const old = JSON.stringify({
+      tools: [{ name: 'tool-old', inputSchema: { type: 'object', properties: { old: { type: 'string' } } } }],
+      capabilities: { MARKET_STATISTICS: 'tool-old' }, missingCapabilities: [],
+    });
+    const current = JSON.stringify({
+      tools: [{ name: 'tool-current', inputSchema: { type: 'object', properties: { month: { type: 'string' } } } }],
+      capabilities: { MARKET_STATISTICS: 'tool-current' }, missingCapabilities: [],
+    });
+    const runId = '11111111-1111-4111-8111-111111111111';
+    database.prepare(`
+      INSERT INTO data_tasks (
+        id, sync_run_id, name, task_type, target, source, marketplace,
+        status, total, success, failed, created_at
+      ) VALUES (?, ?, 'schema run', 'critical_sync', 'market-1',
+        'SellerSprite MCP', 'US', 'success', 1, 1, 0, '2026-09-21T01:00:00.000Z')
+    `).run(runId, runId);
+    database.prepare(`
+      INSERT INTO provider_capability_snapshots (
+        id, provider_id, capabilities_json, collected_at, sync_run_id
+      ) VALUES (?, 'sellersprite', ?, ?, ?)
+    `).run('old', old, '2026-09-21T02:00:00.000Z', null);
+    database.prepare(`
+      INSERT INTO provider_capability_snapshots (
+        id, provider_id, capabilities_json, collected_at, sync_run_id
+      ) VALUES (?, 'sellersprite', ?, ?, ?)
+    `).run('current', current, '2026-09-21T01:00:00.000Z', runId);
+    const app = createApp({ database });
+
+    const latest = (await request(app).get('/api/integrations/sellersprite/capabilities').expect(200)).body.data;
+    const scoped = (await request(app)
+      .get(`/api/integrations/sellersprite/capabilities?runId=${runId}`).expect(200)).body.data;
+
+    expect(scoped.required[1].schemaHash).toMatch(/^[a-f0-9]{64}$/);
+    expect(scoped.required[1].schemaHash).not.toBe(latest.required[1].schemaHash);
+    await request(app)
+      .get('/api/integrations/sellersprite/capabilities?runId=22222222-2222-4222-8222-222222222222')
+      .expect(404);
+  });
+
+  it('proves the Dashboard selected run-linked real observations while Demo is retained', async () => {
+    database = openDatabase(':memory:');
+    const app = createApp({ database });
+    await request(app).post('/api/settings/demo').send({ enabled: true }).expect(200);
+    database.exec(`
+      INSERT INTO market_nodes (
+        id, name, parent_id, level, marketplace, category_id, keywords_json,
+        status, source_type, created_at
+      ) VALUES (
+        'real-market', 'Verified market', NULL, 1, 'US', '1055398:1063252',
+        '[]', 'active', 'import', '2026-09-21T00:00:00.000Z'
+      );
+      INSERT INTO products (
+        id, asin, sku, brand, title, image_url, marketplace, product_type,
+        is_owned, market_node_id, source_type, created_at
+      ) VALUES (
+        'real-owned', 'B0REAL0001', 'REAL-1', 'Brand', 'Real owned SKU', '',
+        'US', 'pillow', 1, 'real-market', 'import', '2026-09-21T00:00:00.000Z'
+      );
+      UPDATE app_settings SET default_market_id = 'real-market' WHERE id = 1;
+    `);
+    addVerifiedMcpCoverage(database, 'real-market', 'real-owned');
+    const runId = (database.prepare(`
+      SELECT id FROM data_coverage_runs WHERE run_type = 'critical_sync'
+    `).get() as { id: string }).id;
+
+    const response = await request(app)
+      .get(`/api/dashboard/executive/run-proof/${runId}`).expect(200);
+    expect(response.body.data).toEqual({
+      passed: true, marketVerified: true, verifiedOwnedProducts: 1, requiredOwnedProducts: 1,
+    });
+    expect(JSON.stringify(response.body.data)).not.toMatch(/B0REAL0001|Real owned SKU|1055398/);
+
+    database.prepare(`DELETE FROM mcp_sync_observation_links
+      WHERE snapshot_kind = 'fact' AND entity_id = 'real-owned'`).run();
+    const stale = await request(app)
+      .get(`/api/dashboard/executive/run-proof/${runId}`).expect(200);
+    expect(stale.body.data).toMatchObject({ passed: false, verifiedOwnedProducts: 0 });
+  });
+
+  it('syncs market and owned history through admin routes without remote calls on dashboard GET', async () => {
+    database = openDatabase(':memory:');
+    database.exec(`
+      INSERT INTO market_nodes (
+        id, name, parent_id, level, marketplace, category_id,
+        sellersprite_confirmed_node_path, keywords_json, status, source_type, created_at
+      ) VALUES (
+        'market-live', 'Bed Pillows', NULL, 1, 'US', '1055398:1063252:1199122:10671043011',
+        '1055398:1063252:1199122:10671043011', '[]',
+        'active', 'import', '2026-09-01T00:00:00.000Z'
+      );
+      INSERT INTO products (
+        id, asin, sku, internal_name, brand, title, image_url, marketplace,
+        product_type, is_owned, market_node_id, keywords_json, monitoring_enabled,
+        source_type, created_at
+      ) VALUES (
+        'owned-live', 'B0OWNED001', 'LIVE-01', 'Live One', 'Own', 'Live One', '',
+        'US', 'memory_foam_pillow', 1, 'market-live', '[]', 1, 'import',
+        '2026-09-01T00:00:00.000Z'
+      );
+      UPDATE app_settings SET default_market_id = 'market-live' WHERE id = 1;
+    `);
+    let calls = 0;
+    const delegate = liveSyncPort();
+    const port: SellerSpriteSyncPort = {
+      async fetchMarketResearchSummary(input) { calls += 1; return delegate.fetchMarketResearchSummary(input); },
+      async fetchMarketStatistics(input) { calls += 1; return delegate.fetchMarketStatistics(input); },
+      async fetchMarketConcentration(input) { calls += 1; return delegate.fetchMarketConcentration(input); },
+      async fetchAsinSalesTrend(input) { calls += 1; return delegate.fetchAsinSalesTrend(input); },
+      async discoverAsinCompetitors(input) { calls += 1; return delegate.discoverAsinCompetitors(input); },
+    };
+    const app = createApp({ database, sellerSpritePort: port });
+
+    await request(app).post('/api/integrations/sellersprite/sync/market')
+      .send({ marketId: 'market-live', month: '202608' }).expect(201);
+    await request(app).post('/api/integrations/sellersprite/sync/products')
+      .send({ productIds: ['owned-live'] }).expect(201);
+    expect(calls).toBe(4);
+
+    await request(app).get('/api/dashboard/executive?range=30D').expect(200);
+    const coverage = await request(app).get('/api/data-coverage?marketplace=US').expect(200);
+    expect(coverage.body.data).toMatchObject({ marketplace: 'US' });
+    expect(calls).toBe(4);
+    expect((database.prepare(`SELECT COUNT(*) AS count FROM market_snapshots`).get() as { count: number }).count).toBe(1);
+    expect((database.prepare(`SELECT COUNT(*) AS count FROM product_snapshots`).get() as { count: number }).count).toBe(1);
+    await request(app).patch('/api/markets/market-live/sellersprite-node')
+      .send({ nodeIdPath: '1055398:1063252:1199122', confirmed: true }).expect(409);
+  });
+
+  it('requires an admin-confirmed numeric SellerSprite market path before market sync', async () => {
+    database = openDatabase(':memory:');
+    database.prepare(`INSERT INTO market_nodes (
+      id, name, level, marketplace, category_id, status, source_type, created_at
+    ) VALUES ('unmapped', 'Memory Foam Pillow', 1, 'US',
+      '1055398:1063252:1199122:10671043011', '值得研究', 'import', '2026-09-19')`).run();
+    const app = createApp({ database, sellerSpritePort: liveSyncPort() });
+    await request(app).post('/api/integrations/sellersprite/sync/market')
+      .send({ marketId: 'unmapped', month: '202608' }).expect(400);
+    await request(app).patch('/api/markets/unmapped/sellersprite-node')
+      .send({ nodeIdPath: 'unverified-name', confirmed: true }).expect(400);
+    await request(app).patch('/api/markets/unmapped/sellersprite-node')
+      .send({ nodeIdPath: '1055398:1063252:1199122:10671043011' }).expect(400);
+    await request(app).patch('/api/markets/unmapped/sellersprite-node')
+      .send({ nodeIdPath: '1055398:1063252:1199122:10671043011', confirmed: true }).expect(200);
+    expect(database.prepare(`SELECT category_id AS path,
+      sellersprite_confirmed_node_path AS confirmedPath, status
+      FROM market_nodes WHERE id = 'unmapped'`).get()).toEqual({
+      path: '1055398:1063252:1199122:10671043011',
+      confirmedPath: '1055398:1063252:1199122:10671043011',
+      status: '值得研究',
+    });
+    await request(app).post('/api/integrations/sellersprite/sync/market')
+      .send({ marketId: 'unmapped', month: '202608' }).expect(201);
+  });
+
+  it('requires human confirmation before a discovered competitor becomes a relation', async () => {
+    database = openDatabase(':memory:');
+    database.exec(`
+      INSERT INTO market_nodes (
+        id, name, level, marketplace, category_id, sellersprite_confirmed_node_path,
+        status, source_type, created_at
+      ) VALUES ('market-live', 'Bed Pillows', 1, 'US', '1055398:1063252',
+        '1055398:1063252', 'active', 'import', '2026-09-01T00:00:00.000Z');
+      INSERT INTO products (
+        id, asin, brand, title, image_url, marketplace, product_type, is_owned,
+        market_node_id, source_type, created_at
+      ) VALUES (
+        'owned-live', 'B0OWNED001', 'Own', 'Live One', '', 'US', 'pillow', 1,
+        'market-live', 'import', '2026-09-01T00:00:00.000Z'
+      );
+    `);
+    const app = createApp({ database, sellerSpritePort: liveSyncPort() });
+
+    await request(app).post('/api/owned-products/owned-live/competitor-candidates')
+      .send({ size: 5 }).expect(201);
+    expect((database.prepare(`SELECT COUNT(*) AS count FROM competitor_relations`).get() as { count: number }).count).toBe(0);
+    const review = await request(app).get('/api/owned-products/owned-live/competitor-candidates').expect(200);
+    expect(review.body.data).toEqual([expect.objectContaining({ asin: 'B0PUBLIC02', status: 'pending_review' })]);
+    const candidate = review.body.data[0] as { id: string };
+    const confirmed = await request(app)
+      .post(`/api/owned-products/owned-live/competitor-candidates/${candidate.id}/confirm`)
+      .send({ relationType: 'direct', reason: '人工确认' }).expect(201);
+    expect((database.prepare(`SELECT COUNT(*) AS count FROM competitor_relations`).get() as { count: number }).count).toBe(1);
+    expect((await request(app).get('/api/owned-products/owned-live/competitor-candidates').expect(200))
+      .body.data[0].status).toBe('confirmed');
+    const competitorProductId = confirmed.body.data.competitorProductId as string;
+    const sync = await request(app).post('/api/integrations/sellersprite/sync/competitor')
+      .send({ ownedProductId: 'owned-live', competitorProductId }).expect(201);
+    expect(sync.body.data).toMatchObject({ inserted: 1 });
+    expect(database.prepare(`SELECT source_type, estimated_sales FROM product_snapshots
+      WHERE product_id = ?`).get(competitorProductId))
+      .toEqual({ source_type: 'mcp', estimated_sales: 10 });
+    database.prepare(`INSERT INTO competitor_candidates (
+      id, marketplace, asin, source_product_id, source, source_type, status, created_at
+    ) VALUES ('reject-me', 'US', 'B0PUBLIC03', 'owned-live', 'SellerSprite', 'mcp', 'pending_review', '2026-09-19')`).run();
+    await request(app).post('/api/owned-products/owned-live/competitor-candidates/reject-me/reject')
+      .send({}).expect(200);
+    expect((database.prepare(`SELECT status FROM competitor_candidates WHERE id = 'reject-me'`).get() as { status: string })
+      .status).toBe('rejected');
+  });
+
+  it('wires review-first import preview and confirmation routes', async () => {
+    const app = testApp();
+    const csv = [
+      'marketplace,asin,sku,internalName,brand,title,productType,parentAsin,variationTheme,marketNode,monitoringEnabled,status',
+      'US,B0MASTER01,SKU-01,Pillow One,Own,Pillow One,memory_foam_pillow,,,Bed Pillows,true,active',
+    ].join('\n');
+    const preview = await request(app).post('/api/import/preview/csv')
+      .attach('file', Buffer.from(csv), 'owned-products.csv').expect(200);
+    expect(preview.body.data).toMatchObject({ detectedType: 'owned_product_master', newCount: 1 });
+    expect(preview.body.data.rows).toHaveLength(1);
+
+    const confirmed = await request(app).post('/api/import/confirm')
+      .send({ token: preview.body.data.token }).expect(201);
+    expect(confirmed.body.data).toMatchObject({ successCount: 1, failureCount: 0 });
+  });
+
+  it('rejects legacy direct uploads without creating an import task or business records', async () => {
+    const app = testApp();
+    const csv = [
+      'ASIN,SKU,Brand,Title,MarketName,Price,Rating,Reviews,BSR,MonthlySales,SellerCount,Growth7D,Growth30D,Growth90D,Confidence,IsEstimated,Date',
+      'B0BYPASS01,SKU-01,Brand,Product,Market,39.99,4.4,120,8000,700,1,1.2,4.2,9.4,0.8,true,2026-09-09',
+    ].join('\n');
+    for (const endpoint of ['/api/import/csv', '/api/import/xlsx']) {
+      const response = await request(app).post(endpoint).field('entityType', 'product')
+        .attach('file', Buffer.from(csv), 'products.csv').expect(410);
+      expect(response.body.error).toMatch(/预览|审核/);
+    }
+    expect(database?.prepare('SELECT COUNT(*) AS count FROM products').get()).toEqual({ count: 0 });
+    expect(database?.prepare('SELECT COUNT(*) AS count FROM data_tasks').get()).toEqual({ count: 0 });
+  });
+
+  it('passes Amazon report dates through preview and preserves actual source authority', async () => {
+    const app = testApp();
+    const master = [
+      'marketplace,asin,sku,internalName,brand,title,productType,parentAsin,variationTheme,marketNode,monitoringEnabled,status',
+      'US,B0ACTUAL01,SKU-01,Owned Pillow,Own,Owned Pillow,memory_foam_pillow,,,Memory Foam,true,active',
+    ].join('\n');
+    const masterPreview = await request(app).post('/api/import/preview/csv')
+      .attach('file', Buffer.from(master), 'master.csv').expect(200);
+    await request(app).post('/api/import/confirm')
+      .send({ token: masterPreview.body.data.token }).expect(201);
+    const report = [
+      '(Parent) ASIN,(Child) ASIN,Title,SKU,Units Ordered,Ordered Product Sales',
+      'B0PARENT01,B0ACTUAL01,Owned Pillow,SKU-01,120,$4800',
+    ].join('\n');
+    const missingPeriod = await request(app).post('/api/import/preview/csv')
+      .field('sourceType', 'amazon').field('marketplace', 'US')
+      .attach('file', Buffer.from(report), 'report.csv').expect(200);
+    expect(missingPeriod.body.data).toMatchObject({ newCount: 0, errorCount: 1 });
+    const preview = await request(app).post('/api/import/preview/csv')
+      .field('sourceType', 'amazon').field('marketplace', 'US')
+      .field('reportStartDate', '2026-08-01').field('reportEndDate', '2026-08-31')
+      .attach('file', Buffer.from(report), 'report.csv').expect(200);
+    expect(preview.body.data).toMatchObject({ detectedType: 'amazon_business_report', newCount: 1 });
+    await request(app).post('/api/import/confirm').send({ token: preview.body.data.token }).expect(201);
+    expect(database!.prepare(`SELECT estimated_sales, estimated_revenue, bsr, source_type,
+      is_estimated, observation_date, period FROM product_snapshots WHERE source_type = 'amazon'`).get())
+      .toEqual({ estimated_sales: 120, estimated_revenue: 4800, bsr: null,
+        source_type: 'amazon', is_estimated: 0, observation_date: '2026-08-31',
+        period: '2026-08-01/2026-08-31' });
+  });
+
+  it('does not automatically enter Live when only a product master exists', async () => {
+    const app = testApp();
+
+    await request(app).post('/api/owned-products').send({
+      asin: 'B0LIVEONLY', brand: 'Own', title: 'Configured pillow',
+      productType: 'memory_foam_pillow',
+    }).expect(201);
+
+    const settings = await request(app).get('/api/settings').expect(200);
+    expect(settings.body.data.mode).toBe('empty');
+    const verification = await request(app).get('/api/go-live/verify').expect(200);
+    expect(verification.body.data.hasMinimumRealCoverage).toBe(false);
+  });
+});
 
 describe('system bootstrap and demo mode', () => {
   it('starts empty and enters explicitly marked demo mode', async () => {
@@ -147,7 +662,7 @@ describe('system bootstrap and demo mode', () => {
     });
     expect(created.body.data.insight).toMatchObject({ status: '数据不足', confidence: 0, evidence: [] });
     const settings = await request(app).get('/api/settings').expect(200);
-    expect(settings.body.data).toMatchObject({ mode: 'live', defaultMarketId: 'mkt-memory-foam' });
+    expect(settings.body.data).toMatchObject({ mode: 'empty', defaultMarketId: 'mkt-memory-foam' });
     const marketList = await request(app).get('/api/markets').expect(200);
     expect(marketList.body.data[0].name).toBe('Memory Foam Pillow');
     const marketDetail = await request(app).get('/api/markets/mkt-memory-foam').expect(200);
@@ -204,7 +719,7 @@ describe('system bootstrap and demo mode', () => {
       SELECT opportunity_ids_json FROM research_results
     `).get()).toMatchObject({ opportunity_ids_json: '[]' });
     expect(await request(app).get('/api/settings').then((result) => result.body.data.mode))
-      .toBe('live');
+      .toBe('empty');
   });
 });
 
@@ -346,23 +861,61 @@ describe('workflow mutations', () => {
     expect(watchlist.body.data.filter((item: { itemType: string }) => item.itemType === 'owned_product')).toHaveLength(1);
   });
 
-  it('never cascades away historical snapshots through the owned-product delete API', async () => {
+  it('deactivates an owned product without cascading away historical or audit records', async () => {
     const app = testApp();
     await request(app).post('/api/settings/demo').send({ enabled: true }).expect(200);
+    await request(app).post('/api/watchlist').send({
+      itemType: 'owned_product', itemId: 'owned-sku-01', name: 'SKU-01 history',
+    }).expect(201);
+    database?.prepare(`
+      INSERT INTO decisions (
+        id, entity_type, entity_id, decision, reason, ai_insight_id,
+        data_version, decided_by, decided_at
+      ) VALUES (
+        'decision-owned-sku-01-history', 'owned_product', 'owned-sku-01', 'watch',
+        'Retained deactivation history', 'insight-owned-sku-01',
+        'demo-2026-09-09', 'test-owner', '2026-09-10T00:00:00.000Z'
+      )
+    `).run();
     const before = database?.prepare(`
-      SELECT COUNT(*) AS count FROM product_snapshots WHERE product_id = 'owned-sku-01'
-    `).get() as { count: number };
-    expect(before.count).toBeGreaterThan(0);
+      SELECT
+        (SELECT COUNT(*) FROM product_snapshots WHERE product_id = 'owned-sku-01') AS snapshots,
+        (SELECT COUNT(*) FROM competitor_relations WHERE owned_product_id = 'owned-sku-01') AS relations,
+        (SELECT COUNT(*) FROM ai_insights
+          WHERE entity_type = 'owned_product' AND entity_id = 'owned-sku-01') AS insights,
+        (SELECT COUNT(*) FROM decisions
+          WHERE entity_type = 'owned_product' AND entity_id = 'owned-sku-01') AS decisions,
+        (SELECT COUNT(*) FROM watchlist_items
+          WHERE item_type = 'owned_product' AND item_id = 'owned-sku-01') AS watchlist
+    `).get() as { snapshots: number; relations: number; insights: number; decisions: number; watchlist: number };
+    expect(before).toMatchObject({ snapshots: 4, relations: 3, insights: 1, decisions: 1, watchlist: 1 });
 
-    await request(app).delete('/api/owned-products/owned-sku-01').expect(409);
-    expect(database?.prepare(`SELECT 1 AS found FROM products WHERE id = 'owned-sku-01'`).get())
-      .toMatchObject({ found: 1 });
+    const result = await request(app).delete('/api/owned-products/owned-sku-01').expect(200);
+    expect(result.body.data).toEqual({ id: 'owned-sku-01', deactivated: true });
     expect(database?.prepare(`
-      SELECT COUNT(*) AS count FROM product_snapshots WHERE product_id = 'owned-sku-01'
-    `).get()).toMatchObject({ count: before.count });
+      SELECT status, monitoring_enabled AS monitoringEnabled
+      FROM products WHERE id = 'owned-sku-01'
+    `).get()).toMatchObject({ status: 'inactive', monitoringEnabled: 0 });
+    expect(database?.prepare(`
+      SELECT
+        (SELECT COUNT(*) FROM product_snapshots WHERE product_id = 'owned-sku-01') AS snapshots,
+        (SELECT COUNT(*) FROM competitor_relations WHERE owned_product_id = 'owned-sku-01') AS relations,
+        (SELECT COUNT(*) FROM ai_insights
+          WHERE entity_type = 'owned_product' AND entity_id = 'owned-sku-01') AS insights,
+        (SELECT COUNT(*) FROM decisions
+          WHERE entity_type = 'owned_product' AND entity_id = 'owned-sku-01') AS decisions,
+        (SELECT COUNT(*) FROM watchlist_items
+          WHERE item_type = 'owned_product' AND item_id = 'owned-sku-01') AS watchlist
+    `).get()).toEqual({ ...before, watchlist: 0 });
+    expect(await request(app).get('/api/owned-products').then((response) => response.body.data))
+      .not.toContainEqual(expect.objectContaining({ id: 'owned-sku-01' }));
+    await request(app).get('/api/owned-products/owned-sku-01').expect(404);
+    await request(app).get('/api/owned-products/owned-sku-01/snapshots').expect(404);
+    await request(app).get('/api/owned-products/owned-sku-01/competitors').expect(404);
+    await request(app).get('/api/owned-products/owned-sku-01/insights').expect(404);
   });
 
-  it('still allows deleting a newly configured owned product that has no snapshot history', async () => {
+  it('retains a newly configured owned-product master when it is deactivated', async () => {
     const app = testApp();
     const created = await request(app).post('/api/owned-products').send({
       asin: 'B0DELETEEMPTY', sku: 'DELETE-EMPTY', brand: 'Own Brand',
@@ -370,9 +923,11 @@ describe('workflow mutations', () => {
       marketNodeId: 'mkt-delete-empty', monitoringEnabled: false,
     }).expect(201);
 
-    await request(app).delete(`/api/owned-products/${created.body.data.id as string}`).expect(200);
-    expect(database?.prepare('SELECT 1 AS found FROM products WHERE id = ?')
-      .get(created.body.data.id as string)).toBeUndefined();
+    const id = created.body.data.id as string;
+    const result = await request(app).delete(`/api/owned-products/${id}`).expect(200);
+    expect(result.body.data).toEqual({ id, deactivated: true });
+    expect(database?.prepare(`SELECT status FROM products WHERE id = ?`).get(id))
+      .toMatchObject({ status: 'inactive' });
   });
 
   it('creates development research and monitoring atomically in the current marketplace', async () => {
@@ -473,24 +1028,27 @@ describe('workflow mutations', () => {
     await request(app).patch('/api/watchlist/watch-market').send({ status: 'paused' }).expect(403);
   });
 
-  it('replaces demo rows on real import and never lets Demo overwrite live data', async () => {
+  it('preserves Demo and real observations until explicit scoped Demo cleanup', async () => {
     const app = testApp();
     await request(app).post('/api/settings/demo').send({ enabled: true }).expect(200);
+    const demoSnapshotCount = (database!.prepare(`
+      SELECT COUNT(*) AS count FROM product_snapshots WHERE source_type = 'mock'
+    `).get() as { count: number }).count;
     const csv = [
       `ASIN,SKU,Brand,Title,MarketName,Keywords,MonitoringEnabled,${COMPLETE_PRODUCT_FIELDS}`,
       `B0LIVE0001,LIVE-01,Live Brand,Imported Pillow,Imported Memory Foam,pillow|foam,true,${completeProductValues(39.99, 900, 6.2)}`,
     ].join('\n');
-    const imported = await request(app)
-      .post('/api/import/csv')
-      .field('entityType', 'product')
-      .attach('file', Buffer.from(csv), 'products.csv')
-      .expect(201);
+    const imported = await previewAndConfirmCsv(app, csv, 'products.csv', { entityType: 'product' });
     expect(imported.body.data).toMatchObject({ rowCount: 1, successCount: 1, failureCount: 0 });
-    expect(imported.body.meta.mode).toBe('live');
+    expect(imported.body.meta.mode).toBe('demo');
     const products = await request(app).get('/api/owned-products').expect(200);
-    expect(products.body.data).toHaveLength(1);
-    expect(products.body.data[0].latest.provenance.sourceType).toBe('import');
-    expect(products.body.data[0]).toMatchObject({
+    expect(products.body.data).toHaveLength(5);
+    expect((database!.prepare(`
+      SELECT COUNT(*) AS count FROM product_snapshots WHERE source_type = 'mock'
+    `).get() as { count: number }).count).toBe(demoSnapshotCount);
+    const importedProduct = products.body.data.find((item: { asin: string }) => item.asin === 'B0LIVE0001');
+    expect(importedProduct.latest.provenance.sourceType).toBe('import');
+    expect(importedProduct).toMatchObject({
       monitoringEnabled: true,
       keywords: ['pillow', 'foam'],
       latest: { snapshotAvailable: true, growth30d: null, growth30dAvailable: false },
@@ -502,17 +1060,35 @@ describe('workflow mutations', () => {
       `ASIN,${COMPLETE_PRODUCT_FIELDS}`,
       `B0LIVE0001,${completeProductValues(41.99, 950, 7.1, '2026-09-10')}`,
     ].join('\n');
-    await request(app)
-      .post('/api/import/csv')
-      .field('entityType', 'product')
-      .attach('file', Buffer.from(updateCsv), 'snapshot.csv')
-      .expect(201);
+    await previewAndConfirmCsv(app, updateCsv, 'snapshot.csv', { entityType: 'product' });
     const updatedProducts = await request(app).get('/api/owned-products').expect(200);
-    expect(updatedProducts.body.data[0]).toMatchObject({ monitoringEnabled: true, keywords: ['pillow', 'foam'] });
+    expect(updatedProducts.body.data.find((item: { asin: string }) => item.asin === 'B0LIVE0001'))
+      .toMatchObject({ monitoringEnabled: true, keywords: ['pillow', 'foam'] });
 
-    await request(app).post('/api/settings/demo').send({ enabled: true }).expect(409);
-    await request(app).post('/api/settings/demo').send({ enabled: false }).expect(200);
-    expect(await request(app).get('/api/owned-products').then((result) => result.body.data)).toHaveLength(1);
+    await request(app).post('/api/settings/demo').send({ enabled: true }).expect(200);
+    await request(app).post('/api/settings/demo').send({ enabled: false }).expect(409);
+    const importedMarketId = (database!.prepare('SELECT market_node_id FROM products WHERE id = ?')
+      .get(importedProduct.id) as { market_node_id: string }).market_node_id;
+    addVerifiedMcpCoverage(database!, importedMarketId, importedProduct.id);
+    temporaryDirectory = mkdtempSync(join(tmpdir(), 'ys-demo-cleanup-'));
+    const migrationApp = createApp({ database: database!, backupDirectory: temporaryDirectory });
+    await request(migrationApp).post('/api/go-live/backup').send({}).expect(201);
+    await request(migrationApp).post('/api/go-live/cleanup')
+      .send({ confirmation: 'CLEAR DEMO DATA' }).expect(200);
+    await request(migrationApp).post('/api/settings/demo').send({ enabled: false }).expect(200);
+    expect(await request(app).get('/api/owned-products').then((result) => result.body.data))
+      .toEqual([expect.objectContaining({ asin: 'B0LIVE0001' })]);
+    expect(database!.prepare(`SELECT COUNT(*) AS count FROM products WHERE is_owned = 1`).get())
+      .toEqual({ count: 5 });
+    expect(database!.prepare(`SELECT COUNT(*) AS count FROM products
+      WHERE is_owned = 1 AND source_type = 'mock' AND status = 'inactive'`).get())
+      .toEqual({ count: 4 });
+    expect((database!.prepare(`
+      SELECT COUNT(*) AS count FROM product_snapshots WHERE source_type = 'mock'
+    `).get() as { count: number }).count).toBe(0);
+    expect((database!.prepare(`
+      SELECT COUNT(*) AS count FROM product_snapshots WHERE source_type = 'import'
+    `).get() as { count: number }).count).toBe(2);
   });
 
   it('keeps imported products and market nodes in the same marketplace', async () => {
@@ -522,8 +1098,7 @@ describe('workflow mutations', () => {
       `ASIN,SKU,Brand,Title,MarketNodeId,MarketName,${COMPLETE_PRODUCT_FIELDS}`,
       `B0CAIMPORT1,CA-I1,CA Brand,CA Import,mkt-ca-import,CA Imported Market,${completeProductValues(45, 320, 3.4)}`,
     ].join('\n');
-    await request(app).post('/api/import/csv').field('entityType', 'product')
-      .attach('file', Buffer.from(currentMarketplaceCsv), 'ca.csv').expect(201);
+    await previewAndConfirmCsv(app, currentMarketplaceCsv, 'ca.csv', { entityType: 'product' });
     const caProducts = await request(app).get('/api/owned-products').expect(200);
     expect(caProducts.body.data[0]).toMatchObject({ asin: 'B0CAIMPORT1', marketplace: 'CA' });
     expect(database?.prepare('SELECT marketplace FROM market_nodes WHERE id = ?').get('mkt-ca-import'))
@@ -534,8 +1109,7 @@ describe('workflow mutations', () => {
       `B0USIMPORT1,US-I1,US Brand,US Import,US,mkt-shared-id,US Shared Market,${completeProductValues(30, 500, 4.1)}`,
       `B0CAIMPORT2,CA-I2,CA Brand,CA Collision,CA,mkt-shared-id,CA Shared Market,${completeProductValues(42, 410, 2.8)}`,
     ].join('\n');
-    const collision = await request(app).post('/api/import/csv').field('entityType', 'product')
-      .attach('file', Buffer.from(collisionCsv), 'collision.csv').expect(201);
+    const collision = await previewAndConfirmCsv(app, collisionCsv, 'collision.csv', { entityType: 'product' });
     expect(collision.body.data).toMatchObject({ rowCount: 2, successCount: 1, failureCount: 1 });
     expect(collision.body.data.errors[0]).toContain('US 与当前工作区站点 CA 不一致');
     expect(database?.prepare(`SELECT COUNT(*) AS count FROM products WHERE asin = 'B0USIMPORT1'`).get())
@@ -550,8 +1124,7 @@ describe('workflow mutations', () => {
       'ASIN,SKU,Brand,Title,MarketNodeId,MarketName,Price',
       'B0PARTIAL1,P-1,Brand,Partial Product,mkt-partial-product,Partial Product Market,29.99',
     ].join('\n');
-    const productImport = await request(app).post('/api/import/csv').field('entityType', 'product')
-      .attach('file', Buffer.from(partialProduct), 'partial-product.csv').expect(201);
+    const productImport = await previewAndConfirmCsv(app, partialProduct, 'partial-product.csv', { entityType: 'product' });
     expect(productImport.body.data).toMatchObject({ successCount: 0, failureCount: 1 });
     expect(productImport.body.data.errors[0]).toContain('缺少或无法解析字段 estimatedsales');
 
@@ -559,8 +1132,7 @@ describe('workflow mutations', () => {
       'MarketNodeId,MarketName,MonthlySales,AvgPrice,Date',
       'mkt-partial-market,Partial Market,1000,30,2026-09-09',
     ].join('\n');
-    const marketImport = await request(app).post('/api/import/csv').field('entityType', 'market')
-      .attach('file', Buffer.from(partialMarket), 'partial-market.csv').expect(201);
+    const marketImport = await previewAndConfirmCsv(app, partialMarket, 'partial-market.csv', { entityType: 'market' });
     expect(marketImport.body.data).toMatchObject({ successCount: 0, failureCount: 1 });
     expect(marketImport.body.data.errors[0]).toContain('缺少或无法解析字段 productcount');
 
@@ -588,8 +1160,8 @@ describe('workflow mutations', () => {
       31, 30, 4.3, 190, 27, 44, 14, 0.92, false, '2026-09-09',
     ].join(',');
 
-    const firstImport = await request(app).post('/api/import/csv').field('entityType', 'market')
-      .attach('file', Buffer.from([header, baseline].join('\n')), 'market-baseline.csv').expect(201);
+    const firstImport = await previewAndConfirmCsv(app, [header, baseline].join('\n'),
+      'market-baseline.csv', { entityType: 'market' });
     expect(firstImport.body.data).toMatchObject({ successCount: 1, failureCount: 0 });
     const firstRead = await request(app).get('/api/markets/mkt-baseline-guard').expect(200);
     expect(firstRead.body.data.node).toMatchObject({
@@ -600,8 +1172,8 @@ describe('workflow mutations', () => {
       WHERE entity_type = 'market' AND entity_id = 'mkt-baseline-guard'
     `).get()).toMatchObject({ count: 0 });
 
-    const secondImport = await request(app).post('/api/import/csv').field('entityType', 'market')
-      .attach('file', Buffer.from([header, current].join('\n')), 'market-current.csv').expect(201);
+    const secondImport = await previewAndConfirmCsv(app, [header, current].join('\n'),
+      'market-current.csv', { entityType: 'market' });
     expect(secondImport.body.data).toMatchObject({ successCount: 1, failureCount: 0 });
     const secondRead = await request(app).get('/api/markets/mkt-baseline-guard').expect(200);
     expect(secondRead.body.data.node).toMatchObject({ growth30d: 20, growth30dAvailable: true });
@@ -690,8 +1262,7 @@ describe('workflow mutations', () => {
       `ASIN,SKU,Brand,Title,MarketName,${COMPLETE_PRODUCT_FIELDS}`,
       `B0LIVE0002,LIVE-02,Live Brand,Real Imported Pillow,Real Market,${completeProductValues(39.99, 700, 4.2)}`,
     ].join('\n');
-    await request(app).post('/api/import/csv').field('entityType', 'product')
-      .attach('file', Buffer.from(csv), 'live.csv').expect(201);
+    await previewAndConfirmCsv(app, csv, 'live.csv', { entityType: 'product' });
     const product = await request(app).get('/api/owned-products').then((result) => result.body.data[0]);
     const before = await request(app).get(`/api/owned-products/${product.id}/snapshots`).expect(200);
     const task = await request(app).post('/api/data-tasks/run')
@@ -708,8 +1279,7 @@ describe('workflow mutations', () => {
       `ASIN,SKU,Brand,Title,MarketName,${COMPLETE_PRODUCT_FIELDS}`,
       `B0LIVE0003,LIVE-03,Live Brand,Imported Product,Imported Market,${completeProductValues(28, 400, 1.6)}`,
     ].join('\n');
-    await request(app).post('/api/import/csv').field('entityType', 'product')
-      .attach('file', Buffer.from(csv), 'live.csv').expect(201);
+    await previewAndConfirmCsv(app, csv, 'live.csv', { entityType: 'product' });
     const project = await request(app).post('/api/development-projects').send({
       name: '尚未采集的邻近产品',
       productType: 'adjacent',
@@ -728,8 +1298,7 @@ describe('workflow mutations', () => {
       `ASIN,SKU,Brand,Title,MarketName,Marketplace,${COMPLETE_PRODUCT_FIELDS}`,
       `B0USA00001,US-01,Brand US,US Pillow,US Memory Market,US,${completeProductValues(35, 500, 4.8)}`,
     ].join('\n');
-    await request(app).post('/api/import/csv').field('entityType', 'product')
-      .attach('file', Buffer.from(usCsv), 'us-market.csv').expect(201);
+    await previewAndConfirmCsv(app, usCsv, 'us-market.csv', { entityType: 'product' });
     expect(await request(app).get('/api/owned-products').then((result) => result.body.data)).toHaveLength(1);
 
     await request(app).patch('/api/settings').send({ marketplace: 'CA' }).expect(200);
@@ -737,8 +1306,7 @@ describe('workflow mutations', () => {
       `ASIN,SKU,Brand,Title,MarketName,Marketplace,${COMPLETE_PRODUCT_FIELDS}`,
       `B0CAN00001,CA-01,Brand CA,CA Pillow,CA Memory Market,CA,${completeProductValues(48, 420, 3.7)}`,
     ].join('\n');
-    await request(app).post('/api/import/csv').field('entityType', 'product')
-      .attach('file', Buffer.from(caCsv), 'ca-market.csv').expect(201);
+    await previewAndConfirmCsv(app, caCsv, 'ca-market.csv', { entityType: 'product' });
     const settings = await request(app).get('/api/settings').expect(200);
     expect(settings.body.data.defaultMarketId).not.toBe('');
     const markets = await request(app).get('/api/markets').expect(200);

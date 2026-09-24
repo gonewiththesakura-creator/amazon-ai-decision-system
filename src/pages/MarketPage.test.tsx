@@ -1,18 +1,20 @@
 // @vitest-environment jsdom
 
 import '@testing-library/jest-dom/vitest';
-import { cleanup, render, screen, within } from '@testing-library/react';
+import { cleanup, fireEvent, render, screen, within } from '@testing-library/react';
 import { MemoryRouter } from 'react-router-dom';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { MarketDetail, MarketNode, Product } from '../../shared/types';
 import MarketPage from './MarketPage';
 
-const { useApiMock } = vi.hoisted(() => ({ useApiMock: vi.fn() }));
+const { useApiMock, modeMock } = vi.hoisted(() => ({
+  useApiMock: vi.fn(), modeMock: { value: 'demo' },
+}));
 
 vi.mock('../lib/AppContext', () => ({
   useApp: () => ({
     settings: {
-      mode: 'demo',
+      mode: modeMock.value,
       marketplace: 'US',
       currency: 'USD',
       defaultMarketId: 'market-memory-foam',
@@ -104,12 +106,20 @@ const detail: MarketDetail = {
     generatedAt: '2026-09-11T01:30:00.000Z',
   },
   provenance: {
-    source: 'Demo fixture',
+    source: 'SellerSprite MCP',
     sourceType: 'mock',
     collectedAt: '2026-09-11T01:30:00.000Z',
     period: '30D',
     isEstimated: false,
     confidence: 0.9,
+  },
+  metricProvenance: {
+    monthly_sales: { source: 'SellerSprite MCP', sourceType: 'mcp',
+      sourceRecordId: 'market-sales-fact', sourceRecordType: 'metric_fact',
+      collectedAt: '2026-09-11T01:30:00.000Z', period: '30D', isEstimated: true, confidence: 0.9 },
+    monthly_revenue: { source: 'SellerSprite CSV', sourceType: 'import',
+      sourceRecordId: 'market-import-snapshot', sourceRecordType: 'snapshot',
+      collectedAt: '2026-09-10T01:30:00.000Z', period: '30D', isEstimated: true, confidence: 0.8 },
   },
 };
 
@@ -146,6 +156,7 @@ function product(id: string, asin: string, sales: number | null, growth: number 
 }
 
 beforeEach(() => {
+  modeMock.value = 'demo';
   useApiMock.mockImplementation((path: string | null) => ({
     data: path?.startsWith('/api/markets/market-memory-foam/products')
       ? [product('product-a', 'B0A', 1000, 12), product('product-b', 'B0B', 800, null)]
@@ -165,6 +176,22 @@ afterEach(() => {
 });
 
 describe('MarketPage V2.1 hierarchy', () => {
+  it('shows imported market observations before Live activation, but keeps empty onboarding', () => {
+    modeMock.value = 'empty';
+    const view = render(<MemoryRouter initialEntries={['/market?market=market-memory-foam']}><MarketPage /></MemoryRouter>);
+    expect(screen.getByRole('heading', { name: '记忆棉枕市场' })).toBeInTheDocument();
+    expect(useApiMock).toHaveBeenCalledWith('/api/markets?marketplace=US', 0);
+
+    view.unmount();
+    useApiMock.mockImplementation((path: string | null) => ({
+      data: path?.startsWith('/api/markets?') ? [] : null,
+      error: null, loading: false, refreshing: false, reload: vi.fn(),
+    }));
+    render(<MemoryRouter initialEntries={['/market']}><MarketPage /></MemoryRouter>);
+    expect(screen.queryByRole('heading', { name: '记忆棉枕市场' })).not.toBeInTheDocument();
+    expect(screen.getByRole('heading', { name: '尚未接入真实数据' })).toBeInTheDocument();
+  });
+
   it('places charts before TOP100, then shows the AI conclusion before supporting metrics', () => {
     render(<MemoryRouter initialEntries={['/market?market=market-memory-foam']}><MarketPage /></MemoryRouter>);
 
@@ -174,6 +201,9 @@ describe('MarketPage V2.1 hierarchy', () => {
     const positions = expected.map((label) => labels.indexOf(label));
     expect(positions.every((position, index) => index === 0 || position > positions[index - 1])).toBe(true);
     expect(screen.getByText('Demo 数据')).toBeInTheDocument();
+    expect(screen.getByText('多来源指标')).toBeInTheDocument();
+    fireEvent.click(screen.getByText('逐项指标来源'));
+    expect(screen.getByText(/SellerSprite CSV · 快照 market-import-snapshot/)).toBeInTheDocument();
     expect(screen.getByText('产品数量')).toBeInTheDocument();
     expect(screen.queryByText('新品数量')).not.toBeInTheDocument();
 

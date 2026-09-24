@@ -16,8 +16,6 @@ import {
   Settings2,
   Shield,
   Sparkles,
-  Trash2,
-  Upload,
   UserRound,
   X,
 } from 'lucide-react';
@@ -28,12 +26,10 @@ import type {
   Product,
 } from '../../shared/types';
 import { ProductImage } from '../components/ProductImage';
+import RealDataControls from '../components/RealDataControls';
 import { useApp } from '../lib/AppContext';
-import { importFailureMessage, importSummary, type FileImportResult, type ImportSource } from '../lib/importResult';
 
 type SettingsTab = 'general' | 'products' | 'sources' | 'ai' | 'import';
-type ImportEntityType = 'auto' | 'product' | 'market' | 'review';
-
 interface OwnedProductForm {
   asin: string;
   sku: string;
@@ -157,13 +153,6 @@ export default function SettingsPage() {
   const [productForm, setProductForm] = useState<OwnedProductForm>(initialProductForm);
   const [batchRows, setBatchRows] = useState<BatchProductRow[]>([]);
   const [batchSaving, setBatchSaving] = useState(false);
-  const [selectedFile, setSelectedFile] = useState<File | null>(null);
-  const [importing, setImporting] = useState(false);
-  const [fileInputKey, setFileInputKey] = useState(0);
-  const [importSource, setImportSource] = useState<ImportSource>('import');
-  const [importEntityType, setImportEntityType] = useState<ImportEntityType>('auto');
-  const [importResearchJobId, setImportResearchJobId] = useState('');
-  const [importWarnings, setImportWarnings] = useState<string[]>([]);
 
   const loadSettings = useCallback(async () => {
     setLoading(true);
@@ -191,7 +180,6 @@ export default function SettingsPage() {
   useEffect(() => {
     setProducts([]);
     setSources([]);
-    setSelectedFile(null);
     setShowProductForm(false);
     void loadSettings();
   }, [appSettings.marketplace, loadSettings, refreshKey]);
@@ -317,17 +305,17 @@ export default function SettingsPage() {
     }
   }
 
-  async function removeProduct(product: Product) {
-    if (!window.confirm(`确认删除 ${product.internalName || product.sku || product.asin}？相关快照、竞品关系和监控记录也会删除，此操作不可撤销。`)) return;
+  async function deactivateProduct(product: Product) {
+    if (!window.confirm(`确认停用 ${product.internalName || product.sku || product.asin}？主档、历史 Snapshot、竞品关系和审计记录会保留，当前监控将关闭。`)) return;
     setDeletingProductId(product.id);
     setError(null);
     try {
-      await request<{ id: string; deleted: boolean }>(`/api/owned-products/${encodeURIComponent(product.id)}`, { method: 'DELETE' });
+      await request<{ id: string; deactivated: boolean }>(`/api/owned-products/${encodeURIComponent(product.id)}`, { method: 'DELETE' });
       setProducts((current) => current.filter((item) => item.id !== product.id));
       await reloadAppSettings();
-      setNotice(`已删除 ${product.internalName || product.sku || product.asin}。`);
+      setNotice(`已停用 ${product.internalName || product.sku || product.asin}，历史记录已保留。`);
     } catch (caught) {
-      setError(caught instanceof Error ? caught.message : '删除产品失败');
+      setError(caught instanceof Error ? caught.message : '停用产品失败');
     } finally {
       setDeletingProductId(null);
     }
@@ -374,55 +362,6 @@ export default function SettingsPage() {
     }
   }
 
-  async function importFile(event: FormEvent<HTMLFormElement>) {
-    event.preventDefault();
-    if (!selectedFile) return;
-    if (importEntityType === 'review' && !importResearchJobId.trim()) {
-      setError('评论导入必须填写目标 Research Job ID。');
-      return;
-    }
-    const extension = selectedFile.name.split('.').pop()?.toLocaleLowerCase();
-    if (extension !== 'csv' && extension !== 'xlsx' && extension !== 'xls') {
-      setError('请选择 CSV、XLSX 或 XLS 文件。');
-      return;
-    }
-    setImporting(true);
-    setError(null);
-    setImportWarnings([]);
-    try {
-      const formData = new FormData();
-      formData.append('file', selectedFile);
-      formData.append('sourceType', importSource);
-      formData.append('marketplace', appSettings.marketplace);
-      if (importEntityType !== 'auto') formData.append('entityType', importEntityType);
-      if (importEntityType === 'review') formData.append('researchJobId', importResearchJobId.trim());
-      const result = await request<FileImportResult>(extension === 'csv' ? '/api/import/csv' : '/api/import/xlsx', {
-        method: 'POST',
-        body: formData,
-      });
-      const failure = importFailureMessage(result);
-      if (failure) {
-        setError(failure);
-        setImportWarnings(result.errors);
-        return;
-      }
-      await reloadAppSettings();
-      if (result.failureCount > 0 || result.task.status === 'partial') {
-        setNotice(null);
-        setImportWarnings([importSummary(result), ...result.errors]);
-      } else {
-        setNotice(`${importSummary(result)} “${selectedFile.name}”的任务记录已保留。`);
-        setImportWarnings([]);
-      }
-      setSelectedFile(null);
-      setFileInputKey((current) => current + 1);
-    } catch (caught) {
-      setError(caught instanceof Error ? caught.message : '文件导入失败');
-    } finally {
-      setImporting(false);
-    }
-  }
-
   if (loading) {
     return <main className="page settings-page"><header className="page-header"><div><div className="eyebrow">系统管理</div><h1>设置</h1></div></header><div className="loading-state"><Loader2 className="spin" size={22} /> 正在加载系统设置…</div></main>;
   }
@@ -440,7 +379,6 @@ export default function SettingsPage() {
 
       {error && <div className="alert alert-error" role="alert">{error}<button type="button" onClick={() => void loadSettings()}>重新加载</button></div>}
       {notice && <div className="alert alert-success" role="status">{notice}</div>}
-      {importWarnings.length ? <div className="alert alert-warning" role="status"><span>{importWarnings.slice(0, 2).join('；')}</span><Link to="/data-tasks">查看数据任务</Link></div> : null}
       {isViewer && <div className="alert alert-info"><Shield size={17} />当前为 Viewer 权限预览：业务写操作已禁用，但可在基础设置中切回 Admin 退出预览。本版本不包含用户认证。</div>}
 
       <div className="settings-layout">
@@ -485,7 +423,7 @@ export default function SettingsPage() {
               {products.length === 0 ? (
                 <div className="empty-state compact"><PackagePlus size={27} /><h3>尚未录入自有 SKU</h3><p>使用批量向导初始化现有业务；每行独立保存，完成后再导入快照与设置竞品。</p><button className="button button-primary" type="button" disabled={isViewer} onClick={openBatchForm}><Plus size={16} />批量初始化自有 SKU</button></div>
               ) : (
-                <div className="data-table-wrap"><table className="data-table"><thead><tr><th>产品</th><th>ASIN / SKU</th><th>类型</th><th>Marketplace</th><th>市场节点</th><th>监控</th><th><span className="visually-hidden">管理</span></th></tr></thead><tbody>{products.map((product) => <tr key={product.id}><td><div className="product-cell"><ProductImage src={product.imageUrl} alt={product.title} size="sm" /><div><strong>{product.internalName || product.title}</strong><small>{product.brand}</small></div></div></td><td><span>{product.asin}</span><small>{product.sku || '未设置 SKU'}</small></td><td>{product.productType}</td><td>{product.marketplace}</td><td>{product.marketNodeId}</td><td><span className={`status-badge ${product.monitoringEnabled ? 'success' : 'neutral'}`}>{product.monitoringEnabled ? '已启用' : '未启用'}</span></td><td><div className="row-actions"><button className="icon-button" type="button" aria-label={`编辑 ${product.internalName || product.asin}`} title="编辑产品" disabled={isViewer || deletingProductId !== null} onClick={() => openProductEditor(product)}><Pencil size={15} /></button><button className="icon-button danger-text" type="button" aria-label={`删除 ${product.internalName || product.asin}`} title="删除产品" disabled={isViewer || deletingProductId !== null} onClick={() => void removeProduct(product)}>{deletingProductId === product.id ? <Loader2 className="spin" size={15} /> : <Trash2 size={15} />}</button></div></td></tr>)}</tbody></table></div>
+                <div className="data-table-wrap"><table className="data-table"><thead><tr><th>产品</th><th>ASIN / SKU</th><th>类型</th><th>Marketplace</th><th>市场节点</th><th>监控</th><th><span className="visually-hidden">管理</span></th></tr></thead><tbody>{products.map((product) => <tr key={product.id}><td><div className="product-cell"><ProductImage src={product.imageUrl} alt={product.title} size="sm" /><div><strong>{product.internalName || product.title}</strong><small>{product.brand}</small></div></div></td><td><span>{product.asin}</span><small>{product.sku || '未设置 SKU'}</small></td><td>{product.productType}</td><td>{product.marketplace}</td><td>{product.marketNodeId}</td><td><span className={`status-badge ${product.monitoringEnabled ? 'success' : 'neutral'}`}>{product.monitoringEnabled ? '已启用' : '未启用'}</span></td><td><div className="row-actions"><button className="icon-button" type="button" aria-label={`编辑 ${product.internalName || product.asin}`} title="编辑产品" disabled={isViewer || deletingProductId !== null} onClick={() => openProductEditor(product)}><Pencil size={15} /></button><button className="icon-button danger-text" type="button" aria-label={`停用 ${product.internalName || product.asin}`} title="停用产品并保留历史" disabled={isViewer || deletingProductId !== null} onClick={() => void deactivateProduct(product)}>{deletingProductId === product.id ? <Loader2 className="spin" size={15} /> : <CircleOff size={15} />}</button></div></td></tr>)}</tbody></table></div>
               )}
             </section>
           )}
@@ -498,6 +436,7 @@ export default function SettingsPage() {
               ) : (
                 <div className="source-grid grid grid-2">{sources.map((source) => <article className="panel source-card" key={source.id}><div className="source-card-heading"><div className="source-icon"><Database size={20} /></div><div><h3>{source.name}</h3><span>{source.type.toLocaleUpperCase()}</span></div><span className={`status-badge ${sourceTone(source.status)}`}>{sourceStatus(source.status)}</span></div><p>{source.description}</p><div className="source-footer"><span>最近同步</span><strong>{formatDate(source.lastSyncAt)}</strong></div></article>)}</div>
               )}
+              <RealDataControls isViewer={isViewer} marketId={draft.defaultMarketId} />
             </section>
           )}
 
@@ -514,22 +453,9 @@ export default function SettingsPage() {
           )}
 
           {tab === 'import' && (
-            <section className="panel settings-section">
-              <div className="panel-header"><div><span className="eyebrow">CSV / XLSX</span><h2>文件导入</h2><p>支持产品、市场快照和 Research Job 评论样本；第三方文件先经过来源 Adapter 再落库。</p></div><FileSpreadsheet size={22} /></div>
-              <form className="import-form" onSubmit={(event) => void importFile(event)}>
-                <div className="import-context">
-                  <label className="field"><span>文件来源</span><select className="input" value={importSource} disabled={isViewer || importing} onChange={(event) => setImportSource(event.target.value as ImportSource)}><option value="import">SellerSprite 报表</option><option value="amazon">Amazon 报表</option></select><small>来源会写入每条快照的证据链。</small></label>
-                  <label className="field"><span>归属站点</span><input className="input" value={`Amazon ${appSettings.marketplace}`} disabled readOnly /><small>未包含 Marketplace 列时使用顶部当前站点。</small></label>
-                  <label className="field"><span>数据类型</span><select className="input" value={importEntityType} disabled={isViewer || importing} onChange={(event) => setImportEntityType(event.target.value as ImportEntityType)}><option value="auto">自动识别</option><option value="product">产品快照</option><option value="market">市场快照</option><option value="review">评论样本</option></select><small>评论会追加到指定 Research Job，不覆盖历史样本。</small></label>
-                  {importEntityType === 'review' ? <label className="field"><span>Research Job ID</span><input className="input" required value={importResearchJobId} disabled={isViewer || importing} onChange={(event) => setImportResearchJobId(event.target.value)} placeholder="目标研究任务 ID" /><small>任务必须属于当前站点且尚未完成。</small></label> : null}
-                </div>
-                <label className={`file-drop ${selectedFile ? 'has-file' : ''}`}>
-                  <input key={fileInputKey} type="file" accept=".csv,.xlsx,.xls,text/csv,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,application/vnd.ms-excel" disabled={isViewer || importing} onChange={(event) => setSelectedFile(event.target.files?.[0] ?? null)} />
-                  {selectedFile ? <><FileSpreadsheet size={30} /><strong>{selectedFile.name}</strong><span>{(selectedFile.size / 1024).toFixed(1)} KB · 点击可更换文件</span></> : <><Upload size={30} /><strong>选择 CSV 或 XLSX 文件</strong><span>单个文件将作为独立数据任务处理</span></>}
-                </label>
-                <div className="import-notes"><h3>导入规则</h3><ul><li>产品与市场行必须包含完整快照必填字段；缺失字段时该行不会写入。</li><li>评论行至少包含 ReviewId、ProductId 和 ReviewText；Rating 与 Date 缺失时保留为空。</li><li>模板见 <code>examples/product-snapshots.csv</code>、<code>examples/market-snapshots.csv</code>、<code>examples/reviews.csv</code>。</li><li>来源、采集时间和失败原因会保留在证据链与数据任务中。</li></ul></div>
-                <div className="settings-actions"><button className="button button-primary" type="submit" disabled={isViewer || importing || !selectedFile || (importEntityType === 'review' && !importResearchJobId.trim())}>{importing ? <Loader2 className="spin" size={16} /> : <Upload size={16} />}{importing ? '正在上传' : '开始导入'}</button></div>
-              </form>
+            <section className="settings-section">
+              <div className="section-heading"><div><span className="eyebrow">CSV / XLSX</span><h2>文件导入</h2></div></div>
+              <Link className="button button-primary" to="/data-tasks"><FileSpreadsheet size={16} />前往导入审核</Link>
             </section>
           )}
         </div>

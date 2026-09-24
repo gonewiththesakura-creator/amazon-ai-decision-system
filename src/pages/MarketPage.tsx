@@ -69,6 +69,13 @@ const productTypeLabels: Record<string, string> = {
   orthopedic_pillow: '人体工学枕',
 };
 
+const marketMetricLabels: Record<string, string> = {
+  monthly_sales: '月销量', monthly_revenue: '月销售额', product_count: '产品数',
+  seller_count: '卖家数', brand_count: '品牌数', avg_price: '平均售价',
+  median_price: '中位售价', avg_rating: '平均 Rating', median_reviews: 'Review 中位数',
+  top10_share: 'TOP10 占比', top20_share: 'TOP20 占比', new_product_share: '新品占比',
+};
+
 function productTypeLabel(value: string): string {
   return productTypeLabels[value] ?? value.replaceAll('_', ' ');
 }
@@ -138,13 +145,13 @@ export default function MarketPage() {
   const previousMarketplace = useRef(settings.marketplace);
 
   const marketplaceQuery = encodeURIComponent(settings.marketplace);
-  const marketsQuery = useApi<MarketNode[]>(settings.mode === 'empty' ? null : `/api/markets?marketplace=${marketplaceQuery}`, refreshKey);
+  const marketsQuery = useApi<MarketNode[]>(`/api/markets?marketplace=${marketplaceQuery}`, refreshKey);
   const requestedMarket = searchParams.get('market');
   const selectedId = requestedMarket || settings.defaultMarketId || marketsQuery.data?.[0]?.id || '';
   const detailPath = selectedId ? `/api/markets/${encodeURIComponent(selectedId)}?range=${range}&marketplace=${marketplaceQuery}` : null;
-  const detailQuery = useApi<MarketDetail>(settings.mode === 'empty' ? null : detailPath, refreshKey);
+  const detailQuery = useApi<MarketDetail>(detailPath, refreshKey);
   const productsPath = selectedId ? `/api/markets/${encodeURIComponent(selectedId)}/products?marketplace=${marketplaceQuery}` : null;
-  const productsQuery = useApi<Product[]>(settings.mode === 'empty' ? null : productsPath, refreshKey);
+  const productsQuery = useApi<Product[]>(productsPath, refreshKey);
 
   useEffect(() => {
     if (!requestedMarket && selectedId) setSearchParams({ market: selectedId }, { replace: true });
@@ -188,7 +195,6 @@ export default function MarketPage() {
   }, [productSort, productsQuery.data]);
 
   if (settingsLoading) return <PageLoading label="正在检查市场数据源" />;
-  if (settings.mode === 'empty') return <Onboarding />;
   if ((marketsQuery.loading || detailQuery.loading) && !detailQuery.data) return <PageLoading label="正在读取市场历史快照" />;
   if ((marketsQuery.error || detailQuery.error) && !detailQuery.data) {
     return (
@@ -200,12 +206,15 @@ export default function MarketPage() {
     );
   }
   if (!marketsQuery.data?.length) {
+    if (settings.mode === 'empty') return <Onboarding />;
     return <EmptyState title="尚未建立市场" description="连接数据源或导入市场文件后，系统会自动生成可扩展的 MarketNode 市场树。" />;
   }
   if (!detailQuery.data) return null;
 
   const detail = detailQuery.data;
   const { kpis, node, provenance } = detail;
+  const metricSources = Object.entries(detail.metricProvenance ?? {});
+  const hasMixedSources = new Set(metricSources.map(([, source]) => source.sourceRecordId)).size > 1;
   const hasTrustedData = hasTrustedMarketData(detail);
   const hasGrowthBaseline = hasMarketGrowthBaseline(detail);
 
@@ -247,12 +256,20 @@ export default function MarketPage() {
       </section>
 
       {hasTrustedData ? <div className="source-strip">
-        <span><Database size={15} aria-hidden="true" />{provenance.source}</span>
+        <span><Database size={15} aria-hidden="true" />{kpis.monthlySales === null ? '最新观察' : '月销量来源'}：{provenance.source}</span>
         <span><Clock3 size={15} aria-hidden="true" />采集于 {formatDateTime(provenance.collectedAt)}</span>
         <span>周期 {provenance.period}</span>
         {settings.mode === 'demo' ? <Badge tone="warning">Demo 数据</Badge> : provenance.isEstimated ? <Badge tone="warning">估算数据</Badge> : <Badge tone="positive">原始数据</Badge>}
         <span>可信度 {formatConfidence(provenance.confidence)}</span>
+        {hasMixedSources ? <span>多来源指标</span> : null}
       </div> : <div className="source-strip source-strip--pending"><span><DatabaseZap size={15} aria-hidden="true" />尚无市场快照</span><Badge tone="warning">待补数据</Badge></div>}
+      {hasTrustedData && metricSources.length > 0 ? <details className="metric-source-details">
+        <summary>逐项指标来源</summary>
+        <dl>{metricSources.map(([metric, source]) => <div key={metric}>
+          <dt>{marketMetricLabels[metric] ?? metric}</dt>
+          <dd>{source.source} · {source.sourceRecordType === 'metric_fact' ? '事实' : '快照'} {source.sourceRecordId}</dd>
+        </div>)}</dl>
+      </details> : null}
 
       {!hasTrustedData ? (
         <>

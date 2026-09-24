@@ -1,7 +1,7 @@
 import { useEffect, useRef } from 'react';
 import { Link, useNavigate, useSearchParams } from 'react-router-dom';
-import { RefreshCw, Settings2, Store } from 'lucide-react';
-import type { ExecutiveDashboardViewModel, TimeRange } from '../../shared/types';
+import { DatabaseZap, RefreshCw, Settings2, Store } from 'lucide-react';
+import type { DataCoverageReport, ExecutiveDashboardViewModel, TimeRange } from '../../shared/types';
 import {
   CompetitorGrowthChart,
   DailyInsights,
@@ -16,7 +16,7 @@ import {
 } from '../components/dashboard';
 import { Onboarding } from '../components/Onboarding';
 import { ErrorState, PageLoading } from '../components/StateViews';
-import { useApi } from '../lib/api';
+import { ApiError, useApi } from '../lib/api';
 import { useApp } from '../lib/AppContext';
 import './dashboard-page.css';
 
@@ -33,10 +33,18 @@ export default function DashboardPage() {
   const previousMarketplace = useRef(settings.marketplace);
   const range = isTimeRange(searchParams.get('range')) ? searchParams.get('range') as TimeRange : '30D';
   const selectedSkuId = searchParams.get('sku');
+  const compareSkuIds = comparisonSkuIds(searchParams.get('compareSkuIds'));
   const marketplace = encodeURIComponent(settings.marketplace);
   const skuParam = selectedSkuId ? `&skuId=${encodeURIComponent(selectedSkuId)}` : '';
+  const comparisonParam = compareSkuIds.length
+    ? `&compareSkuIds=${encodeURIComponent(compareSkuIds.join(','))}`
+    : '';
   const query = useApi<ExecutiveDashboardViewModel>(
-    settings.mode === 'empty' ? null : `/api/dashboard/executive?marketplace=${marketplace}&range=${range}${skuParam}`,
+    `/api/dashboard/executive?marketplace=${marketplace}&range=${range}${skuParam}${comparisonParam}`,
+    refreshKey,
+  );
+  const coverageQuery = useApi<DataCoverageReport>(
+    `/api/data-coverage?marketplace=${marketplace}`,
     refreshKey,
   );
 
@@ -53,6 +61,20 @@ export default function DashboardPage() {
     setSearchParams(next, { replace: true });
   }, [query.data, searchParams, selectedSkuId, setSearchParams]);
 
+  useEffect(() => {
+    if (!compareSkuIds.length || !query.data || query.data.ownedSkuPerformance.length > 5) return;
+    const next = new URLSearchParams(searchParams);
+    next.delete('compareSkuIds');
+    setSearchParams(next, { replace: true });
+  }, [compareSkuIds.length, query.data, searchParams, setSearchParams]);
+
+  useEffect(() => {
+    if (!compareSkuIds.length || selectedSkuId || !(query.error instanceof ApiError) || query.error.status !== 404) return;
+    const next = new URLSearchParams(searchParams);
+    next.delete('compareSkuIds');
+    setSearchParams(next, { replace: true });
+  }, [compareSkuIds.length, query.error, searchParams, selectedSkuId, setSearchParams]);
+
   const updateParameter = (key: 'range' | 'sku', value: string | null) => {
     const next = new URLSearchParams(searchParams);
     if (value) next.set(key, value);
@@ -60,16 +82,29 @@ export default function DashboardPage() {
     setSearchParams(next, { replace: true });
   };
 
+  const updateComparisonSkuIds = (skuIds: string[]) => {
+    const next = new URLSearchParams(searchParams);
+    const value = comparisonSkuIds(skuIds.join(','));
+    if (value.length) next.set('compareSkuIds', value.join(','));
+    else next.delete('compareSkuIds');
+    setSearchParams(next, { replace: true });
+  };
+
   if (settingsLoading) return <PageLoading label="正在检查数据连接" />;
-  if (settings.mode === 'empty') return <Onboarding />;
   if (query.loading && !query.data) return <PageLoading label="正在读取经营快照" />;
   if (query.error && !query.data) {
     return <ErrorState error={query.error} onRetry={query.reload} lastSuccessfulSync={settings.lastSuccessfulSync} />;
   }
   if (!query.data) return null;
+  if (settings.mode === 'empty' && !query.data.market && query.data.ownedSkuPerformance.length === 0) {
+    return <Onboarding />;
+  }
 
   const data = query.data;
   const focus = data.skuFocus;
+  const displayedComparisonSkuIds = compareSkuIds.length
+    ? compareSkuIds
+    : data.comparisonSkuIds ?? [];
 
   return (
     <div className="page-stack executive-dashboard-page">
@@ -90,6 +125,16 @@ export default function DashboardPage() {
         </div>
         <div className="executive-dashboard-header__meta">
           <span><Store size={14} aria-hidden="true" />Amazon {data.marketplace}</span>
+          {coverageQuery.loading && !coverageQuery.data ? (
+            <span role="status" aria-label="正在检查数据覆盖">正在检查数据覆盖…</span>
+          ) : (
+            <button className={`executive-system-sync executive-coverage--${coverageSummary(coverageQuery.data)}`} type="button"
+              aria-label={`${coverageQuery.error && !coverageQuery.data ? '数据覆盖不可用' : coverageLabel(coverageSummary(coverageQuery.data))}，查看详情`}
+              title={coverageQuery.error?.message ?? undefined} onClick={() => navigate('/data-tasks')}>
+              <DatabaseZap size={14} aria-hidden="true" />
+              {coverageQuery.error && !coverageQuery.data ? '数据覆盖不可用' : coverageLabel(coverageSummary(coverageQuery.data))}
+            </button>
+          )}
           <div className="executive-segmented-control" aria-label="驾驶舱时间范围">
             {ranges.map((item) => (
               <button
@@ -145,6 +190,9 @@ export default function DashboardPage() {
               range={range}
               onRangeChange={(nextRange) => updateParameter('range', nextRange)}
               marketHref={data.market ? `/market?market=${encodeURIComponent(data.market.id)}` : undefined}
+              comparisonSkus={data.ownedSkuPerformance}
+              selectedComparisonSkuIds={displayedComparisonSkuIds}
+              onComparisonSkuIdsChange={updateComparisonSkuIds}
             />
             <MarketConcentrationDonut
               concentration={data.marketDistribution.concentration}
@@ -170,6 +218,24 @@ export default function DashboardPage() {
       )}
     </div>
   );
+}
+
+function comparisonSkuIds(value: string | null): string[] {
+  if (!value) return [];
+  return [...new Set(value.split(',').map((id) => id.trim()).filter(Boolean))].slice(0, 5);
+}
+
+function coverageSummary(report: DataCoverageReport | null): 'complete' | 'partial' | 'missing' {
+  if (!report) return 'missing';
+  const counters = [report.primaryMarket, report.activeOwnedProducts, report.coreCompetitors, report.history90d, report.amazonActual]
+    .filter((counter) => counter.status !== 'not_applicable');
+  if (counters.length > 0 && counters.every((counter) => counter.status === 'complete')) return 'complete';
+  if (counters.length === 0 || counters.every((counter) => counter.status === 'missing')) return 'missing';
+  return 'partial';
+}
+
+function coverageLabel(status: ReturnType<typeof coverageSummary>): string {
+  return { complete: '数据覆盖完整', partial: '数据部分覆盖', missing: '数据覆盖缺失' }[status];
 }
 
 function systemSyncLabel(status: ExecutiveDashboardViewModel['systemSyncStatus']['status']): string {

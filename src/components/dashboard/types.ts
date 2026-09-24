@@ -19,6 +19,7 @@ export interface SkuRelativePerformanceItem {
   name: string;
   relativeDelta: number | null;
   performance: 'strong_outperform' | 'outperform' | 'in_line' | 'underperform' | 'strong_underperform' | 'insufficient_data';
+  attention?: boolean;
 }
 
 export interface DistributionSlice {

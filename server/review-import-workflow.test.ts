@@ -4,6 +4,7 @@ import { afterEach, describe, expect, it } from 'vitest';
 import type { ResearchJobDetail, WorkflowEvidence } from '../shared/types.js';
 import { createApp } from './app.js';
 import { openDatabase, type AppDatabase } from './database/database.js';
+import { previewAndConfirmCsv } from './test-utils/import-api.js';
 
 let database: AppDatabase | undefined;
 
@@ -35,13 +36,9 @@ describe('review file import workflow', () => {
       'import-r-1,B0COMP0001,"Too firm and presses against my neck.",2,2026-09-09,US',
       'import-r-2,B0COMP0002,"Strong odor for several days.",,,US',
     ].join('\n');
-    const imported = await request(app).post('/api/import/csv')
-      .field('entityType', 'review')
-      .field('researchJobId', created.id)
-      .field('sourceType', 'amazon')
-      .field('marketplace', 'US')
-      .attach('file', Buffer.from(csv), 'reviews.csv')
-      .expect(201);
+    const imported = await previewAndConfirmCsv(app, csv, 'reviews.csv', {
+      entityType: 'review', researchJobId: created.id, sourceType: 'amazon', marketplace: 'US',
+    });
     expect(imported.body.data).toMatchObject({
       entityType: 'review', rowCount: 2, successCount: 2, failureCount: 0,
     });
@@ -77,12 +74,9 @@ describe('review file import workflow', () => {
       'ReviewId,ProductId,ReviewText,Marketplace',
       'cross-market-r-1,B0COMP0001,"Too firm",US',
     ].join('\n');
-    const result = await request(app).post('/api/import/csv')
-      .field('entityType', 'review')
-      .field('researchJobId', created.id)
-      .field('marketplace', 'CA')
-      .attach('file', Buffer.from(csv), 'reviews.csv')
-      .expect(201);
+    const result = await previewAndConfirmCsv(app, csv, 'reviews.csv', {
+      entityType: 'review', researchJobId: created.id, marketplace: 'CA',
+    });
     expect(result.body.data).toMatchObject({ successCount: 0, failureCount: 1 });
     expect(result.body.data.errors[0]).toMatch(/US 与当前工作区站点 CA 不一致/);
     expect(database.prepare('SELECT COUNT(*) AS count FROM reviews').get()).toMatchObject({ count: 0 });

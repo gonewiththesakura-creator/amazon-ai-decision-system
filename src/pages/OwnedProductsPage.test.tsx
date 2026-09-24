@@ -2,13 +2,14 @@
 
 import '@testing-library/jest-dom/vitest';
 import { StrictMode } from 'react';
-import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { createMemoryRouter, RouterProvider } from 'react-router-dom';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { Competitor, OwnedProductDetail, ProductSnapshot, Provenance } from '../../shared/types';
 import OwnedProductsPage from './OwnedProductsPage';
 
 const { useApiMock } = vi.hoisted(() => ({ useApiMock: vi.fn() }));
+const { getMock, postMock } = vi.hoisted(() => ({ getMock: vi.fn(), postMock: vi.fn() }));
 const scrollIntoViewMock = vi.fn();
 let reduceMotion = false;
 
@@ -27,7 +28,7 @@ vi.mock('../lib/AppContext', () => ({
 }));
 
 vi.mock('../lib/api', () => ({
-  api: { post: vi.fn(), patch: vi.fn(), delete: vi.fn() },
+  api: { get: getMock, post: postMock, patch: vi.fn(), delete: vi.fn() },
   useApi: useApiMock,
 }));
 
@@ -150,6 +151,8 @@ const detail: OwnedProductDetail = {
 };
 
 beforeEach(() => {
+  getMock.mockReset().mockResolvedValue([]);
+  postMock.mockReset().mockResolvedValue({ inserted: 1 });
   reduceMotion = false;
   scrollIntoViewMock.mockReset();
   Object.defineProperty(HTMLElement.prototype, 'scrollIntoView', {
@@ -245,5 +248,93 @@ describe('OwnedProductsPage competitor deep link', () => {
 
     await waitFor(() => expect(scrollIntoViewMock).toHaveBeenCalledOnce());
     expect(scrollIntoViewMock).toHaveBeenCalledWith({ behavior: 'auto', block: 'center', inline: 'nearest' });
+  });
+
+  it('syncs an already confirmed competitor from its row', async () => {
+    render(<RouterProvider router={createRouter('competitor-target')} />);
+    fireEvent.click(await screen.findByRole('button', { name: '同步竞品 B0TARGET01' }));
+    await waitFor(() => expect(postMock).toHaveBeenCalledWith(
+      '/api/integrations/sellersprite/sync/competitor',
+      { ownedProductId: 'owned-1', competitorProductId: 'competitor-target' },
+    ));
+  });
+});
+
+describe('OwnedProductsPage large portfolio selector', () => {
+  it('filters and paginates a 25-product portfolio without hiding the total', async () => {
+    const products = Array.from({ length: 25 }, (_, index) => {
+      const number = index + 1;
+      return {
+        ...detail,
+        id: `owned-${number}`,
+        asin: `B0OWNED${String(number).padStart(3, '0')}`,
+        sku: `SKU-${String(number).padStart(2, '0')}`,
+        internalName: `Portfolio SKU ${String(number).padStart(2, '0')}`,
+        title: `Portfolio Memory Foam Pillow ${String(number).padStart(2, '0')}`,
+        latest: snapshot(`owned-${number}`, 1_000 + number),
+        snapshots: [snapshot(`owned-${number}`, 1_000 + number)],
+      } satisfies OwnedProductDetail;
+    });
+    useApiMock.mockImplementation((path: string | null) => {
+      const match = path?.match(/^\/api\/owned-products\/([^?]+)/);
+      const selected = match ? products.find((product) => product.id === decodeURIComponent(match[1])) : null;
+      return {
+        data: selected ?? products,
+        error: null,
+        loading: false,
+        refreshing: false,
+        reload: vi.fn(),
+      };
+    });
+    const router = createMemoryRouter([
+      { path: '/owned-products/:productId', element: <OwnedProductsPage /> },
+    ], { initialEntries: ['/owned-products/owned-1'] });
+    render(<RouterProvider router={router} />);
+
+    expect(screen.getByText('25 个产品')).toBeInTheDocument();
+    const selector = screen.getByRole('navigation', { name: '选择自有 SKU' });
+    expect(within(selector).getAllByRole('link')).toHaveLength(12);
+    expect(within(selector).getByText('Portfolio SKU 01')).toBeInTheDocument();
+    expect(within(selector).queryByText('Portfolio SKU 13')).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: '下一页' }));
+    expect(within(selector).getByText('Portfolio SKU 13')).toBeInTheDocument();
+    expect(within(selector).queryByText('Portfolio SKU 01')).not.toBeInTheDocument();
+
+    fireEvent.change(screen.getByRole('searchbox', { name: '搜索自有 SKU' }), {
+      target: { value: 'SKU 25' },
+    });
+    expect(within(selector).getAllByRole('link')).toHaveLength(1);
+    expect(within(selector).getByText('Portfolio SKU 25')).toBeInTheDocument();
+    expect(screen.getByText('显示 1 / 25')).toBeInTheDocument();
+  });
+
+  it('keeps a deep-linked product on its page and exposes current selection and pagination semantics', async () => {
+    const products = Array.from({ length: 25 }, (_, index) => ({
+      ...detail,
+      id: `owned-${index + 1}`,
+      sku: `SKU-${String(index + 1).padStart(2, '0')}`,
+      internalName: `Portfolio SKU ${String(index + 1).padStart(2, '0')}`,
+      latest: snapshot(`owned-${index + 1}`, 1_000 + index),
+    } satisfies OwnedProductDetail));
+    useApiMock.mockImplementation((path: string | null) => {
+      const match = path?.match(/^\/api\/owned-products\/([^?]+)/);
+      return {
+        data: match ? products.find((product) => product.id === decodeURIComponent(match[1])) : products,
+        error: null, loading: false, refreshing: false, reload: vi.fn(),
+      };
+    });
+    const router = createMemoryRouter([
+      { path: '/owned-products/:productId', element: <OwnedProductsPage /> },
+    ], { initialEntries: ['/owned-products/owned-25'] });
+    render(<RouterProvider router={router} />);
+
+    const selector = await screen.findByRole('navigation', { name: '选择自有 SKU' });
+    const selected = within(selector).getByRole('link', { name: /Portfolio SKU 25/ });
+    expect(selected).toHaveAttribute('aria-current', 'page');
+    selected.focus();
+    expect(selected).toHaveFocus();
+    expect(screen.getByRole('status', { name: '自有 SKU 分页状态' })).toHaveTextContent('3 / 3');
+    expect(screen.getByRole('navigation', { name: '自有 SKU 分页' })).toBeInTheDocument();
   });
 });

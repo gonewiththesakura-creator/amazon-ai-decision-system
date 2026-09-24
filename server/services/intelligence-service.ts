@@ -20,7 +20,7 @@ import type {
   ScoreBreakdown,
   WatchlistItem,
 } from '../../shared/types.js';
-import { AdapterRegistry, DataSourceRouter } from '../adapters/index.js';
+import { AdapterRegistry, DataSourceRouter, SellerSpriteMCPAdapter } from '../adapters/index.js';
 import type {
   MarketDataAdapter,
   MarketOverviewRecord,
@@ -69,6 +69,16 @@ export interface DevelopmentInput {
   supplyChainRelation?: string;
   marketNodeId?: string;
   sourceOpportunityId?: string;
+}
+
+const RUN_MANAGED_TASK_TYPES = new Set(['critical_sync', 'competitor_discovery']);
+
+function isRunManagedTask(task: Pick<DataTask, 'syncRunId' | 'taskType'>): boolean {
+  return task.syncRunId !== null || RUN_MANAGED_TASK_TYPES.has(task.taskType);
+}
+
+function runManagedTaskError(): Error {
+  return new Error('请在设置 -> 数据源中重新运行 SellerSprite 关键同步；运行级任务不能通过通用数据任务接口执行或重试。');
 }
 
 export class IntelligenceService {
@@ -159,9 +169,6 @@ export class IntelligenceService {
         JSON.stringify(input.keywords ?? []), input.monitoringEnabled ? 1 : 0,
         settings.mode === 'demo' ? 'mock' : 'import', now,
       );
-      if (settings.mode === 'empty') {
-        this.database.prepare(`UPDATE app_settings SET mode = 'live' WHERE id = 1`).run();
-      }
       if (input.monitoringEnabled) {
         this.addWatchlist({
           itemType: 'owned_product', itemId: id,
@@ -220,29 +227,19 @@ export class IntelligenceService {
     });
   }
 
-  deleteOwnedProduct(id: string): boolean {
+  deactivateOwnedProduct(id: string): boolean {
     if (!this.repository.getOwnedProduct(id)) throw new Error('自有产品不存在。');
     const marketplace = this.repository.getSettings().marketplace;
-    const snapshotCount = this.database.prepare(`
-      SELECT COUNT(*) AS count FROM product_snapshots WHERE product_id = ?
-    `).get(id) as { count: number };
-    if (Number(snapshotCount.count) > 0) {
-      throw new Error('该 SKU 存在历史 Snapshot，不能删除；可关闭监控并保留审计记录。');
-    }
     return transaction(this.database, () => {
       this.database.prepare(`
         DELETE FROM watchlist_items WHERE marketplace = ? AND item_type = 'owned_product' AND item_id = ?
       `).run(marketplace, id);
-      this.database.prepare(`
-        DELETE FROM ai_insights WHERE entity_type = 'owned_product' AND entity_id = ?
-      `).run(id);
-      this.database.prepare(`
-        DELETE FROM decisions WHERE entity_type = 'owned_product' AND entity_id = ?
-      `).run(id);
-      const deleted = this.database.prepare(`
-        DELETE FROM products WHERE id = ? AND is_owned = 1 AND marketplace = ?
-      `).run(id, marketplace);
-      return Number(deleted.changes) > 0;
+      const deactivated = this.database.prepare(`
+        UPDATE products
+        SET status = 'inactive', monitoring_enabled = 0, updated_at = ?
+        WHERE id = ? AND is_owned = 1 AND marketplace = ? AND status = 'active'
+      `).run(new Date().toISOString(), id, marketplace);
+      return Number(deactivated.changes) > 0;
     });
   }
 
@@ -621,9 +618,6 @@ export class IntelligenceService {
         id, query, summary, JSON.stringify(nodes), JSON.stringify(combinations),
         JSON.stringify(opportunityIds), nodes.length, now,
       );
-      if (settings.mode === 'empty') {
-        this.database.prepare(`UPDATE app_settings SET mode = 'live' WHERE id = 1`).run();
-      }
     });
     for (const opportunityId of opportunityIds) {
       const created = this.repository.getOpportunity(opportunityId);
@@ -820,12 +814,23 @@ export class IntelligenceService {
       if (previous.marketplace !== activeMarketplace) {
         throw new Error(`原任务属于 ${previous.marketplace} 站点，请切换到该站点后重试。`);
       }
+      if (previous.researchJobId) {
+        throw new Error(`该数据任务由 Research Job ${previous.researchJobId} 工作流管理；请在 Research Job 页面补数或重试，不能通过通用数据任务接口重试。`);
+      }
       if (previous.taskType === 'file_import') {
         throw new Error('文件导入任务不能无文件重试，请重新上传原 CSV/XLSX 文件。');
       }
+      if (previous.taskType === 'post_import_analysis') {
+        throw new Error('导入后分析需要按原批次单独复核，不能通过通用数据任务接口重试。');
+      }
+      if (isRunManagedTask(previous)) throw runManagedTaskError();
       taskType = previous.taskType;
       target = previous.target;
       sourcePreference = previous.sourceId ?? previous.source;
+    }
+    if (RUN_MANAGED_TASK_TYPES.has(taskType)) throw runManagedTaskError();
+    if (taskType === 'post_import_analysis') {
+      throw new Error('导入后分析需要按原批次单独复核，不能通过通用数据任务接口运行。');
     }
     let watchItem: WatchlistItem | undefined;
     if (input.watchlistId) {
@@ -861,6 +866,9 @@ export class IntelligenceService {
     try {
       if (routeError) throw routeError;
       if (!adapter) throw new Error('当前任务没有可用真实数据源，请先配置数据源。');
+      if (adapter.id === 'source-sellersprite-mcp') {
+        throw new Error('SellerSprite MCP 不支持旧版刷新；请通过设置 -> 数据源中的 V2.2 关键同步调用计划或专用同步运行。请检查 SELLERSPRITE_MCP_URL 配置。');
+      }
       const refreshed = await this.refreshTarget(taskType, target, input.watchlistId, adapter);
       const completedAt = new Date().toISOString();
       this.database.prepare(`
@@ -910,9 +918,21 @@ export class IntelligenceService {
       },
       suggestedQuestions: ['今天有什么值得关注？', '哪个 SKU 最近最差？', '腰靠值得开发吗？'],
     };
-    if (settings.mode === 'empty') return empty;
+    if (settings.mode === 'empty') {
+      const staged = this.database.prepare(`
+        SELECT EXISTS(
+          SELECT 1 FROM products
+          WHERE marketplace = ? AND is_owned = 1 AND source_type <> 'mock'
+          UNION ALL
+          SELECT 1 FROM market_snapshots snapshot
+          JOIN market_nodes market ON market.id = snapshot.market_node_id
+          WHERE market.marketplace = ? AND snapshot.source_type <> 'mock'
+        ) AS available
+      `).get(settings.marketplace, settings.marketplace) as { available: number };
+      if (!staged.available) return empty;
+    }
     const market = settings.defaultMarketId ? this.repository.getMarket(settings.defaultMarketId) : null;
-    const owned = this.repository.getOwnedProducts();
+    const owned = this.repository.getSellableOwnedProducts();
     const comparableOwned = owned.filter((item) => item.relativePerformanceAvailable);
     const formallyAnalyzedOwned = comparableOwned.filter((item) => isFormalWorkflowInsight(item.insight));
     const projects = this.repository.getDevelopmentProjects();
@@ -1191,7 +1211,8 @@ export class IntelligenceService {
     if (normalizedTaskType === 'file_import') return 'file_import';
     if (this.repository.getMarket(target)) return 'market';
     const product = this.database.prepare(`
-      SELECT is_owned FROM products WHERE id = ? AND marketplace = ?
+      SELECT is_owned FROM products
+      WHERE id = ? AND marketplace = ? AND (is_owned = 0 OR status = 'active')
     `).get(target, this.repository.getSettings().marketplace) as { is_owned: number } | undefined;
     if (product) return product.is_owned === 1 ? 'owned_product' : 'competitor';
     return undefined;
@@ -1216,6 +1237,9 @@ export class IntelligenceService {
       throw new Error('评论刷新持久化尚未实现，任务已安全终止且未写入任何数据。');
     }
     if (normalizedTaskType === 'dashboard_core_refresh') {
+      if (adapter instanceof SellerSpriteMCPAdapter) {
+        throw new Error('V2.2 SellerSprite MCP 不支持旧版刷新任务；请使用真实数据工作台的关键数据同步。');
+      }
       refreshed = await this.refreshDashboardCore(adapter);
     } else if (watchItem) {
       if (watchItem.itemType === 'market') {
@@ -1223,7 +1247,8 @@ export class IntelligenceService {
         refreshed = await this.appendMarketSnapshot(watchItem.itemId, adapter);
       } else if (['owned_product', 'competitor'].includes(watchItem.itemType)) {
         const product = this.database.prepare(`
-          SELECT id FROM products WHERE id = ? AND marketplace = ?
+          SELECT id FROM products
+          WHERE id = ? AND marketplace = ? AND (is_owned = 0 OR status = 'active')
         `).get(watchItem.itemId, this.repository.getSettings().marketplace);
         if (!product) throw new Error('监控产品不存在于当前站点。');
         refreshed = await this.appendProductSnapshot(watchItem.itemId, adapter);
@@ -1260,7 +1285,7 @@ export class IntelligenceService {
       ['owned_sku_refresh', 'product_refresh'].includes(normalizedTaskType)
       && (target === '' || target === 'all' || target === 'owned-products')
     ) {
-      for (const owned of this.repository.getOwnedProducts()) {
+      for (const owned of this.repository.getSellableOwnedProducts()) {
         refreshed += await this.appendProductSnapshot(owned.id, adapter);
       }
     } else if (
@@ -1273,7 +1298,10 @@ export class IntelligenceService {
         JOIN products owned ON owned.id = relation.owned_product_id
         JOIN products competitor ON competitor.id = relation.competitor_product_id
         WHERE relation.relation_type = 'direct'
-          AND owned.marketplace = ? AND competitor.marketplace = ?
+          AND owned.marketplace = ? AND owned.is_owned = 1 AND owned.is_parent = 0
+          AND owned.status = 'active' AND competitor.marketplace = ?
+          AND competitor.is_owned = 0 AND competitor.is_parent = 0
+          AND competitor.status = 'active'
       `).all(
         this.repository.getSettings().marketplace,
         this.repository.getSettings().marketplace,
@@ -1285,7 +1313,8 @@ export class IntelligenceService {
       refreshed = await this.appendMarketSnapshot(target, adapter);
     } else {
       const product = this.database.prepare(`
-        SELECT id FROM products WHERE id = ? AND marketplace = ?
+        SELECT id FROM products
+        WHERE id = ? AND marketplace = ? AND (is_owned = 0 OR status = 'active')
       `).get(target, this.repository.getSettings().marketplace);
       if (product) refreshed += await this.appendProductSnapshot(target, adapter);
       else if (target === 'owned-products' || target === 'all') {
@@ -1293,7 +1322,7 @@ export class IntelligenceService {
           const defaultMarketId = this.repository.getSettings().defaultMarketId;
           if (defaultMarketId) refreshed += await this.appendMarketSnapshot(defaultMarketId, adapter);
         }
-        for (const owned of this.repository.getOwnedProducts()) {
+        for (const owned of this.repository.getSellableOwnedProducts()) {
           refreshed += await this.appendProductSnapshot(owned.id, adapter);
         }
       } else {
@@ -1341,14 +1370,18 @@ export class IntelligenceService {
       ? await this.prepareMarketSnapshot(settings.defaultMarketId, adapter)
       : null;
     const productIds = this.database.prepare(`
-      SELECT id FROM products WHERE is_owned = 1 AND marketplace = ?
+      SELECT id FROM products
+      WHERE is_owned = 1 AND is_parent = 0 AND status = 'active' AND marketplace = ?
       UNION
       SELECT relation.competitor_product_id AS id
       FROM competitor_relations relation
       JOIN products owned ON owned.id = relation.owned_product_id
       JOIN products competitor ON competitor.id = relation.competitor_product_id
       WHERE relation.relation_type = 'direct'
-        AND owned.marketplace = ? AND competitor.marketplace = ?
+        AND owned.marketplace = ? AND owned.is_owned = 1 AND owned.is_parent = 0
+        AND owned.status = 'active' AND competitor.marketplace = ?
+        AND competitor.is_owned = 0 AND competitor.is_parent = 0
+        AND competitor.status = 'active'
       ORDER BY id
     `).all(settings.marketplace, settings.marketplace, settings.marketplace) as Array<{ id: string }>;
     const products: PreparedProductSnapshot[] = [];
@@ -1407,7 +1440,8 @@ export class IntelligenceService {
   ): Promise<PreparedProductSnapshot | null> {
     const product = this.database.prepare(`
       SELECT asin, marketplace, is_owned AS isOwned
-      FROM products WHERE id = ? AND marketplace = ?
+      FROM products
+      WHERE id = ? AND marketplace = ? AND (is_owned = 0 OR status = 'active')
     `).get(productId, this.repository.getSettings().marketplace) as LocalProductIdentity | undefined;
     if (!product) return null;
     const detail = await adapter.fetchProductDetail({
@@ -1432,8 +1466,8 @@ export class IntelligenceService {
         id, market_node_id, date, product_count, seller_count, brand_count, monthly_sales,
         monthly_revenue, avg_price, median_price, avg_rating, median_reviews, top10_share,
         top20_share, new_product_share, price_bands_json, concentration_json, source,
-        source_type, collected_at, period, is_estimated, confidence
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        source_type, collected_at, period, is_estimated, confidence, observation_date, dedup_key
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).run(
       randomUUID(), marketId, collectedAt.slice(0, 10), overview.productCount, overview.sellerCount,
       overview.brandCount, overview.monthlySales, overview.monthlyRevenue, overview.avgPrice,
@@ -1443,13 +1477,16 @@ export class IntelligenceService {
       overview.provenance.source, overview.provenance.sourceType, collectedAt,
       overview.provenance.period, overview.provenance.isEstimated ? 1 : 0,
       overview.provenance.confidence,
+      collectedAt.slice(0, 10), `market|${this.repository.getSettings().marketplace}|${marketId}|${collectedAt.slice(0, 10)}|${overview.provenance.sourceType.trim().toLowerCase()}|${overview.provenance.source.trim().toLowerCase()}|${overview.provenance.period}`,
     );
   }
 
   private analyzeMarketSnapshot(marketId: string): void {
     this.ai.analyze({ entityType: 'market', entityId: marketId });
     const ownedRows = this.database.prepare(`
-      SELECT id FROM products WHERE is_owned = 1 AND market_node_id = ? AND marketplace = ?
+      SELECT id FROM products
+      WHERE is_owned = 1 AND is_parent = 0 AND status = 'active'
+        AND market_node_id = ? AND marketplace = ?
     `).all(marketId, this.repository.getSettings().marketplace) as Array<{ id: string }>;
     ownedRows.forEach((row) => this.ai.analyze({ entityType: 'owned_product', entityId: row.id }));
     const projectRows = this.database.prepare(`
@@ -1467,8 +1504,8 @@ export class IntelligenceService {
       INSERT INTO product_snapshots (
         id, product_id, date, price, rating, review_count, bsr, estimated_sales,
         estimated_revenue, seller_count, growth_7d, growth_30d, growth_90d,
-        source, source_type, collected_at, period, is_estimated, confidence
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        source, source_type, collected_at, period, is_estimated, confidence, observation_date, dedup_key
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).run(
       randomUUID(), productId, snapshot.date, snapshot.price, snapshot.rating,
       snapshot.reviewCount, snapshot.bsr, snapshot.estimatedSales,
@@ -1476,6 +1513,7 @@ export class IntelligenceService {
       snapshot.growth30d, snapshot.growth90d, provenance.source, provenance.sourceType,
       provenance.collectedAt, provenance.period, provenance.isEstimated ? 1 : 0,
       provenance.confidence,
+      snapshot.date, `product|${this.repository.getSettings().marketplace}|${productId}|${snapshot.date}|${provenance.sourceType.trim().toLowerCase()}|${provenance.source.trim().toLowerCase()}|${provenance.period}`,
     );
   }
 
@@ -1488,6 +1526,7 @@ export class IntelligenceService {
         FROM competitor_relations relation
         JOIN products owned ON owned.id = relation.owned_product_id
         WHERE relation.competitor_product_id = ? AND owned.marketplace = ?
+          AND owned.is_owned = 1 AND owned.is_parent = 0 AND owned.status = 'active'
       `).all(productId, this.repository.getSettings().marketplace) as Array<{ id: string }>;
       owners.forEach((owner) => this.ai.analyze({ entityType: 'owned_product', entityId: owner.id }));
     }

@@ -10,7 +10,7 @@ import {
   XAxis,
   YAxis,
 } from 'recharts';
-import type { IndexedTrendExcludedSeries } from '../../../shared/types';
+import type { ExecutiveSkuPerformance, IndexedTrendExcludedSeries } from '../../../shared/types';
 import { ChartCard } from './ChartCard';
 import { ChartEmptyState } from './ChartEmptyState';
 import { formatDashboardDate, indexedTrendDomain } from './format';
@@ -29,6 +29,9 @@ export interface MarketSkuTrendChartProps {
   title?: string;
   description?: string;
   marketHref?: string;
+  comparisonSkus?: Array<Pick<ExecutiveSkuPerformance, 'id' | 'name'>>;
+  selectedComparisonSkuIds?: string[];
+  onComparisonSkuIdsChange?: (skuIds: string[]) => void;
 }
 
 type ChartTrendRow = Record<string, string | number | null> & { date: string };
@@ -88,6 +91,9 @@ export function MarketSkuTrendChart({
   title = '市场 VS 自有 SKU 趋势',
   description = '所有参与序列使用同一有效日期作为 100 基准，比较走势而非绝对体量。',
   marketHref,
+  comparisonSkus,
+  selectedComparisonSkuIds = [],
+  onComparisonSkuIdsChange,
 }: MarketSkuTrendChartProps) {
   const [internalRange, setInternalRange] = useState<DashboardRange>('30D');
   const activeRange = range ?? internalRange;
@@ -133,6 +139,34 @@ export function MarketSkuTrendChart({
     </div>
   );
 
+  const comparisonControl = comparisonSkus && comparisonSkus.length > 5 && onComparisonSkuIdsChange ? (
+    <details className="dashboard-trend-comparison-selector">
+      <summary>选择对比产品 {selectedComparisonSkuIds.length}/5</summary>
+      <div className="dashboard-trend-comparison-selector__options">
+        {comparisonSkus.map((sku) => {
+          const checked = selectedComparisonSkuIds.includes(sku.id);
+          const disabled = !checked && selectedComparisonSkuIds.length >= 5;
+          return (
+            <label key={sku.id}>
+              <input
+                type="checkbox"
+                checked={checked}
+                disabled={disabled}
+                onChange={() => onComparisonSkuIdsChange(
+                  checked
+                    ? selectedComparisonSkuIds.filter((id) => id !== sku.id)
+                    : [...selectedComparisonSkuIds, sku.id],
+                )}
+              />
+              {sku.name}
+            </label>
+          );
+        })}
+      </div>
+      {selectedComparisonSkuIds.length >= 5 ? <small>最多选择 5 个产品</small> : null}
+    </details>
+  ) : null;
+
   return (
     <ChartCard
       className="dashboard-chart-card--trend"
@@ -142,6 +176,7 @@ export function MarketSkuTrendChart({
       action={rangeControl}
       footer={footer}
     >
+      {comparisonControl}
       {canCompare ? (
         <>
           <div className="dashboard-chart-legend" aria-hidden="true">

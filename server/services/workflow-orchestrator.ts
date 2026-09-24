@@ -1,7 +1,9 @@
 import type {
   DecisionRecord,
+  MetricProvenance,
   NormalizedField,
   PerformanceLevel,
+  ProductSnapshot,
   ReviewInsight,
   ResearchJobDetail,
   ResearchStepType,
@@ -15,6 +17,8 @@ import { assessReverseReview } from '../domain/reverse-review-engine.js';
 import { executeProductRules, type ProductRuleResult } from '../domain/workflow-rule-engine.js';
 import { IntelligenceRepository } from '../repository/intelligence-repository.js';
 import { WorkflowRepository } from '../repository/workflow-repository.js';
+import { MetricAuthorityResolver, type MetricFact } from './metric-authority-resolver.js';
+import { isLiveObservationReadable } from './live-observation-readability.js';
 
 export interface RetryResearchJobRequest {
   resolvedData: Record<string, unknown>;
@@ -58,11 +62,13 @@ const OWNED_PRODUCT_DIAGNOSTIC_GAPS = [
 export class WorkflowOrchestrator {
   readonly repository: WorkflowRepository;
   private readonly intelligence: IntelligenceRepository;
+  private readonly authority: MetricAuthorityResolver;
   private readonly manualInput = new ManualInputAdapter();
 
   constructor(private readonly database: AppDatabase) {
     this.repository = new WorkflowRepository(database);
     this.intelligence = new IntelligenceRepository(database);
+    this.authority = new MetricAuthorityResolver(database);
   }
 
   run(jobId: string, inputPatch: Record<string, unknown> = {}): ResearchJobDetail {
@@ -421,7 +427,7 @@ export class WorkflowOrchestrator {
       current, collected, field, `${field} 来自当前工作流的可追溯数据与确定性计算。`,
     ));
     if (job.type === 'owned_product') {
-      evidence.push(this.createDerivedEvidence(current, collected, {
+      evidence.push(this.createDerivedEvidence(current, collected, evidence, {
         claim: 'SKU 相对市场表现由两个 30D 增长率相减得到。',
         metricName: 'relative_delta',
         metricValue: output.relative_delta,
@@ -661,21 +667,26 @@ export class WorkflowOrchestrator {
   private createDerivedEvidence(
     job: ResearchJobDetail,
     collected: CollectedWorkflowData,
+    components: WorkflowEvidence[],
     input: Pick<WorkflowEvidence, 'claim' | 'metricName' | 'metricValue' | 'calculation'>,
   ): WorkflowEvidence {
-    const source = collected.sources.sku_growth_30d
-      ?? collected.sources.market_growth_30d
-      ?? Object.values(collected.sources)[0]
-      ?? unknownSource(job);
+    const sources = [collected.sources.sku_growth_30d, collected.sources.market_growth_30d]
+      .filter((source): source is FieldSource => Boolean(source));
+    const componentEvidence = components.filter((item) => (
+      item.metricName === 'sku_growth_30d' || item.metricName === 'market_growth_30d'
+    ));
     return this.repository.createEvidence(job.id, {
       ...input,
-      source: source.source,
-      sourceType: source.sourceType,
-      sourceRecordId: source.sourceRecordId,
-      collectedAt: source.collectedAt,
+      source: 'Deterministic calculation from component Evidence',
+      sourceType: 'manual',
+      collectedAt: sources.map((source) => source.collectedAt).sort().at(-1) ?? new Date().toISOString(),
       period: '30D',
-      isEstimated: source.isEstimated,
-      confidence: source.confidence,
+      isEstimated: sources.some((source) => source.isEstimated),
+      calculation: `${input.calculation}; component sources: ${componentEvidence.map((item) => (
+        `${item.metricName}=${item.sourceType}:${item.sourceRecordId ?? 'unrecorded'}`
+          + `${item.syncRunId ? ` (run ${item.syncRunId})` : ''}`
+      )).join(', ')}`,
+      confidence: sources.length > 0 ? Math.min(...sources.map((source) => source.confidence)) : 0,
       dataVersion: job.dataVersion,
     });
   }
@@ -868,48 +879,71 @@ export class WorkflowOrchestrator {
     });
   }
 
-  private collectMarket(job: ResearchJobDetail): CollectedWorkflowData {
+  private collectMarket(job: ResearchJobDetail): CollectedWorkflowData & { growthPair?: SnapshotGrowthPair } {
     const marketId = requiredEntityId(job);
-    const rows = this.database.prepare(`
+    const allRows = this.database.prepare(`
       SELECT snapshot.* FROM market_snapshots snapshot
       JOIN market_nodes node ON node.id = snapshot.market_node_id
       WHERE snapshot.market_node_id = ? AND node.marketplace = ?
-      ORDER BY snapshot.date DESC, snapshot.collected_at DESC
-    `).all(marketId, job.marketplace) as SnapshotRow[];
-    const latest = rows[0];
-    if (!latest) return emptyCollected();
-    const growth = deriveSnapshotGrowth(rows.map((row) => ({
-      id: text(row.id), date: text(row.date), value: numericValue(row.monthly_sales),
-    })));
-    const baseline = growth
-      ? rows.find((row) => text(row.id) === growth.baseline.id)
-      : undefined;
-    const source = sourceFromSnapshot(latest);
-    const baselineSource = baseline ? sourceFromSnapshot(baseline) : source;
-    const comparisonSource: FieldSource = {
-      ...source,
-      source: unique([source.source, baselineSource.source]).join(' + '),
-      period: '30D',
-      isEstimated: source.isEstimated || baselineSource.isEstimated,
-      confidence: Math.min(source.confidence, baselineSource.confidence),
+        AND (? = 1 OR snapshot.source_type <> 'mock')
+      ORDER BY COALESCE(snapshot.observation_date, snapshot.date) DESC, snapshot.collected_at DESC
+    `).all(marketId, job.marketplace, job.isDemo ? 1 : 0) as SnapshotRow[];
+    const rows = job.isDemo ? allRows : allRows.filter((row) => isLiveObservationReadable(
+      this.database, 'market', text(row.id), text(row.source_type),
+      row.sync_run_id === null ? null : text(row.sync_run_id),
+    ));
+    if (rows.length === 0) return emptyCollected();
+    const dates = unique(rows.map((row) => text(row.observation_date) || text(row.date)));
+    const resolve = (date: string, metric: string): MetricFact | null => {
+      const resolution = this.authority.resolveMetric({
+        entityType: 'market', entityId: marketId, observationDate: date, metric,
+      });
+      return [resolution.selected, ...resolution.alternatives].find((fact) => (
+        fact !== null && (job.isDemo || fact.sourceType !== 'mock')
+      )) ?? null;
     };
+    const representative = (date: string, fact: MetricFact | null): SnapshotRow => {
+      const candidates = rows.filter((row) => (text(row.observation_date) || text(row.date)) === date);
+      return candidates.find((row) => text(row.id) === fact?.id)
+        ?? candidates.find((row) => row.source_type === fact?.sourceType && row.source === fact.source)
+        ?? candidates[0];
+    };
+    const metricSource = (date: string, fact: MetricFact): FieldSource => (
+      sourceFromMetricFact(fact, text(representative(date, fact).period))
+    );
+    const salesHistory = dates.map((date) => {
+      const fact = resolve(date, 'monthly_sales');
+      return { id: fact?.id ?? `missing:${date}`, date, value: fact?.value ?? null,
+        source: fact ? metricSource(date, fact) : null };
+    });
+    const rawGrowth = comparableSnapshotGrowth(salesHistory);
+    const growthSources = rawGrowth ? [rawGrowth.latest, rawGrowth.baseline].map((point) => (
+      salesHistory.find((item) => item.id === point.id)?.source ?? null
+    )) : [];
+    const growth = rawGrowth && this.hasOneCompleteMcpRun(growthSources, job.marketplace)
+      ? rawGrowth : null;
+    const latestDate = dates[0];
+    const currentSales = salesHistory[0];
+    const baselineSales = growth ? salesHistory.find((point) => point.date === growth.baseline.date) : undefined;
+    const latest = representative(latestDate, resolve(latestDate, 'monthly_sales'));
+    const baseline = baselineSales ? representative(baselineSales.date, resolve(baselineSales.date, 'monthly_sales')) : undefined;
+    const source = currentSales.source ?? sourceFromSnapshot(latest);
     const currentPriceBands = marketPriceBands(latest.price_bands_json);
     const baselinePriceBands = marketPriceBands(baseline?.price_bands_json);
     const currentConcentration = marketConcentration(latest.concentration_json);
     const baselineConcentration = marketConcentration(baseline?.concentration_json);
+    const marketFields = [
+      ['monthly_sales', 'monthly_sales'], ['monthly_revenue', 'monthly_revenue'],
+      ['product_count', 'product_count'], ['seller_count', 'seller_count'],
+      ['brand_count', 'brand_count'], ['avg_price', 'avg_price'],
+      ['median_price', 'median_price'], ['avg_rating', 'avg_rating'],
+      ['median_reviews', 'median_reviews'], ['top10_sales_share', 'top10_share'],
+      ['top20_sales_share', 'top20_share'], ['new_product_share', 'new_product_share'],
+    ] as const;
+    const currentFacts = Object.fromEntries(marketFields.map(([field, metric]) => [field, resolve(latestDate, metric)])) as
+      Record<typeof marketFields[number][0], MetricFact | null>;
     const values: Record<string, unknown> = {
-      monthly_sales: numericValue(latest.monthly_sales),
-      monthly_revenue: numericValue(latest.monthly_revenue),
-      product_count: numericValue(latest.product_count),
-      seller_count: numericValue(latest.seller_count),
-      brand_count: numericValue(latest.brand_count),
-      avg_price: numericValue(latest.avg_price),
-      median_price: numericValue(latest.median_price),
-      avg_rating: numericValue(latest.avg_rating),
-      median_reviews: numericValue(latest.median_reviews),
-      top10_sales_share: numericValue(latest.top10_share),
-      top20_sales_share: numericValue(latest.top20_share),
-      new_product_share: numericValue(latest.new_product_share),
+      ...Object.fromEntries(marketFields.map(([field]) => [field, currentFacts[field]?.value ?? null])),
       market_growth_30d: growth?.growth ?? null,
       market_growth_baseline: growth ? true : null,
       market_growth_elapsed_days: growth?.elapsedDays ?? null,
@@ -926,11 +960,19 @@ export class WorkflowOrchestrator {
         ['median_reviews_change_30d_pct', 'median_reviews', 'Median reviews'],
       ] as const;
       for (const [outputField, snapshotField, label] of percentChanges) {
-        const currentValue = numericValue(latest[snapshotField]);
-        const baselineValue = numericValue(baseline[snapshotField]);
-        values[outputField] = percentageChange(currentValue, baselineValue);
-        calculations[outputField] = percentageChangeCalculation(
-          label, growth.latest.id, currentValue, growth.baseline.id, baselineValue,
+        const currentFact = resolve(latestDate, snapshotField);
+        const baselineFact = resolve(baselineSales!.date, snapshotField);
+        const currentValue = currentFact?.value;
+        const baselineValue = baselineFact?.value;
+        values[outputField] = currentValue != null && baselineValue != null
+          && comparableSources(metricSource(latestDate, currentFact!), metricSource(baselineSales!.date, baselineFact!))
+          && this.hasOneCompleteMcpRun([
+            ...growthSources,
+            metricSource(latestDate, currentFact!), metricSource(baselineSales!.date, baselineFact!),
+          ], job.marketplace)
+          ? percentageChange(currentValue, baselineValue) : null;
+        if (values[outputField] !== null) calculations[outputField] = percentageChangeCalculation(
+          label, currentFact!.id, currentValue!, baselineFact!.id, baselineValue!,
           growth.elapsedDays, values[outputField],
         );
       }
@@ -941,15 +983,26 @@ export class WorkflowOrchestrator {
         ['new_product_share_change_30d_pp', 'new_product_share', 'New-product share', 'pp'],
       ] as const;
       for (const [outputField, snapshotField, label, unit] of absoluteChanges) {
-        const currentValue = numericValue(latest[snapshotField]);
-        const baselineValue = numericValue(baseline[snapshotField]);
-        values[outputField] = round3(currentValue - baselineValue);
-        calculations[outputField] = absoluteChangeCalculation(
-          label, growth.latest.id, currentValue, growth.baseline.id, baselineValue,
+        const currentFact = resolve(latestDate, snapshotField);
+        const baselineFact = resolve(baselineSales!.date, snapshotField);
+        const currentValue = currentFact?.value;
+        const baselineValue = baselineFact?.value;
+        values[outputField] = currentValue != null && baselineValue != null
+          && comparableSources(metricSource(latestDate, currentFact!), metricSource(baselineSales!.date, baselineFact!))
+          && this.hasOneCompleteMcpRun([
+            ...growthSources,
+            metricSource(latestDate, currentFact!), metricSource(baselineSales!.date, baselineFact!),
+          ], job.marketplace)
+          ? round3(currentValue - baselineValue) : null;
+        if (values[outputField] !== null) calculations[outputField] = absoluteChangeCalculation(
+          label, currentFact!.id, currentValue!, baselineFact!.id, baselineValue!,
           growth.elapsedDays, values[outputField], unit,
         );
       }
-      if (currentPriceBands.length > 0 && baselinePriceBands.length > 0) {
+      if (currentPriceBands.length > 0 && baselinePriceBands.length > 0
+        && this.hasOneCompleteMcpRun([
+          ...growthSources, sourceFromSnapshot(latest), sourceFromSnapshot(baseline),
+        ], job.marketplace)) {
         values.price_bands_change_30d = comparePriceBands(
           currentPriceBands, baselinePriceBands, growth,
         );
@@ -957,7 +1010,10 @@ export class WorkflowOrchestrator {
       } else {
         values.price_bands_change_30d = null;
       }
-      if (currentConcentration.length > 0 && baselineConcentration.length > 0) {
+      if (currentConcentration.length > 0 && baselineConcentration.length > 0
+        && this.hasOneCompleteMcpRun([
+          ...growthSources, sourceFromSnapshot(latest), sourceFromSnapshot(baseline),
+        ], job.marketplace)) {
         values.concentration_change_30d = compareConcentration(
           currentConcentration, baselineConcentration, growth,
         );
@@ -966,58 +1022,114 @@ export class WorkflowOrchestrator {
         values.concentration_change_30d = null;
       }
     }
-    values.price_band_history_available = Boolean(
-      growth && currentPriceBands.length > 0 && baselinePriceBands.length > 0,
-    );
+    values.price_band_history_available = values.price_bands_change_30d !== null
+      && values.price_bands_change_30d !== undefined;
     values.top100_history_available = job.type === 'existing_market'
-      ? this.hasTop100History(marketId, job.marketplace)
+      ? this.hasTop100History(marketId, job.marketplace, job.isDemo)
       : false;
     values.submarket_history_available = job.type === 'existing_market'
-      ? this.hasSubmarketHistory(marketId, job.marketplace)
+      ? this.hasSubmarketHistory(marketId, job.marketplace, job.isDemo)
       : false;
-    const sources = Object.fromEntries(Object.keys(values).map((field) => [field, {
-      ...(field.includes('_change_30d') ? comparisonSource : source),
-      sourceRecordId: growth && field.startsWith('market_growth') ? growth.latest.id : source.sourceRecordId,
-      period: field.startsWith('market_growth') || field.includes('_change_30d') ? '30D' : source.period,
-    }])) as Record<string, FieldSource>;
+    const sources = Object.fromEntries(Object.keys(values).map((field) => {
+      const metric = field.replace(/(?:_change_30d_pct|_change_30d_pp|_change_30d)$/, '');
+      const currentFact = currentFacts[metric as keyof typeof currentFacts];
+      const currentMetricSource = currentFact ? metricSource(latestDate, currentFact) : source;
+      const rawMetric = marketFields.find(([outputField]) => outputField === metric)?.[1];
+      const baselineFact = field.includes('_change_30d') && baselineSales && rawMetric
+        ? resolve(baselineSales.date, rawMetric) : null;
+      const comparisonSource = baselineFact ? metricSource(baselineSales!.date, baselineFact) : null;
+      const selectedSource = comparisonSource ? { ...currentMetricSource,
+        source: unique([currentMetricSource.source, comparisonSource.source]).join(' + '),
+        isEstimated: currentMetricSource.isEstimated || comparisonSource.isEstimated,
+        confidence: Math.min(currentMetricSource.confidence, comparisonSource.confidence) } : currentMetricSource;
+      return [field, {
+        ...selectedSource,
+        sourceRecordId: growth && field.startsWith('market_growth') ? growth.latest.id : selectedSource.sourceRecordId,
+        period: field.startsWith('market_growth') || field.includes('_change_30d') ? '30D' : selectedSource.period,
+      }];
+    })) as Record<string, FieldSource>;
     if (growth) {
       calculations.market_growth_30d = growthCalculation('Market sales', growth);
       calculations.market_growth_elapsed_days = `Snapshot dates ${growth.latest.date} and ${growth.baseline.date}: ${growth.elapsedDays} elapsed days.`;
     }
-    return { values, sources, calculations, reviews: [] };
+    return { values, sources, calculations, reviews: [], growthPair: growth ?? undefined };
   }
 
-  private hasTop100History(marketId: string, marketplace: string): boolean {
+  private hasTop100History(marketId: string, marketplace: string, allowMock: boolean): boolean {
+    const productIds = this.top100ProductIds(marketId, marketplace, allowMock);
+    return productIds.length === 100
+      && productIds.every((productId) => this.getProductGrowth(productId, marketplace) !== null);
+  }
+
+  private top100ProductIds(
+    marketId: string, marketplace: string, allowMock: boolean, excludedProductId?: string,
+  ): string[] {
     const rows = this.database.prepare(`
-      SELECT candidate.id AS product_id
+      SELECT candidate.id AS productId, snapshot.id AS snapshotId, snapshot.bsr,
+        snapshot.source_type AS sourceType, snapshot.sync_run_id AS syncRunId
       FROM products candidate
-      JOIN product_snapshots latest ON latest.id = (
-        SELECT snapshot.id FROM product_snapshots snapshot
-        WHERE snapshot.product_id = candidate.id
-        ORDER BY snapshot.date DESC, snapshot.collected_at DESC LIMIT 1
-      )
-      WHERE candidate.market_node_id = ? AND candidate.marketplace = ? AND latest.bsr > 0
-      ORDER BY latest.bsr ASC LIMIT 100
-    `).all(marketId, marketplace) as Array<{ product_id: string }>;
-    return rows.length === 100
-      && rows.every(({ product_id }) => this.getProductGrowth(product_id, marketplace) !== null);
+      JOIN product_snapshots snapshot ON snapshot.product_id = candidate.id
+      WHERE candidate.market_node_id = ? AND candidate.marketplace = ?
+        AND candidate.is_owned = 0 AND candidate.status = 'active'
+        AND candidate.is_parent = 0
+        AND (? = 1 OR candidate.source_type <> 'mock')
+        AND (? IS NULL OR candidate.id <> ?)
+      ORDER BY candidate.id, snapshot.date DESC, snapshot.collected_at DESC, snapshot.id DESC
+    `).all(
+      marketId, marketplace, allowMock ? 1 : 0,
+      excludedProductId ?? null, excludedProductId ?? null,
+    ) as Array<{
+      productId: string; snapshotId: string; bsr: number | null;
+      sourceType: string; syncRunId: string | null;
+    }>;
+    const latest = new Map<string, number | null>();
+    for (const row of rows) {
+      if (latest.has(row.productId)) continue;
+      if (!allowMock && !isLiveObservationReadable(
+        this.database, 'product', row.snapshotId, row.sourceType, row.syncRunId,
+      )) continue;
+      latest.set(row.productId, strictNumber(row.bsr, Number.MIN_VALUE));
+    }
+    return [...latest.entries()]
+      .filter((entry): entry is [string, number] => entry[1] !== null)
+      .sort((left, right) => left[1] - right[1] || left[0].localeCompare(right[0]))
+      .slice(0, 100)
+      .map(([productId]) => productId);
   }
 
-  private hasSubmarketHistory(marketId: string, marketplace: string): boolean {
+  private hasSubmarketHistory(marketId: string, marketplace: string, allowMock: boolean): boolean {
     const children = this.database.prepare(`
       SELECT id FROM market_nodes WHERE parent_id = ? AND marketplace = ?
     `).all(marketId, marketplace) as Array<{ id: string }>;
     if (children.length === 0) return false;
     return children.every(({ id }) => {
-      const snapshots = this.database.prepare(`
-        SELECT id, date, monthly_sales FROM market_snapshots
-        WHERE market_node_id = ? ORDER BY date DESC, collected_at DESC
-      `).all(id) as SnapshotRow[];
-      return deriveSnapshotGrowth(snapshots.map((snapshot) => ({
-        id: text(snapshot.id),
-        date: text(snapshot.date),
-        value: numericValue(snapshot.monthly_sales),
-      }))) !== null;
+      const allSnapshots = this.database.prepare(`
+        SELECT id, date, observation_date, source, source_type,
+          period, sync_run_id FROM market_snapshots WHERE market_node_id = ?
+          AND (? = 1 OR source_type <> 'mock')
+      `).all(id, allowMock ? 1 : 0) as SnapshotRow[];
+      const snapshots = allowMock ? allSnapshots : allSnapshots.filter((snapshot) => (
+        isLiveObservationReadable(this.database, 'market', text(snapshot.id),
+          text(snapshot.source_type), snapshot.sync_run_id === null ? null : text(snapshot.sync_run_id))
+      ));
+      const dates = unique(snapshots.map((snapshot) => text(snapshot.observation_date) || text(snapshot.date)));
+      return comparableSnapshotGrowth(dates.map((date) => {
+        const resolution = this.authority.resolveMetric({
+          entityType: 'market', entityId: id, metric: 'monthly_sales', observationDate: date,
+        });
+        const fact = [resolution.selected, ...resolution.alternatives].find((candidate) => (
+          candidate !== null && (allowMock || candidate.sourceType !== 'mock')
+        )) ?? null;
+        const matchingSnapshot = snapshots.find((snapshot) => (
+          (text(snapshot.observation_date) || text(snapshot.date)) === date
+          && (text(snapshot.id) === fact?.id
+            || (snapshot.source_type === fact?.sourceType && snapshot.source === fact.source))
+        ));
+        return {
+          id: fact?.id ?? `missing:${date}`, date, value: fact?.value ?? null,
+          source: fact ? sourceFromMetricFact(fact, text(matchingSnapshot?.period)) : null,
+        };
+      })) !== null;
     });
   }
 
@@ -1025,86 +1137,108 @@ export class WorkflowOrchestrator {
     const productId = requiredEntityId(job);
     const owned = this.intelligence.getOwnedProduct(productId);
     if (!owned || owned.marketplace !== job.marketplace) throw new Error('自有产品不存在或不属于当前站点。');
-    const productRows = this.database.prepare(`
-      SELECT snapshot.* FROM product_snapshots snapshot
-      JOIN products product ON product.id = snapshot.product_id
-      WHERE snapshot.product_id = ? AND product.marketplace = ? AND product.is_owned = 1
-      ORDER BY snapshot.date DESC, snapshot.collected_at DESC
-    `).all(productId, job.marketplace) as SnapshotRow[];
-    const skuGrowth = deriveSnapshotGrowth(productRows.map((row) => ({
-      id: text(row.id), date: text(row.date), value: numericValue(row.estimated_sales),
-    })));
+    const productRows = this.intelligence.getProductSnapshots(productId);
+    const productSalesHistory = productRows.map((row) => ({
+      id: row.metricProvenance?.estimated_sales?.sourceRecordId ?? row.id,
+      date: row.date, value: row.estimatedSales,
+      source: row.metricProvenance?.estimated_sales
+        ? this.productMetricSource(row, 'estimated_sales')
+        : null,
+    }));
+    const rawSkuGrowth = comparableSnapshotGrowth(productSalesHistory);
+    const skuGrowth = rawSkuGrowth && this.hasOneCompleteMcpRun([
+      productSalesHistory.find((point) => point.id === rawSkuGrowth.latest.id)?.source ?? null,
+      productSalesHistory.find((point) => point.id === rawSkuGrowth.baseline.id)?.source ?? null,
+    ], job.marketplace) ? rawSkuGrowth : null;
     const market = this.collectMarket({ ...job, entityId: owned.marketNodeId });
+    const skuGrowthSource = skuGrowth
+      ? productSalesHistory.find((point) => point.id === skuGrowth.latest.id)?.source ?? null : null;
+    const coreGrowthSources = [skuGrowthSource, market.sources.market_growth_30d ?? null];
+    const comparableSkuGrowth = skuGrowth && market.growthPair
+      && sameGrowthMonths(skuGrowth, market.growthPair)
+      && this.sharesCompleteMcpRun(coreGrowthSources, job.marketplace) ? skuGrowth : null;
     const competitorRows = this.database.prepare(`
       SELECT relation.competitor_product_id AS product_id
       FROM competitor_relations relation
       JOIN products competitor ON competitor.id = relation.competitor_product_id
       WHERE relation.owned_product_id = ? AND relation.relation_type = 'direct'
-        AND competitor.marketplace = ?
-    `).all(productId, job.marketplace) as Array<{ product_id: string }>;
+        AND competitor.marketplace = ? AND competitor.is_owned = 0
+        AND competitor.is_parent = 0
+        AND competitor.status = 'active' AND (? = 1 OR competitor.source_type <> 'mock')
+    `).all(productId, job.marketplace, job.isDemo ? 1 : 0) as Array<{ product_id: string }>;
     const competitorGrowths = competitorRows.map(({ product_id: competitorId }) => ({
       competitorId,
       pair: this.getProductGrowth(competitorId, job.marketplace),
-    })).filter((item): item is { competitorId: string; pair: SnapshotGrowthPair } => item.pair !== null);
-    const top100Rows = this.database.prepare(`
-      SELECT DISTINCT candidate.id AS product_id
-      FROM products candidate
-      JOIN product_snapshots latest ON latest.id = (
-        SELECT snapshot.id FROM product_snapshots snapshot
-        WHERE snapshot.product_id = candidate.id
-        ORDER BY snapshot.date DESC, snapshot.collected_at DESC LIMIT 1
-      )
-      WHERE candidate.market_node_id = ? AND candidate.marketplace = ?
-        AND candidate.id <> ? AND candidate.is_owned = 0 AND latest.bsr > 0
-      ORDER BY latest.bsr ASC LIMIT 100
-    `).all(owned.marketNodeId, job.marketplace, productId) as Array<{ product_id: string }>;
-    const top100Growths = top100Rows.map(({ product_id: candidateId }) => ({
+    })).filter((item): item is { competitorId: string; pair: SourcedGrowthPair } => (
+      item.pair !== null && comparableSkuGrowth !== null
+        && sameGrowthMonths(item.pair, comparableSkuGrowth)
+        && this.sharesCompleteMcpRun([
+          ...coreGrowthSources, item.pair.latestSource, item.pair.baselineSource,
+        ], job.marketplace)
+    ));
+    const top100Growths = this.top100ProductIds(
+      owned.marketNodeId, job.marketplace, job.isDemo, productId,
+    ).map((candidateId) => ({
       productId: candidateId,
       pair: this.getProductGrowth(candidateId, job.marketplace),
-    })).filter((item): item is { productId: string; pair: SnapshotGrowthPair } => item.pair !== null);
-    const latest = productRows[0];
-    const skuSource = latest ? sourceFromSnapshot(latest) : unknownSource(job);
+    })).filter((item): item is { productId: string; pair: SourcedGrowthPair } => (
+      item.pair !== null && comparableSkuGrowth !== null
+        && sameGrowthMonths(item.pair, comparableSkuGrowth)
+        && this.sharesCompleteMcpRun([
+          ...coreGrowthSources, item.pair.latestSource, item.pair.baselineSource,
+        ], job.marketplace)
+    ));
+    const comparableCompetitorGrowths = this.hasOneCompleteMcpRun(competitorGrowths.flatMap((item) => (
+      [item.pair.latestSource, item.pair.baselineSource]
+    )), job.marketplace) ? competitorGrowths : [];
+    const comparableTop100Growths = this.hasOneCompleteMcpRun(top100Growths.flatMap((item) => (
+      [item.pair.latestSource, item.pair.baselineSource]
+    )), job.marketplace) ? top100Growths : [];
+    const latest = productRows.at(-1);
+    const skuSource = latest ? this.productMetricSource(latest, 'estimated_sales') : unknownSource(job);
     const values: Record<string, unknown> = {
-      sku_growth_30d: skuGrowth?.growth ?? null,
+      sku_growth_30d: comparableSkuGrowth?.growth ?? null,
       market_growth_30d: market.values.market_growth_30d ?? null,
       market_growth_baseline: market.values.market_growth_baseline ?? null,
-      direct_competitor_growth_30d: competitorGrowths.length > 0
-        ? round1(competitorGrowths.reduce((sum, item) => sum + item.pair.growth, 0) / competitorGrowths.length)
+      direct_competitor_growth_30d: comparableCompetitorGrowths.length > 0
+        ? round1(comparableCompetitorGrowths.reduce((sum, item) => sum + item.pair.growth, 0) / comparableCompetitorGrowths.length)
         : null,
-      direct_competitor_sample_size: competitorGrowths.length,
-      top100_growth_30d: top100Growths.length > 0
-        ? round1(top100Growths.reduce((sum, item) => sum + item.pair.growth, 0) / top100Growths.length)
+      direct_competitor_sample_size: comparableCompetitorGrowths.length,
+      top100_growth_30d: comparableTop100Growths.length > 0
+        ? round1(comparableTop100Growths.reduce((sum, item) => sum + item.pair.growth, 0) / comparableTop100Growths.length)
         : null,
-      top100_sample_size: top100Growths.length,
-      current_sales: latest ? numericValue(latest.estimated_sales) : null,
-      current_price: latest ? numericValue(latest.price) : null,
-      current_rating: latest ? numericValue(latest.rating) : null,
-      current_review_count: latest ? numericValue(latest.review_count) : null,
-      current_bsr: latest ? numericValue(latest.bsr) : null,
+      top100_sample_size: comparableTop100Growths.length,
+      current_sales: latest?.estimatedSales ?? null,
+      current_price: latest?.price ?? null,
+      current_rating: latest?.rating ?? null,
+      current_review_count: latest?.reviewCount ?? null,
+      current_bsr: latest?.bsr ?? null,
     };
     const sources: Record<string, FieldSource> = {
-      sku_growth_30d: { ...skuSource, sourceRecordId: skuGrowth?.latest.id ?? skuSource.sourceRecordId, period: '30D' },
+      sku_growth_30d: { ...skuSource, sourceRecordId: comparableSkuGrowth?.latest.id ?? skuSource.sourceRecordId, period: '30D' },
       market_growth_30d: market.sources.market_growth_30d ?? unknownSource(job),
       market_growth_baseline: market.sources.market_growth_baseline ?? unknownSource(job),
-      direct_competitor_growth_30d: competitorGrowths[0]
-        ? { ...this.sourceForProductSnapshot(competitorGrowths[0].pair.latest.id), period: '30D' }
+      direct_competitor_growth_30d: comparableCompetitorGrowths[0]
+        ? { ...comparableCompetitorGrowths[0].pair.latestSource, period: '30D' }
         : unknownSource(job),
-      top100_growth_30d: top100Growths[0]
-        ? { ...this.sourceForProductSnapshot(top100Growths[0].pair.latest.id), period: '30D' }
+      top100_growth_30d: comparableTop100Growths[0]
+        ? { ...comparableTop100Growths[0].pair.latestSource, period: '30D' }
         : unknownSource(job),
     };
-    for (const field of ['direct_competitor_sample_size', 'top100_sample_size', 'current_sales', 'current_price', 'current_rating', 'current_review_count', 'current_bsr']) {
-      sources[field] = skuSource;
-    }
+    for (const field of ['direct_competitor_sample_size', 'top100_sample_size', 'current_sales']) sources[field] = skuSource;
+    for (const [field, metric] of [
+      ['current_price', 'price'], ['current_rating', 'rating'],
+      ['current_review_count', 'review_count'], ['current_bsr', 'bsr'],
+    ] as const) sources[field] = latest ? this.productMetricSource(latest, metric) : unknownSource(job);
     const calculations: Record<string, string> = { ...market.calculations };
-    if (skuGrowth) calculations.sku_growth_30d = growthCalculation('SKU estimated sales', skuGrowth);
-    if (competitorGrowths.length > 0) {
-      calculations.direct_competitor_growth_30d = `mean(${competitorGrowths.map((item) => (
+    if (comparableSkuGrowth) calculations.sku_growth_30d = growthCalculation('SKU estimated sales', comparableSkuGrowth);
+    if (comparableCompetitorGrowths.length > 0) {
+      calculations.direct_competitor_growth_30d = `mean(${comparableCompetitorGrowths.map((item) => (
         `${item.competitorId}:${item.pair.latest.id}/${item.pair.baseline.id}=${item.pair.growth}%`
       )).join(', ')})`;
     }
-    if (top100Growths.length > 0) {
-      calculations.top100_growth_30d = `mean(${top100Growths.map((item) => (
+    if (comparableTop100Growths.length > 0) {
+      calculations.top100_growth_30d = `mean(${comparableTop100Growths.map((item) => (
         `${item.productId}:${item.pair.latest.id}/${item.pair.baseline.id}=${item.pair.growth}%`
       )).join(', ')})`;
     }
@@ -1137,21 +1271,93 @@ export class WorkflowOrchestrator {
     };
   }
 
-  private getProductGrowth(productId: string, marketplace: string): SnapshotGrowthPair | null {
-    const rows = this.database.prepare(`
-      SELECT snapshot.id, snapshot.date, snapshot.estimated_sales
-      FROM product_snapshots snapshot JOIN products product ON product.id = snapshot.product_id
-      WHERE snapshot.product_id = ? AND product.marketplace = ?
-      ORDER BY snapshot.date DESC, snapshot.collected_at DESC
-    `).all(productId, marketplace) as SnapshotRow[];
-    return deriveSnapshotGrowth(rows.map((row) => ({
-      id: text(row.id), date: text(row.date), value: numericValue(row.estimated_sales),
-    })));
+  private getProductGrowth(productId: string, marketplace: string): SourcedGrowthPair | null {
+    const product = this.database.prepare(`SELECT marketplace FROM products WHERE id = ?`)
+      .get(productId) as { marketplace: string } | undefined;
+    if (product?.marketplace !== marketplace) return null;
+    const points = this.intelligence.getProductSnapshots(productId).map((row) => ({
+      id: row.metricProvenance?.estimated_sales?.sourceRecordId ?? row.id,
+      date: row.date, value: row.estimatedSales,
+      source: row.metricProvenance?.estimated_sales
+        ? this.productMetricSource(row, 'estimated_sales') : null,
+    }));
+    const pair = comparableSnapshotGrowth(points);
+    const latestSource = points.find((point) => point.id === pair?.latest.id)?.source;
+    const baselineSource = points.find((point) => point.id === pair?.baseline.id)?.source;
+    return pair && latestSource && baselineSource
+      && this.hasOneCompleteMcpRun([latestSource, baselineSource], marketplace)
+      ? { ...pair, latestSource, baselineSource } : null;
   }
 
-  private sourceForProductSnapshot(snapshotId: string): FieldSource {
-    const row = this.database.prepare(`SELECT * FROM product_snapshots WHERE id = ?`).get(snapshotId) as SnapshotRow | undefined;
-    return row ? sourceFromSnapshot(row) : unknownSourceFromId(snapshotId);
+  private hasOneCompleteMcpRun(sources: Array<FieldSource | null>, marketplace: string): boolean {
+    if (!sources.some((source) => source?.sourceType === 'mcp')) return true;
+    const runs = sources.map((source) => source?.sourceType === 'mcp' && source.sourceRecordId
+      ? this.completeMcpRunForRecord(source.sourceRecordId, marketplace) : null);
+    return runs.length > 0 && runs[0] !== null && runs.every((run) => run === runs[0]);
+  }
+
+  private sharesCompleteMcpRun(sources: Array<FieldSource | null>, marketplace: string): boolean {
+    const mcpSources = sources.filter((source): source is FieldSource => source?.sourceType === 'mcp');
+    if (mcpSources.length === 0) return true;
+    const runs = mcpSources.map((source) => source.sourceRecordId
+      ? this.completeMcpRunForRecord(source.sourceRecordId, marketplace) : null);
+    return runs[0] !== null && runs.every((run) => run === runs[0]);
+  }
+
+  private completeMcpRunForRecord(recordId: string, marketplace: string): string | null {
+    const records = this.database.prepare(`
+      SELECT id, entity_id AS entityId, sync_run_id AS directRunId, 'fact' AS kind
+      FROM metric_facts WHERE id = ? AND marketplace = ? AND source_type = 'mcp'
+      UNION ALL
+      SELECT snapshot.id, snapshot.market_node_id, snapshot.sync_run_id, 'market'
+      FROM market_snapshots snapshot
+      JOIN market_nodes market ON market.id = snapshot.market_node_id
+      WHERE snapshot.id = ? AND market.marketplace = ? AND snapshot.source_type = 'mcp'
+      UNION ALL
+      SELECT snapshot.id, snapshot.product_id, snapshot.sync_run_id, 'product'
+      FROM product_snapshots snapshot
+      JOIN products product ON product.id = snapshot.product_id
+      WHERE snapshot.id = ? AND product.marketplace = ? AND snapshot.source_type = 'mcp'
+    `).all(recordId, marketplace, recordId, marketplace, recordId, marketplace) as Array<{
+      id: string; entityId: string; directRunId: string | null; kind: string;
+    }>;
+    if (records.length !== 1) return null;
+    const record = records[0];
+    const link = this.database.prepare(`
+      SELECT link.sync_run_id AS runId
+      FROM mcp_sync_observation_links link
+      JOIN data_coverage_runs coverage ON coverage.id = link.sync_run_id
+        AND coverage.marketplace = ? AND coverage.run_type = 'critical_sync'
+        AND coverage.is_complete = 1
+      JOIN data_tasks task ON task.id = link.sync_run_id
+        AND task.sync_run_id = link.sync_run_id AND task.marketplace = coverage.marketplace
+        AND task.source_id = 'source-sellersprite-mcp' AND task.task_type = 'critical_sync'
+        AND task.status = 'success' AND task.success = task.total AND task.failed = 0
+      WHERE link.snapshot_kind = ? AND link.snapshot_id = ? AND link.entity_id = ?
+      ORDER BY coverage.created_at DESC, link.sync_run_id DESC LIMIT 1
+    `).get(marketplace, record.kind, recordId, record.entityId) as { runId: string } | undefined;
+    if (link) return link.runId;
+    const direct = this.database.prepare(`
+      SELECT task.id AS runId FROM data_tasks task
+      JOIN data_coverage_runs coverage ON coverage.id = task.id
+        AND coverage.marketplace = task.marketplace AND coverage.run_type = 'critical_sync'
+        AND coverage.is_complete = 1
+      WHERE task.id = ? AND task.sync_run_id = task.id AND task.marketplace = ?
+        AND task.source_id = 'source-sellersprite-mcp' AND task.task_type = 'critical_sync'
+        AND task.status = 'success' AND task.success = task.total AND task.failed = 0
+    `).get(record.directRunId, marketplace) as { runId: string } | undefined;
+    return direct?.runId ?? null;
+  }
+
+  private productMetricSource(snapshot: ProductSnapshot, metric: string): FieldSource {
+    const provenance = snapshot.metricProvenance?.[metric];
+    if (!provenance || provenance.period) return sourceFromProductMetric(snapshot, metric);
+    const matching = this.database.prepare(`
+      SELECT DISTINCT period FROM product_snapshots
+      WHERE product_id = ? AND COALESCE(observation_date, date) = ?
+        AND source = ? AND source_type = ? AND period IS NOT NULL
+    `).all(snapshot.productId, snapshot.date, provenance.source, provenance.sourceType) as Array<{ period: string }>;
+    return sourceFromProductMetric(snapshot, metric, matching.length === 1 ? matching[0].period : '');
   }
 
   private prepareResolvedData(
@@ -1224,6 +1430,11 @@ interface FieldSource {
   confidence: number;
   originalUnit: string;
   normalizedUnit: string;
+}
+
+interface SourcedGrowthPair extends SnapshotGrowthPair {
+  latestSource: FieldSource;
+  baselineSource: FieldSource;
 }
 
 interface CollectedWorkflowData {
@@ -1435,6 +1646,82 @@ function sourceFromSnapshot(row: SnapshotRow): FieldSource {
   };
 }
 
+function sourceFromMetricFact(fact: MetricFact, snapshotPeriod = ''): FieldSource {
+  return {
+    source: fact.source,
+    sourceType: fact.sourceType as FieldSource['sourceType'],
+    sourceRecordId: fact.id,
+    collectedAt: fact.collectedAt,
+    period: fact.period || snapshotPeriod,
+    isEstimated: fact.isEstimated,
+    confidence: fact.confidence,
+    originalUnit: 'as_recorded',
+    normalizedUnit: 'as_recorded',
+  };
+}
+
+function sourceFromMetricProvenance(provenance: MetricProvenance): FieldSource {
+  return {
+    ...provenance,
+    originalUnit: 'as_recorded',
+    normalizedUnit: 'as_recorded',
+  };
+}
+
+function sourceFromProductMetric(
+  snapshot: ProductSnapshot, metric: string, fallbackPeriod = snapshot.provenance.period,
+): FieldSource {
+  const provenance = snapshot.metricProvenance?.[metric];
+  if (provenance) return {
+    ...sourceFromMetricProvenance(provenance),
+    period: provenance.period || fallbackPeriod,
+  };
+  return {
+    ...snapshot.provenance,
+    sourceRecordId: snapshot.id,
+    originalUnit: 'as_recorded',
+    normalizedUnit: 'as_recorded',
+  };
+}
+
+function comparableSources(left: FieldSource | null, right: FieldSource | null): boolean {
+  if (!left || !right || left.sourceType !== right.sourceType) return false;
+  if (left.period && right.period && left.period !== right.period
+    && !(monthlyReportWindow(left.period) && monthlyReportWindow(right.period))) return false;
+  if (left.sourceType === 'amazon') {
+    return /\bapi\b/i.test(left.source) === /\bapi\b/i.test(right.source);
+  }
+  return true;
+}
+
+function monthlyReportWindow(period: string): boolean {
+  const range = /^(\d{4}-\d{2}-\d{2})\/(\d{4}-\d{2}-\d{2})$/.exec(period);
+  if (!range) return false;
+  const start = Date.parse(`${range[1]}T00:00:00Z`);
+  const end = Date.parse(`${range[2]}T00:00:00Z`);
+  if (!Number.isFinite(start) || !Number.isFinite(end)
+    || new Date(start).toISOString().slice(0, 10) !== range[1]
+    || new Date(end).toISOString().slice(0, 10) !== range[2]) return false;
+  const inclusiveDays = (end - start) / 86_400_000 + 1;
+  return inclusiveDays >= 28 && inclusiveDays <= 31;
+}
+
+function comparableSnapshotGrowth(
+  points: Array<{ id: string; date: string; value: number | null; source: FieldSource | null }>,
+): SnapshotGrowthPair | null {
+  const latest = [...points].sort((left, right) => right.date.localeCompare(left.date))[0];
+  if (!latest || !latest.source) return null;
+  return deriveSnapshotGrowth(points.map((point) => ({
+    id: point.id, date: point.date,
+    value: comparableSources(latest.source, point.source) ? point.value : null,
+  })));
+}
+
+function sameGrowthMonths(left: SnapshotGrowthPair, right: SnapshotGrowthPair): boolean {
+  return left.latest.date.slice(0, 7) === right.latest.date.slice(0, 7)
+    && left.baseline.date.slice(0, 7) === right.baseline.date.slice(0, 7);
+}
+
 function unknownSource(job: ResearchJobDetail, source = 'Missing source record'): FieldSource {
   return {
     source,
@@ -1446,20 +1733,6 @@ function unknownSource(job: ResearchJobDetail, source = 'Missing source record')
     confidence: job.isDemo ? 0.9 : 0.75,
     originalUnit: 'unitless',
     normalizedUnit: 'unitless',
-  };
-}
-
-function unknownSourceFromId(sourceRecordId: string): FieldSource {
-  return {
-    source: 'Referenced product snapshot',
-    sourceType: 'import',
-    sourceRecordId,
-    collectedAt: '',
-    period: '30D',
-    isEstimated: true,
-    confidence: 0,
-    originalUnit: 'as_recorded',
-    normalizedUnit: 'as_recorded',
   };
 }
 
