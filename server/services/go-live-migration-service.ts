@@ -4,7 +4,7 @@ import type { AppDatabase } from '../database/database.js';
 import { transaction } from '../database/database.js';
 import { confirmedDirectCompetitors } from './confirmed-direct-competitor-coverage.js';
 import { validMarketHistorySpan } from './real-history-coverage.js';
-import { ownedRosterState, type OwnedRosterState } from './owned-roster-declaration.js';
+import { ownedRosterState, sellerSpriteRosterScope, type OwnedRosterState } from './owned-roster-declaration.js';
 import { LocalObservationResolver, certifiedMarketCall } from './local-observation-resolver.js';
 
 interface CountRow {
@@ -26,6 +26,10 @@ export interface GoLivePreview {
 }
 
 export interface GoLiveVerification extends OwnedRosterState {
+  ownedProductRosterCoverage: {confirmed:number;total:number;passed:boolean};
+  sellerSpriteEnrichmentCoverage: {required:number;covered:number;excluded:ReturnType<typeof sellerSpriteRosterScope>['excluded']};
+  marketCoverage: {primaryHistoryDays:number;hasPrimaryHistory90d:boolean;internalOnlyProducts:number};
+  competitorCoverage: {confirmed:number;runLinkedCandidateGroups:number};
   mockObservations: number;
   realMarketSnapshots: number;
   realOwnedProductSnapshots: number;
@@ -391,8 +395,16 @@ export class GoLiveMigrationService {
       && sellerSpriteCapabilitiesAvailable
       && sellerSpriteCriticalRunId !== null
       && criticalProof.runLinkedCandidateGroups > 0;
+    const providerScope = sellerSpriteRosterScope(this.database,settings.marketplace);
+    const eligibleSnapshotCount = providerScope.eligible.filter(p=>Boolean(this.database.prepare(`SELECT 1
+      FROM product_snapshots snapshot WHERE snapshot.product_id=? AND snapshot.source_type IN ('mcp','amazon','import')
+      AND ${PRODUCT_METRICS} LIMIT 1`).get(p.id))).length;
     return {
       ...rosterState,
+      ownedProductRosterCoverage:{confirmed:rosterState.ownedRosterMatches?providerScope.rows.length:0,total:providerScope.rows.length,passed:rosterState.ownedRosterMatches},
+      sellerSpriteEnrichmentCoverage:{required:providerScope.eligible.length,covered:eligibleSnapshotCount,excluded:providerScope.excluded},
+      marketCoverage:{primaryHistoryDays:primaryMarketHistory.days,hasPrimaryHistory90d:hasPrimaryMarketHistory90d,internalOnlyProducts:providerScope.excluded.length},
+      competitorCoverage:{confirmed:confirmedDirectCompetitorCount,runLinkedCandidateGroups:criticalProof.runLinkedCandidateGroups},
       mockObservations,
       realMarketSnapshots,
       realOwnedProductSnapshots,
@@ -415,7 +427,7 @@ export class GoLiveMigrationService {
         && activeOwnedProducts > 0
         && activeMockOwnedProducts === 0
         && realMarketSnapshots > 0
-        && realOwnedProductSnapshots === activeOwnedProducts
+        && eligibleSnapshotCount === providerScope.eligible.length
         && sellerSpriteOwnedProductSnapshots > 0
         && hasPrimaryMarketHistory90d
         && confirmedDirectCompetitorCount > 0
@@ -429,7 +441,9 @@ export class GoLiveMigrationService {
     requiredEvidenceEntities: number;
     runLinkedCandidateGroups: number;
   } {
-    const owned = this.database.prepare(`
+    const providerScope = sellerSpriteRosterScope(this.database,marketplace);
+    const eligibleIds = new Set(providerScope.eligible.map(p=>String(p.id)));
+    const allOwned = this.database.prepare(`
       WITH RECURSIVE market_scope(id) AS (
         SELECT id FROM market_nodes
         WHERE id = ? AND marketplace = ? AND source_type <> 'mock'
@@ -452,6 +466,7 @@ export class GoLiveMigrationService {
     `).all(marketId, marketplace, marketplace, marketplace) as Array<{
       id: string; asin: string; marketNodeId: string; inScope: number; confirmed: number;
     }>;
+    const owned = allOwned.filter(p=>eligibleIds.has(p.id));
     const requiredEvidenceEntities = owned.length + 1;
     const incomplete = {
       runId: null, verifiedEvidenceEntities: 0, requiredEvidenceEntities,
@@ -497,6 +512,8 @@ export class GoLiveMigrationService {
         coverage = parsed as Record<string, unknown>;
       } catch { continue; }
       if (coverage.syncMode && coverage.syncMode !== 'certification') continue;
+      if ((providerScope.excluded.length > 0 || coverage.rosterScopeDigest)
+        && coverage.rosterScopeDigest !== providerScope.digest) continue;
       const roster = coverage.ownedProducts;
       const month = coverage.month;
       const baselineMonth = coverage.baselineMonth;

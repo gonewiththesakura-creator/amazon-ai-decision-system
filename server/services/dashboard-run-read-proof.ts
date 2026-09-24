@@ -3,6 +3,7 @@ import type { MetricProvenance, ProductSnapshot, TrendPoint } from '../../shared
 import { deriveSnapshotGrowth } from '../domain/snapshot-growth.js';
 import { IntelligenceRepository } from '../repository/intelligence-repository.js';
 import { MetricAuthorityResolver } from './metric-authority-resolver.js';
+import { sellerSpriteRosterScope } from './owned-roster-declaration.js';
 
 export interface DashboardRunReadProofInput {
   runId: string;
@@ -97,11 +98,11 @@ function hasCurrentRunRoster(
   `).get(input.marketId, marketplace) as { nodeIdPath: string | null } | undefined;
   if (!coverage || !market?.nodeIdPath || coverage.marketId !== input.marketId
     || coverage.nodeIdPath !== market.nodeIdPath) return false;
-  const total = database.prepare(`
-    SELECT COUNT(*) AS count FROM products
-    WHERE marketplace = ? AND is_owned = 1 AND is_parent = 0
-      AND status = 'active' AND source_type <> 'mock'
-  `).get(marketplace) as { count: number };
+  const providerScope = sellerSpriteRosterScope(database,marketplace);
+  const eligibleIds = new Set(providerScope.eligible.map(p=>String(p.id)));
+  const originalCoverage = JSON.parse(coverageJson) as {rosterScopeDigest?:string};
+  if ((providerScope.excluded.length > 0 || originalCoverage.rosterScopeDigest)
+    && originalCoverage.rosterScopeDigest !== providerScope.digest) return false;
   const current = database.prepare(`
     WITH RECURSIVE market_scope(id) AS (
       SELECT id FROM market_nodes
@@ -122,8 +123,9 @@ function hasCurrentRunRoster(
       AND product.status = 'active' AND product.source_type <> 'mock'
     ORDER BY product.id
   `).all(input.marketId, marketplace, marketplace, marketplace) as unknown as RunOwnedProduct[];
+  const eligibleCurrent = current.filter(p=>eligibleIds.has(p.id));
   const inputIds = [...input.ownedProductIds].sort();
-  const childNodeIds = [...new Set(current.map((product) => product.marketNodeId))]
+  const childNodeIds = [...new Set(eligibleCurrent.map((product) => product.marketNodeId))]
     .filter((id) => id !== input.marketId).sort();
   const currentMarketNodes = [input.marketId, ...childNodeIds].map((id) => {
     const node = database.prepare(`
@@ -132,11 +134,11 @@ function hasCurrentRunRoster(
     `).get(id, marketplace) as { nodeIdPath: string | null } | undefined;
     return node?.nodeIdPath ? { id, nodeIdPath: node.nodeIdPath } : null;
   });
-  return current.length > 0 && current.length === total.count
+  return eligibleCurrent.length > 0 && eligibleCurrent.length === providerScope.eligible.length
     && currentMarketNodes.every((node): node is RunMarketNode => node !== null)
-    && JSON.stringify(inputIds) === JSON.stringify(current.map((product) => product.id))
+    && JSON.stringify(inputIds) === JSON.stringify(eligibleCurrent.map((product) => product.id))
     && JSON.stringify(coverage.marketNodes) === JSON.stringify(currentMarketNodes)
-    && JSON.stringify(coverage.ownedProducts) === JSON.stringify(current);
+    && JSON.stringify(coverage.ownedProducts) === JSON.stringify(eligibleCurrent);
 }
 
 function isLinkedMetric(

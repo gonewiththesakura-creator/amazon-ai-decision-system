@@ -192,6 +192,7 @@ export class SellerSpriteMCPAdapter implements MarketDataAdapter {
   async fetchAsinSalesTrend(
     input: SellerSpriteAsinRequest, context?: SellerSpriteSyncContext,
   ): Promise<SellerSpriteData<SellerSpriteAsinTrend>> {
+    this.assertRemoteProductEnabled(input);
     return this.fetchCapability(
       'ASIN_SALES_TREND', { ...input }, sellerSpriteAsinTrendSchema, 'owned_sku_refresh', context,
     );
@@ -200,6 +201,7 @@ export class SellerSpriteMCPAdapter implements MarketDataAdapter {
   async fetchAsinIdentity(
     input: SellerSpriteAsinRequest, context?: SellerSpriteSyncContext,
   ): Promise<SellerSpriteData<SellerSpriteAsinIdentity>> {
+    this.assertRemoteProductEnabled(input);
     return this.fetchCapability('ASIN_DETAIL', (registry) => ({
       ...input,
       ...(registry.supportsStringArgument('ASIN_DETAIL', 'returnFields')
@@ -211,6 +213,7 @@ export class SellerSpriteMCPAdapter implements MarketDataAdapter {
     input: SellerSpriteAsinRequest & { size?: number },
     context?: SellerSpriteSyncContext,
   ): Promise<SellerSpriteData<SellerSpriteCompetitorCandidates>> {
+    this.assertRemoteProductEnabled(input);
     return this.fetchCapability('ASIN_COMPETITOR_DISCOVERY', { ...input }, z.array(object), 'competitor_refresh', context);
   }
 
@@ -249,6 +252,13 @@ export class SellerSpriteMCPAdapter implements MarketDataAdapter {
       newProductShare,
       priceBands: [], concentration: [], provenance,
     };
+  }
+
+  private assertRemoteProductEnabled(input: SellerSpriteAsinRequest): void {
+    if (this.database?.prepare(`SELECT 1 FROM products p JOIN product_provider_enrichment e ON e.product_id=p.id
+      WHERE p.asin=? AND p.marketplace=? AND e.remote_enabled=0`).get(input.asin,input.marketplace)) {
+      throw new AdapterUnavailableError('SellerSprite acquisition disabled for this product by explicit master-data policy');
+    }
   }
 
   async fetchMarketProducts(input: MarketInput): Promise<Product[]> {

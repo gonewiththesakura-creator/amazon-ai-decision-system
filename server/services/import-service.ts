@@ -464,7 +464,7 @@ export class ImportService {
         ON CONFLICT(marketplace) DO UPDATE SET declared_count = excluded.declared_count,
           declared_digest = excluded.declared_digest, preview_digest = excluded.preview_digest,
           expected_count = NULL, expected_digest = NULL, status = 'pending_validation',
-          import_batch_id = NULL, updated_at = excluded.updated_at`
+          import_batch_id = NULL, manual_confirmation_id = NULL, updated_at = excluded.updated_at`
         ).run(marketplace, batch.rowCount, declaredDigest, contentDigest, now, now);
         const eventType = !existing ? 'declared' : replacesScope ? 'superseded' : 'refreshed';
         this.database.prepare(`INSERT INTO owned_roster_declaration_events (

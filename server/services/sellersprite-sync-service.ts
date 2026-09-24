@@ -12,7 +12,7 @@ import type { AppDatabase } from '../database/database.js';
 import { transaction } from '../database/database.js';
 import { ProductIdentityResolver } from '../domain/product-identity-resolver.js';
 import { sanitizeMcpError } from '../adapters/sellersprite-mcp-client.js';
-import { requireConfirmedOwnedRoster } from './owned-roster-declaration.js';
+import { requireConfirmedOwnedRoster, sellerSpriteRosterScope, ownedRosterState } from './owned-roster-declaration.js';
 import { LocalObservationResolver } from './local-observation-resolver.js';
 import { reusableCapabilitySnapshot, SELLERSPRITE_CAPABILITIES } from '../adapters/sellersprite-tool-registry.js';
 import { SqliteMcpCapabilityStore } from '../adapters/sellersprite-mcp-store.js';
@@ -572,8 +572,14 @@ export class SellerSpriteSyncService {
     if (products.length === 0) blockers.push('没有启用的自有 SKU');
     if (nodes.some((node) => !/^\d+(?::\d+)*$/.test(node.sellerSpriteNodePath))) blockers.push('市场节点路径尚未确认');
     if (mode === 'incremental' && remote > Math.max(0, quota.estimatedRemaining - quota.reserve)) blockers.push('预计调用超过可用额度');
-    const fingerprint = requestKey([market, products, nodes, competitors, quota.policy, quota.reserve]);
+    const scope = sellerSpriteRosterScope(this.database, market.marketplace);
+    const fingerprint = requestKey([market, products, nodes, competitors, quota.policy, quota.reserve,scope.digest]);
     const plan = { id: randomUUID(), syncMode: mode, entries, estimatedRemoteCalls: remote,
+      ownedProductRosterCoverage:{...ownedRosterState(this.database,market.marketplace),total:scope.rows.length},
+      sellerSpriteEnrichmentCoverage:{required:scope.eligible.length,excluded:scope.excluded},
+      marketCoverage:{remoteEligibleNodes:nodes.length,internalOnlyProductIds:scope.excluded.map(p=>p.id)},
+      competitorCoverage:{confirmed:competitors.length,discoveryProducts:products.length},
+      rosterScopeDigest:scope.digest,
       localSnapshotReuse: entries.filter(e => e.reason === 'closed_month_snapshot_reuse').length,
       historicalMcpCallsSkipped: entries.filter(e => e.reason === 'closed_month_snapshot_reuse').length * 3,
       marketRemoteCalls: entries.filter(e => e.target.startsWith('market:')).reduce((n,e) => n+e.remote,0),
@@ -630,6 +636,9 @@ export class SellerSpriteSyncService {
     currentExecution().runId = runId;
     const startedAt = new Date().toISOString();
     const scope = {
+      rosterScopeDigest:sellerSpriteRosterScope(this.database, market.marketplace).digest,
+      ownedProductRosterCoverage:ownedRosterState(this.database,market.marketplace),
+      sellerSpriteEnrichmentCoverage:sellerSpriteRosterScope(this.database,market.marketplace),
       syncMode: currentExecution().syncMode,
       marketId: market.id, nodeIdPath: market.sellerSpriteNodePath, month, baselineMonth,
       marketMonths: [baselineMonth, month],
@@ -661,6 +670,7 @@ export class SellerSpriteSyncService {
         const currentMarket = this.requireMarket(market.id);
         if (currentMarket.marketplace !== market.marketplace
           || currentMarket.sellerSpriteNodePath !== market.sellerSpriteNodePath
+          || sellerSpriteRosterScope(this.database,market.marketplace).digest !== scope.rosterScopeDigest
           || JSON.stringify(this.activeOwnedProducts(market.marketplace, market.id)) !== JSON.stringify(products)
           || JSON.stringify(this.criticalMarketNodes(currentMarket, products)) !== JSON.stringify(marketNodes)) {
           throw new Error('关键同步期间市场节点或自有 SKU 范围发生变化，请重新运行。');
@@ -700,6 +710,8 @@ export class SellerSpriteSyncService {
       const competitorCoverage = await this.syncCoreCompetitorBatch(runId, market.marketplace);
       transaction(this.database, () => {
         requireConfirmedOwnedRoster(this.database, market.marketplace);
+        if(sellerSpriteRosterScope(this.database,market.marketplace).digest!==scope.rosterScopeDigest)
+          throw new Error('Provider scope changed during certification');
         const completedAt = new Date().toISOString();
         const coverageUpdate = this.database.prepare(`
           UPDATE data_coverage_runs SET is_complete = 1
@@ -1246,11 +1258,8 @@ export class SellerSpriteSyncService {
   }
 
   private activeOwnedProducts(marketplace: string, rootMarketId: string): ProductRow[] {
-    const total = this.database.prepare(`
-      SELECT COUNT(*) AS count FROM products
-      WHERE marketplace = ? AND is_owned = 1 AND is_parent = 0
-        AND status = 'active' AND source_type <> 'mock'
-    `).get(marketplace) as { count: number };
+    const scope = sellerSpriteRosterScope(this.database,marketplace);
+    const eligibleIds = new Set(scope.eligible.map(p=>String(p.id)));
     const rows = this.database.prepare(`
       WITH RECURSIVE market_scope(id) AS (
         SELECT id FROM market_nodes
@@ -1272,10 +1281,11 @@ export class SellerSpriteSyncService {
         AND product.status = 'active' AND product.source_type <> 'mock'
       ORDER BY product.id
     `).all(rootMarketId, marketplace, marketplace, marketplace) as unknown as ProductRow[];
-    if (rows.length !== total.count) {
+    const eligible = rows.filter(p=>eligibleIds.has(p.id));
+    if (eligible.length !== scope.eligible.length) {
       throw new Error('关键同步前置条件失败：全部真实自有 SKU 必须映射到主市场范围内已确认的 SellerSprite 节点。');
     }
-    return rows;
+    return eligible;
   }
 
   private criticalMarketNodes(root: MarketRow, products: ProductRow[]): MarketRow[] {

@@ -287,6 +287,11 @@ export class SellerSpriteMcpClient {
     }
 
     const attempts = Math.max(1, Math.min(2, this.options.retry?.maxAttempts ?? 2));
+    if (request.context.entityType === 'product' && this.options.budget?.database.prepare(`
+      SELECT 1 FROM products p JOIN product_provider_enrichment e ON e.product_id=p.id
+      WHERE p.asin=? AND p.marketplace=? AND e.remote_enabled=0`).get(
+      request.context.entityId ?? '', String(request.arguments.marketplace ?? ''),
+    )) throw new McpPolicyError('BUDGET_BLOCKED');
     for (let attempt = 1; attempt <= attempts; attempt += 1) {
       const startedAt = new Date(this.now()).toISOString();
       let remoteFailureRecorded = false;

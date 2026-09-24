@@ -2,6 +2,15 @@
 
 ## Behavior
 
+Owned Product Master confirmation is independent of SellerSprite enrichment.
+An explicit human ownership attestation can confirm the roster without a provider
+title or numeric node path. Immutable human confirmation evidence is retained.
+Explicit unavailable/pending enrichment with documented scope and remote acquisition
+disabled is excluded from provider collection, not from the owned roster. Plans,
+Go Live verification and Dashboard run proofs bind this scope to the current run.
+Roster, enrichment, market and competitor coverage are reported separately;
+missing enrichment never creates fabricated observations or clears unrelated gates.
+
 Incremental is the default. Valid immutable snapshots are read before validated
 local capability acquisitions and persistent raw cache. Closed month acquisitions
 are stable after a successful collection in a later month. Original acquisition

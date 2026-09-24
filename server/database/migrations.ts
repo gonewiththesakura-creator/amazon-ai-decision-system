@@ -2268,6 +2268,45 @@ migrations.push({ version: 33, sql: `
     BEGIN SELECT RAISE(ABORT, 'Reuse lineage is immutable'); END;
 ` });
 
+migrations.push({version:34,apply(database:DatabaseSync) { database.exec(`
+  CREATE TABLE owned_roster_manual_confirmations (
+    id TEXT PRIMARY KEY, marketplace TEXT NOT NULL, roster_digest TEXT NOT NULL,
+    product_count INTEGER NOT NULL, evidence_json TEXT NOT NULL CHECK(json_valid(evidence_json)),
+    confirmed_at TEXT NOT NULL
+  );
+  CREATE TRIGGER manual_roster_no_update BEFORE UPDATE ON owned_roster_manual_confirmations
+    BEGIN SELECT RAISE(ABORT,'Manual roster evidence is immutable'); END;
+  CREATE TRIGGER manual_roster_no_delete BEFORE DELETE ON owned_roster_manual_confirmations
+    BEGIN SELECT RAISE(ABORT,'Manual roster evidence is immutable'); END;
+  CREATE TABLE product_provider_enrichment (
+    product_id TEXT PRIMARY KEY REFERENCES products(id),
+    status TEXT NOT NULL CHECK(status IN ('pending','unavailable','available')),
+    provider_status TEXT, remote_enabled INTEGER NOT NULL CHECK(remote_enabled IN (0,1)),
+    node_id_path TEXT, title TEXT, evidence_json TEXT NOT NULL CHECK(json_valid(evidence_json)),
+    updated_at TEXT NOT NULL
+  );
+  CREATE TABLE owned_roster_declarations_v34 (
+    marketplace TEXT PRIMARY KEY, declared_count INTEGER NOT NULL CHECK(declared_count>0),
+    declared_digest TEXT NOT NULL CHECK(length(declared_digest)=64),
+    expected_count INTEGER,expected_digest TEXT,preview_digest TEXT NOT NULL CHECK(length(preview_digest)=64),
+    status TEXT NOT NULL CHECK(status IN ('pending_validation','confirmed')),
+    import_batch_id TEXT REFERENCES import_batches(id),created_at TEXT NOT NULL,updated_at TEXT NOT NULL,
+    manual_confirmation_id TEXT REFERENCES owned_roster_manual_confirmations(id),
+    CHECK((status='pending_validation' AND expected_count IS NULL AND expected_digest IS NULL
+      AND import_batch_id IS NULL AND manual_confirmation_id IS NULL)
+      OR (status='confirmed' AND expected_count IS NOT NULL AND expected_digest IS NOT NULL
+        AND expected_count>=0 AND length(expected_digest)=64
+        AND (import_batch_id IS NOT NULL OR manual_confirmation_id IS NOT NULL)))
+  );
+  `);
+  if (Number(database.prepare('SELECT COUNT(*) n FROM owned_roster_declarations').get()!.n)>0) {
+    database.exec('INSERT INTO owned_roster_declarations_v34 SELECT *,NULL FROM owned_roster_declarations');
+  }
+  database.exec(`
+  DROP TABLE owned_roster_declarations;
+  ALTER TABLE owned_roster_declarations_v34 RENAME TO owned_roster_declarations;
+`); }});
+
 export function migrate(database: DatabaseSync): void {
   database.exec(`
     CREATE TABLE IF NOT EXISTS schema_migrations (
