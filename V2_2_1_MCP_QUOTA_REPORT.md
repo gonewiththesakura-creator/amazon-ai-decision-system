@@ -5,9 +5,17 @@
 Incremental is the default. Valid immutable snapshots are read before validated
 local capability acquisitions and persistent raw cache. Closed month acquisitions
 are stable after a successful collection in a later month. Original acquisition
-timestamps are preserved. Certification and force bypass reuse, require a reviewed,
+timestamps are preserved. Certification reuses certified closed-month market snapshots
+with immutable current-run lineage; other certification acquisitions and force bypass reuse, require a reviewed,
 single-use, ten-minute plan, and are recorded separately. Incremental and force
 coverage cannot satisfy the Go Live certification check.
+
+LIST_TOOLS is not refreshed per small task. Within the original snapshot TTL,
+restore the requested capability locally, even when unrelated tools contain
+redacted fields. Refresh only for expiry, missing requested tools, a requested
+schema mismatch, explicitly fresh Certification, or an administrator refresh.
+Loading a snapshot does not extend its TTL. Targeted schema redaction is treated
+as a mismatch; it is never repaired by guessing hidden parameter names.
 
 The plan is a conservative estimate; retries and tool-list pagination are bounded
 by a separate displayed maximum. Every actual tool/page/attempt decrements the

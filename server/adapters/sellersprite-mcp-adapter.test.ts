@@ -12,6 +12,48 @@ import { WorkflowOrchestrator } from '../services/workflow-orchestrator.js';
 import { seedConfirmedOwnedRoster } from '../test-utils/owned-roster-declaration.js';
 
 describe('SellerSpriteMCPAdapter', () => {
+  it.each([false, true])('reuses persisted capability TTL across ASIN tasks despite unrelated redaction (run=%s)', async withRun => {
+    const database = openDatabase(':memory:');
+    class CatalogTransport extends AdapterTransport {
+      override async listTools(): Promise<unknown> {
+        const catalog = await super.listTools() as {tools: unknown[]};
+        catalog.tools.push({name:'keyword_research_trends', inputSchema:{type:'object',
+          properties:{keyword:{type:'string'}},required:['keyword']}});
+        return catalog;
+      }
+    }
+    const transport=new CatalogTransport();
+    transport.includeAsinDetail=true;
+    const invoke=async(index:number)=>{
+      if (withRun) database.prepare(`INSERT INTO data_tasks (id,name,task_type,target,source,status,created_at)
+        VALUES (?,'Offline fixture','identity','B000TEST01','test','running',?)`).run(`task-${index}`,new Date().toISOString());
+      const adapter=new SellerSpriteMCPAdapter({database,client:new SellerSpriteMcpClient({transport})});
+      await adapter.fetchAsinIdentity({marketplace:'US',asin:'B000TEST01'},withRun?{runId:`task-${index}`} : undefined);
+      await adapter.close();
+    };
+    try {
+      await invoke(1);
+      const cached=database.prepare('SELECT capabilities_json FROM provider_capability_snapshots').get()!;
+      expect(String(cached.capabilities_json)).toContain('[PII_PATH]');
+      await invoke(2);
+      await invoke(3);
+      expect(transport.listToolsCallCount).toBe(1);
+      const snapshot=database.prepare('SELECT id,capabilities_json FROM provider_capability_snapshots ORDER BY rowid DESC LIMIT 1').get()!;
+      const broken=JSON.parse(String(snapshot.capabilities_json));
+      const detail=broken.tools.find((t:{name:string})=>t.name==='asin_detail');
+      detail.inputSchema.required=['marketplace','[PII_PATH]'];
+      database.prepare('UPDATE provider_capability_snapshots SET capabilities_json=? WHERE id=?').run(JSON.stringify(broken),snapshot.id);
+      await invoke(4);
+      expect(transport.listToolsCallCount).toBe(2);
+      database.exec("UPDATE provider_capability_snapshots SET collected_at='2000-01-01T00:00:00.000Z'");
+      await invoke(5);
+      expect(transport.listToolsCallCount).toBe(3);
+      const adapter=new SellerSpriteMCPAdapter({database,client:new SellerSpriteMcpClient({transport})});
+      await adapter.refreshCapabilities();
+      expect(transport.listToolsCallCount).toBe(4);
+      await adapter.close();
+    } finally {database.close();}
+  });
   it('pins callable tool schemas to each run when two run discoveries interleave', async () => {
     class RotatingTransport extends AdapterTransport {
       catalogVersion: 'a' | 'b' = 'a';

@@ -19,6 +19,7 @@ import {
   SELLERSPRITE_CAPABILITIES,
   SellerSpriteToolRegistry,
   sellerSpriteSchemaHash,
+  reusableCapabilitySnapshot,
   type SellerSpriteCapability,
 } from './sellersprite-tool-registry.js';
 import type {
@@ -97,6 +98,7 @@ export class SellerSpriteMCPAdapter implements MarketDataAdapter {
   private discoveryInvalidated = false;
   private readonly capabilityStore?: McpCapabilityStore;
   private readonly runRegistries = new Map<string, Promise<SellerSpriteToolRegistry>>();
+  private registryExpiresAt = 0;
   private readonly injectedClient: boolean;
   private discovered = false;
   private readonly database?: AppDatabase;
@@ -326,13 +328,16 @@ export class SellerSpriteMCPAdapter implements MarketDataAdapter {
     return next;
   }
 
-  private async registryForRun(runId: string, fresh: boolean): Promise<SellerSpriteToolRegistry> {
+  private async registryForRun(runId: string, fresh: boolean, capability: SellerSpriteCapability): Promise<SellerSpriteToolRegistry> {
+    if (!fresh && Date.now() >= this.registryExpiresAt) this.runRegistries.clear();
     const registryKey = `${runId}:${fresh}`;
     const existing = this.runRegistries.get(registryKey);
     if (existing) return existing;
     const previous = this.capabilityStore?.latest();
-    const reusable = !fresh && !this.discoveryInvalidated && previous && Date.now() - Date.parse(previous.discoveredAt) < (this.budget?.ttl('LIST_TOOLS') ?? 7 * 86400_000)
-      && !previous.tools.some((tool) => tool.inputSchema.required?.includes('[PII_PATH]'));
+    const ttl = this.budget?.ttl('LIST_TOOLS') ?? 7 * 86400_000;
+    const reusable = !fresh && !this.discoveryInvalidated
+      && reusableCapabilitySnapshot(previous, [capability], ttl);
+    this.registryExpiresAt = (reusable ? Date.parse(previous!.discoveredAt) : Date.now()) + ttl;
     const registry = new SellerSpriteToolRegistry(reusable ? {} : { store: this.capabilityStore });
     const discovery = registry.refresh(
       () => reusable ? Promise.resolve(previous.tools) : this.client.listTools({ fresh: true, runId }),
@@ -371,12 +376,12 @@ export class SellerSpriteMCPAdapter implements MarketDataAdapter {
     const fresh = context?.syncMode ? context.syncMode !== 'incremental' : freshExecution();
     if (fresh && this.database && !freshExecution()) throw new McpPolicyError('CONFIRMATION_REQUIRED');
     if (context?.runId) {
-      registry = await this.registryForRun(context.runId, fresh);
+      registry = await this.registryForRun(context.runId, fresh, capability);
     } else {
       if (!this.discovered || Date.now() - this.discoveredAt > (this.budget?.ttl('LIST_TOOLS') ?? 7 * 86400_000) || fresh) {
         const previous = this.capabilityStore?.latest();
-        const reusable = !fresh && !this.discoveryInvalidated && previous && Date.now() - Date.parse(previous.discoveredAt) < (this.budget?.ttl('LIST_TOOLS') ?? 7 * 86400_000)
-          && !previous.tools.some((tool) => tool.inputSchema.required?.includes('[PII_PATH]'));
+        const reusable = !fresh && !this.discoveryInvalidated
+          && reusableCapabilitySnapshot(previous, [capability], this.budget?.ttl('LIST_TOOLS') ?? 7 * 86400_000);
         if (reusable) {
           const restored = new SellerSpriteToolRegistry();
           await restored.refresh(() => Promise.resolve(previous.tools));
@@ -384,7 +389,7 @@ export class SellerSpriteMCPAdapter implements MarketDataAdapter {
           this.registry = restored;
         } else await this.refreshCapabilities();
         this.discovered = true;
-        this.discoveredAt = Date.now();
+        this.discoveredAt = reusable ? Date.parse(previous!.discoveredAt) : Date.now();
       }
       registry ??= this.registry;
     }
@@ -392,7 +397,12 @@ export class SellerSpriteMCPAdapter implements MarketDataAdapter {
       throw new McpPolicyError('SCHEMA_PAUSED');
     }
     const tool = registry.resolve(capability);
-    if (!tool) throw new SellerSpriteMcpError('TOOL_NOT_FOUND', `SellerSprite capability unavailable: ${capability}`);
+    if (!tool) {
+      this.discoveryInvalidated = true;
+      this.discovered = false;
+      this.runRegistries.clear();
+      throw new SellerSpriteMcpError('TOOL_NOT_FOUND', `SellerSprite capability unavailable: ${capability}`);
+    }
     const resolvedArgs = typeof args === 'function' ? args(registry) : args;
     const request = resolvedArgs.request && typeof resolvedArgs.request === 'object'
       ? resolvedArgs.request as Record<string, unknown> : resolvedArgs;
@@ -406,7 +416,12 @@ export class SellerSpriteMCPAdapter implements MarketDataAdapter {
     }
     let toolArgs: Record<string, unknown>;
     try { toolArgs = registry.argumentsFor(capability, resolvedArgs); }
-    catch { throw new SellerSpriteMcpError('INVALID_SCHEMA', 'SellerSprite tool arguments do not match discovered schema'); }
+    catch {
+      this.discoveryInvalidated = true;
+      this.discovered = false;
+      this.runRegistries.clear();
+      throw new SellerSpriteMcpError('INVALID_SCHEMA', 'SellerSprite tool arguments do not match discovered schema');
+    }
     const entityType = capability === 'ASIN_SALES_TREND' || capability === 'ASIN_COMPETITOR_DISCOVERY'
       || capability === 'ASIN_DETAIL'
       ? 'product' as const : 'market' as const;

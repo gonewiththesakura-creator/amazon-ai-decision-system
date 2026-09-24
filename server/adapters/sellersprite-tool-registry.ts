@@ -22,6 +22,30 @@ const ALL_SELLERSPRITE_CAPABILITIES: readonly SellerSpriteCapability[] = [
   ...SELLERSPRITE_OPTIONAL_CAPABILITIES,
 ];
 
+/** Only the requested contracts must be restorable; unrelated redacted tools do not expire the catalog. */
+export function reusableCapabilitySnapshot(
+  snapshot: McpCapabilitySnapshot | null | undefined, capabilities: readonly SellerSpriteCapability[],
+  ttl: number, now = Date.now(),
+): snapshot is McpCapabilitySnapshot {
+  if (!snapshot) return false;
+  const age = now - Date.parse(snapshot.discoveredAt);
+  if (!Number.isFinite(age) || age < -300_000 || age >= ttl) return false;
+  const requiredIntact = (value: unknown): boolean => {
+    if (!value || typeof value !== 'object') return true;
+    if (Array.isArray(value)) return value.every(requiredIntact);
+    const schema = value as Record<string, unknown>;
+    if (Array.isArray(schema.required) && schema.required.some(key =>
+      typeof key !== 'string' || key.startsWith('['))) return false;
+    return Object.values(schema).every(requiredIntact);
+  };
+  return capabilities.every(capability => {
+    const name = snapshot.capabilities[capability];
+    const matches = snapshot.tools.filter(tool => tool.name === name);
+    return matches.length === 1 && supportsSchema(capability, matches[0]!)
+      && requiredIntact(matches[0]!.inputSchema);
+  });
+}
+
 const aliases: Record<SellerSpriteCapability, string[]> = {
   MARKET_RESEARCH: ['market_research'],
   MARKET_STATISTICS: ['market_research_statistics', 'market_statistics'],

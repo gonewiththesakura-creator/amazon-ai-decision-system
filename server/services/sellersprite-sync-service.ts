@@ -14,6 +14,8 @@ import { ProductIdentityResolver } from '../domain/product-identity-resolver.js'
 import { sanitizeMcpError } from '../adapters/sellersprite-mcp-client.js';
 import { requireConfirmedOwnedRoster } from './owned-roster-declaration.js';
 import { LocalObservationResolver } from './local-observation-resolver.js';
+import { reusableCapabilitySnapshot, SELLERSPRITE_CAPABILITIES } from '../adapters/sellersprite-tool-registry.js';
+import { SqliteMcpCapabilityStore } from '../adapters/sellersprite-mcp-store.js';
 import { currentExecution, mcpExecution, McpBudgetManager, McpPolicyError, requestKey,
   type SellerSpriteSyncMode } from '../adapters/mcp-policy.js';
 
@@ -562,10 +564,8 @@ export class SellerSpriteSyncService {
       entries.push({ target: `competitor:${product.id}`, remote: local || (mode === 'incremental' && quota.estimatedRemaining < 150) ? 0 : 1,
         local: local ? 1 : 0, reason: local ? 'freshness_skip' : mode === 'incremental' && quota.estimatedRemaining < 150 ? 'budget_blocked' : 'missing_or_expired' });
     }
-    const tools = this.database.prepare("SELECT collected_at, capabilities_json FROM provider_capability_snapshots WHERE provider_id='sellersprite' ORDER BY collected_at DESC LIMIT 1").get();
-    const legacyMasked = tools && (JSON.parse(String(tools.capabilities_json)) as {tools?: Array<{inputSchema?:{required?:string[]}}>}).tools
-      ?.some((tool) => tool.inputSchema?.required?.includes('[PII_PATH]'));
-    const toolFresh = tools && !legacyMasked && Date.now() - Date.parse(String(tools.collected_at)) < budget.ttl('LIST_TOOLS');
+    const toolFresh = reusableCapabilitySnapshot(new SqliteMcpCapabilityStore(this.database).latest(),
+      SELLERSPRITE_CAPABILITIES, budget.ttl('LIST_TOOLS'));
     const remote = entries.reduce((n, e) => n + e.remote, 0) + (mode !== 'incremental' || !toolFresh ? 1 : 0);
     const blockers: string[] = [];
     try { requireConfirmedOwnedRoster(this.database, market.marketplace); } catch { blockers.push('自有 SKU 清单尚未确认'); }
