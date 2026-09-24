@@ -128,6 +128,7 @@ interface ProductRow {
 }
 
 interface PreparedMarketObservation {
+  reusedHistoricalSnapshotId?: string;
   market: MarketRow;
   observationDate: string;
   provenance: Provenance;
@@ -534,10 +535,11 @@ export class SellerSpriteSyncService {
       && Boolean(this.database.prepare(`SELECT 1 FROM mcp_local_observations WHERE capability=? AND scope_key=?
         AND (historical_stable=1 OR expires_at>?)`).get(capability, requestKey([market.marketplace, entity, period]), new Date().toISOString()));
     for (const node of nodes) for (const period of [previousMonth(month), month]) {
-      const local = mode === 'incremental' && resolver.market(node.id, monthEnd(period));
+      const historical = mode !== 'force' && resolver.historicalMarket(node.id, monthEnd(period));
+      const local = historical || (mode === 'incremental' && resolver.market(node.id, monthEnd(period)));
       const reuse = local ? 3 : ['MARKET_RESEARCH', 'MARKET_STATISTICS', 'PRODUCT_CONCENTRATION'].filter((cap) => cached(cap, node.sellerSpriteNodePath, period)).length;
       entries.push({ target: `market:${node.id}:${period}`, remote: 3 - reuse, local: reuse,
-        reason: reuse === 3 ? 'freshness_skip' : 'missing_or_expired' });
+        reason: historical ? 'closed_month_snapshot_reuse' : reuse === 3 ? 'freshness_skip' : 'missing_or_expired' });
     }
     for (const product of products) {
       const local = mode === 'incremental' && (resolver.product(product.id).length > 0 || cached('ASIN_SALES_TREND', product.asin));
@@ -572,6 +574,14 @@ export class SellerSpriteSyncService {
     if (mode === 'incremental' && remote > Math.max(0, quota.estimatedRemaining - quota.reserve)) blockers.push('预计调用超过可用额度');
     const fingerprint = requestKey([market, products, nodes, competitors, quota.policy, quota.reserve]);
     const plan = { id: randomUUID(), syncMode: mode, entries, estimatedRemoteCalls: remote,
+      localSnapshotReuse: entries.filter(e => e.reason === 'closed_month_snapshot_reuse').length,
+      historicalMcpCallsSkipped: entries.filter(e => e.reason === 'closed_month_snapshot_reuse').length * 3,
+      marketRemoteCalls: entries.filter(e => e.target.startsWith('market:')).reduce((n,e) => n+e.remote,0),
+      ownedTrendCalls: entries.filter(e => e.target.startsWith('owned:')).reduce((n,e) => n+e.remote,0),
+      competitorDiscoveryCalls: entries.filter(e => e.target.startsWith('discovery:')).reduce((n,e) => n+e.remote,0),
+      confirmedCompetitorTrendCalls: entries.filter(e => e.target.startsWith('competitor:')).reduce((n,e) => n+e.remote,0),
+      toolDiscoveryCalls: mode !== 'incremental' || !toolFresh ? 1 : 0,
+      retryAttemptsPerRequest: 2, additionalPaginationAllowance: 2,
       localReuse: entries.reduce((n, e) => n + e.local, 0), cacheReuse: 0,
       maximumRemoteCalls: remote * 2 + 2, estimatedRemaining: quota.estimatedRemaining,
       projectedRemaining: Math.max(0, quota.estimatedRemaining - remote),
@@ -851,7 +861,9 @@ export class SellerSpriteSyncService {
     if (local) {
       new McpBudgetManager(this.database).record(`market:${market.id}:${observationDate}`, 'local_hit');
       new McpBudgetManager(this.database).record(`market:${market.id}:${observationDate}`, 'freshness_skip');
+      const historical = new LocalObservationResolver(this.database).historicalMarket(market.id, observationDate, String(local.id));
       return { market, observationDate, provenance: localProvenance(local),
+        reusedHistoricalSnapshotId: historical ? String(local.id) : undefined,
         metrics: Object.fromEntries(Object.entries(MARKET_METRIC_COLUMNS).map(([metric, column]) => [metric, local[column]])) as Record<MarketMetric, number | null>,
         concentration: JSON.parse(String(local.concentration_json)) as PreparedMarketObservation['concentration'] };
     }
@@ -1009,6 +1021,10 @@ export class SellerSpriteSyncService {
           throw new Error('本次 SellerSprite 市场数据与同周期不可变观察不一致，需人工核对后重新同步。');
         }
         this.linkObservation(runId, 'market', String(existing.id), market.id, 'reused');
+        if (prepared.reusedHistoricalSnapshotId) {
+          if (prepared.reusedHistoricalSnapshotId !== existing.id) throw new Error('Historical Snapshot identity changed');
+          new LocalObservationResolver(this.database).recordMarketReuse(runId, String(existing.id), market.id, observationDate);
+        }
         for (const metric of Object.keys(MARKET_METRIC_COLUMNS) as MarketMetric[]) {
           this.persistFact('market', market.id, market.marketplace,
             MARKET_METRIC_COLUMNS[metric], metrics[metric], observationDate, provenance, runId);

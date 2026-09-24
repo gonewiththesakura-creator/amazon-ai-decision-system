@@ -2254,6 +2254,20 @@ migrations.push({
   `,
 });
 
+migrations.push({ version: 33, sql: `
+  CREATE TABLE mcp_market_reuse_lineage (
+    sync_run_id TEXT NOT NULL REFERENCES data_tasks(id),
+    snapshot_id TEXT NOT NULL REFERENCES market_snapshots(id),
+    lineage_json TEXT NOT NULL CHECK(json_valid(lineage_json)),
+    created_at TEXT NOT NULL,
+    PRIMARY KEY(sync_run_id,snapshot_id)
+  );
+  CREATE TRIGGER immutable_market_reuse_update BEFORE UPDATE ON mcp_market_reuse_lineage
+    BEGIN SELECT RAISE(ABORT, 'Reuse lineage is immutable'); END;
+  CREATE TRIGGER immutable_market_reuse_delete BEFORE DELETE ON mcp_market_reuse_lineage
+    BEGIN SELECT RAISE(ABORT, 'Reuse lineage is immutable'); END;
+` });
+
 export function migrate(database: DatabaseSync): void {
   database.exec(`
     CREATE TABLE IF NOT EXISTS schema_migrations (

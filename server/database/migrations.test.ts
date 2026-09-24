@@ -353,7 +353,7 @@ describe('database migrations', () => {
     `).all() as Array<{ version: number }>;
 
     expect(versions.map((row) => Number(row.version))).toEqual(
-      Array.from({ length: 32 }, (_, index) => index + 1),
+      Array.from({ length: 33 }, (_, index) => index + 1),
     );
     expect(db.prepare('PRAGMA foreign_key_check').all()).toEqual([]);
     expect(db.prepare('PRAGMA quick_check').get()).toMatchObject({ quick_check: 'ok' });

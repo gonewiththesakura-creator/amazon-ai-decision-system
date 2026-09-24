@@ -8,6 +8,9 @@ import { seedDemoData } from '../database/demo-seed.js';
 import { IntelligenceService } from './intelligence-service.js';
 import { IntelligenceRepository } from '../repository/intelligence-repository.js';
 import { addVerifiedMcpCoverage } from '../test-utils/verified-mcp-coverage.js';
+import { LocalObservationResolver } from './local-observation-resolver.js';
+import { mcpExecution } from '../adapters/mcp-policy.js';
+import { SellerSpriteSyncService, type SellerSpriteSyncPort } from './sellersprite-sync-service.js';
 
 let database: AppDatabase | undefined;
 let temporaryDirectory: string | undefined;
@@ -1087,6 +1090,47 @@ describe('GoLiveMigrationService', () => {
     });
     expect(database.prepare(`SELECT collected_at FROM product_snapshots
       WHERE sync_run_id = ?`).get(run.id)).toEqual({ collected_at: '2026-09-18T00:00:00.000Z' });
+  });
+
+  it('certifies closed-month reuse with original acquisition proof and rejects tampered lineage', async () => {
+    database = openDatabase(':memory:');
+    insertObservationFixture(database, 'mcp', 'mcp');
+    addVerifiedMcpCoverage(database, 'market-us', 'owned-product');
+    const run = database.prepare("SELECT id FROM data_coverage_runs WHERE run_type='critical_sync'").get()!;
+    const clone = (table: string, row: Record<string, unknown>) => {
+      database!.prepare(`INSERT INTO ${table} (${Object.keys(row).join(',')}) VALUES (${Object.keys(row).map(()=>'?').join(',')})`)
+        .run(...Object.values(row) as Array<string | number | null>);
+    };
+    clone('data_tasks', {...database.prepare('SELECT * FROM data_tasks WHERE id=?').get(run.id), id:'original-history',sync_run_id:'original-history'});
+    clone('provider_capability_snapshots', {...database.prepare('SELECT * FROM provider_capability_snapshots WHERE sync_run_id=?').get(run.id),id:'original-capabilities',sync_run_id:'original-history'});
+    const snapshot=database.prepare("SELECT * FROM market_snapshots WHERE sync_run_id=? AND observation_date='2026-08-31'").get(run.id)!;
+    clone('market_snapshots',{...snapshot,id:'historical-snapshot',dedup_key:'historical-snapshot',period:'monthly',concentration_json:'[]',sync_run_id:'original-history'});
+    database.prepare("UPDATE mcp_call_logs SET sync_run_id='original-history' WHERE sync_run_id=? AND observation_month='202608'").run(run.id);
+    database.prepare("DELETE FROM mcp_sync_observation_links WHERE sync_run_id=? AND snapshot_id=?").run(run.id,snapshot.id);
+    database.prepare("INSERT INTO mcp_sync_observation_links VALUES (?,'market','historical-snapshot','market-us','reused')").run(run.id);
+    const resolver=new LocalObservationResolver(database);
+    expect(resolver.historicalMarket('market-us','2026-08-31')?.lineage.originalRunId).toBe('original-history');
+    expect(mcpExecution.run({syncMode:'certification'},()=>resolver.market('market-us','2026-08-31'))?.id).toBe('historical-snapshot');
+    expect(mcpExecution.run({syncMode:'force'},()=>resolver.market('market-us','2026-08-31'))).toBeUndefined();
+    expect(resolver.historicalMarket('market-us','2026-09-30')).toBeUndefined();
+    expect(new GoLiveMigrationService(database).verify().sellerSpriteCriticalRunId).toBeNull();
+    resolver.recordMarketReuse(String(run.id),'historical-snapshot','market-us','2026-08-31');
+    expect(new GoLiveMigrationService(database).verify().sellerSpriteCriticalRunId).toBe(run.id);
+    expect(()=>database!.exec("UPDATE mcp_market_reuse_lineage SET lineage_json='{}'")).toThrow(/immutable/);
+    expect(()=>database!.exec('DELETE FROM mcp_market_reuse_lineage')).toThrow(/immutable/);
+    let remoteCalls=0;
+    const remote=async()=>{remoteCalls++; throw new Error('Unexpected remote request');};
+    const port={fetchMarketResearchSummary:remote,fetchMarketStatistics:remote,fetchMarketConcentration:remote} as unknown as SellerSpriteSyncPort;
+    const sync=new SellerSpriteSyncService(database,port);
+    const plan=sync.planCritical({marketId:'market-us',month:'202609',syncMode:'certification'});
+    expect(plan).toMatchObject({localSnapshotReuse:1,historicalMcpCallsSkipped:3,marketRemoteCalls:3});
+    await mcpExecution.run({syncMode:'certification'},()=>sync.syncMarket({marketId:'market-us',month:'202608'}));
+    expect(remoteCalls).toBe(0);
+    expect(database.prepare('SELECT COUNT(*) n FROM mcp_market_reuse_lineage').get()).toEqual({n:2});
+    database.exec("UPDATE mcp_call_logs SET response_metadata_json='{}' WHERE sync_run_id='original-history' AND capability='MARKET_STATISTICS'");
+    expect(resolver.historicalMarket('market-us','2026-08-31')).toBeUndefined();
+    expect(resolver.hasMarketReuse(String(run.id),'market-us','2026-08-31')).toBe(false);
+    expect(new GoLiveMigrationService(database).verify().sellerSpriteCriticalRunId).toBeNull();
   });
 
   it('does not certify cached calls as a fresh critical acquisition', () => {

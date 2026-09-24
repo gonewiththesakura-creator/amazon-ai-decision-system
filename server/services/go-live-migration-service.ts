@@ -5,6 +5,7 @@ import { transaction } from '../database/database.js';
 import { confirmedDirectCompetitors } from './confirmed-direct-competitor-coverage.js';
 import { validMarketHistorySpan } from './real-history-coverage.js';
 import { ownedRosterState, type OwnedRosterState } from './owned-roster-declaration.js';
+import { LocalObservationResolver, certifiedMarketCall } from './local-observation-resolver.js';
 
 interface CountRow {
   count: number;
@@ -106,54 +107,6 @@ function jsonObject(value: unknown): Record<string, unknown> | null {
   }
   return value && typeof value === 'object' && !Array.isArray(value)
     ? value as Record<string, unknown> : null;
-}
-
-interface CertifiedMarketCall {
-  capability: string;
-  actualTool: string | null;
-  responseMetadataJson: string;
-  observationMonth: string | null;
-}
-
-function hasDiscoveredStringMonth(schema: unknown): boolean {
-  const input = jsonObject(schema);
-  const properties = jsonObject(input?.properties);
-  const nestedRequest = jsonObject(properties?.request);
-  const usesNestedRequest = Array.isArray(input?.required)
-    && input.required.includes('request');
-  const request = usesNestedRequest ? nestedRequest : input;
-  if (usesNestedRequest && request?.type !== 'object') return false;
-  const month = jsonObject(jsonObject(request?.properties)?.month);
-  return month?.type === 'string';
-}
-
-function certifiedMarketCall(call: CertifiedMarketCall, discovery: Record<string, unknown>): boolean {
-  const metadata = jsonObject(call.responseMetadataJson);
-  const certification = jsonObject(metadata?.observationCertification);
-  const capabilities = jsonObject(discovery.capabilities);
-  const hashes = jsonObject(discovery.capabilitySchemaHashes);
-  if (!certification || !capabilities || !hashes || !Array.isArray(discovery.tools)
-    || !call.actualTool || capabilities[call.capability] !== call.actualTool
-    || typeof certification.schemaHash !== 'string'
-    || !/^[a-f0-9]{64}$/.test(certification.schemaHash)
-    || hashes[call.capability] !== certification.schemaHash) return false;
-  const tools = discovery.tools.filter((candidate) => (
-    jsonObject(candidate)?.name === call.actualTool
-  ));
-  if (tools.length !== 1) return false;
-  const tool = jsonObject(tools[0]);
-  if (tool?.schemaHash !== certification.schemaHash) return false;
-  if (!isCalendarMonth(call.observationMonth ?? '')
-    || !hasDiscoveredStringMonth(tool.inputSchema)) return false;
-  if (certification.method === 'response_echo_v1') return true;
-  if (certification.method !== 'documented_request_v1') return false;
-  const documentedTool = call.capability === 'MARKET_RESEARCH'
-    ? 'market_research'
-    : call.capability === 'MARKET_STATISTICS'
-      ? 'market_research_statistics'
-      : call.capability === 'PRODUCT_CONCENTRATION'
-        ? 'market_product_concentration' : null;
-  return call.actualTool === documentedTool;
 }
 
 const MARKET_METRICS = `(
@@ -654,15 +607,13 @@ export class GoLiveMigrationService {
           && call.status === 'success' && call.cacheHit === 0
           && call.resultCount !== null && call.resultCount > 0
       ));
+      const localResolver = new LocalObservationResolver(this.database);
       if (!hasToolDiscovery
-        || !marketNodes.every((marketNode) => marketMonths.every((observationMonth) => hasCall(
-          'MARKET_RESEARCH', 'market', marketNode.nodeIdPath, false, observationMonth,
-        )))
-        || !marketNodes.every((marketNode) => marketMonths.every((observationMonth) => hasCall(
-          'MARKET_STATISTICS', 'market', marketNode.nodeIdPath, false, observationMonth,
-        )))
-        || !marketNodes.every((marketNode) => marketMonths.every((observationMonth) => hasCall(
-          'PRODUCT_CONCENTRATION', 'market', marketNode.nodeIdPath, false, observationMonth,
+        || !marketNodes.every((marketNode) => marketMonths.every((observationMonth) => (
+          localResolver.hasMarketReuse(run.id, marketNode.id, marketDateForMonth(observationMonth))
+          || certifiedMarketCapabilities.every(capability => hasCall(
+            capability, 'market', marketNode.nodeIdPath, false, observationMonth,
+          ))
         )))
         || !owned.every((product) => hasCall('ASIN_SALES_TREND', 'product', product.asin.toUpperCase()))
         || !owned.every((product) => hasCall(
