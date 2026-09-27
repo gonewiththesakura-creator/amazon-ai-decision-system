@@ -125,6 +125,7 @@ export default function DashboardPage() {
         </div>
         <div className="executive-dashboard-header__meta">
           <span><Store size={14} aria-hidden="true" />Amazon {data.marketplace}</span>
+          {coverageQuery.data?.marketDataMaturity ? <span role="status">{coverageQuery.data.marketDataMaturity.message}</span> : null}
           {coverageQuery.loading && !coverageQuery.data ? (
             <span role="status" aria-label="正在检查数据覆盖">正在检查数据覆盖…</span>
           ) : (

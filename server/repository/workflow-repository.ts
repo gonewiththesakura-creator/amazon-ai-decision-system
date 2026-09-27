@@ -24,6 +24,7 @@ import type { AppDatabase } from '../database/database.js';
 import { assertResearchJobTransition } from '../domain/research-job-state-machine.js';
 import { hashAnalysisInput } from '../services/ai-service.js';
 import { IntelligenceRepository } from './intelligence-repository.js';
+import { entityMarketMaturity, requires90DaySupport } from '../services/market-data-maturity.js';
 
 type DbRow = Record<string, unknown>;
 
@@ -259,6 +260,7 @@ export class WorkflowRepository {
     const insight = this.getLatestWorkflowInsight(id, summary.dataVersion);
     return {
       ...summary,
+      marketDataMaturity: entityMarketMaturity(this.database, 'research_job', id),
       input: jsonObject(row.input_json),
       taskBook: jsonObject(row.task_book_json),
       steps: this.getResearchSteps(id),
@@ -700,6 +702,14 @@ export class WorkflowRepository {
   }
 
   saveWorkflowInsight(job: ResearchJobDetail, input: WorkflowInsightInput): Insight {
+    const maturity = entityMarketMaturity(this.database, 'research_job', job.id);
+    if (maturity?.status === 'LIMITED') {
+      if (requires90DaySupport([input.title,input.summary,input.facts,input.opportunities])) {
+        throw new Error('LIMITED：历史不足，禁止生成需要90天市场数据支持的Insight。');
+      }
+      input = {...input, risks: [...input.risks,maturity.message],
+        missingData: [...new Set([...(input.missingData ?? []),'market_history_90d'])]};
+    }
     this.assertEvidenceIds(job.id, input.evidenceIds);
     const cacheInput = {
       jobId: job.id, dataVersion: job.dataVersion, promptVersion: job.promptVersion,

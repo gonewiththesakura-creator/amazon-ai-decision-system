@@ -4,6 +4,7 @@ import type { AppDatabase } from '../database/database.js';
 import { transaction } from '../database/database.js';
 import { confirmedDirectCompetitors } from './confirmed-direct-competitor-coverage.js';
 import { validMarketHistorySpan } from './real-history-coverage.js';
+import { marketDataMaturity } from './market-data-maturity.js';
 import { ownedRosterState, sellerSpriteRosterScope, type OwnedRosterState } from './owned-roster-declaration.js';
 import { LocalObservationResolver, certifiedMarketCall } from './local-observation-resolver.js';
 
@@ -26,6 +27,7 @@ export interface GoLivePreview {
 }
 
 export interface GoLiveVerification extends OwnedRosterState {
+  marketDataMaturity: ReturnType<typeof marketDataMaturity>;
   ownedProductRosterCoverage: {confirmed:number;total:number;passed:boolean};
   sellerSpriteEnrichmentCoverage: {required:number;covered:number;excluded:ReturnType<typeof sellerSpriteRosterScope>['excluded']};
   marketCoverage: {primaryHistoryDays:number;hasPrimaryHistory90d:boolean;internalOnlyProducts:number};
@@ -401,6 +403,7 @@ export class GoLiveMigrationService {
       AND ${PRODUCT_METRICS} LIMIT 1`).get(p.id))).length;
     return {
       ...rosterState,
+      marketDataMaturity: marketDataMaturity(this.database,settings.marketplace,settings.default_market_id),
       ownedProductRosterCoverage:{confirmed:rosterState.ownedRosterMatches?providerScope.rows.length:0,total:providerScope.rows.length,passed:rosterState.ownedRosterMatches},
       sellerSpriteEnrichmentCoverage:{required:providerScope.eligible.length,covered:eligibleSnapshotCount,excluded:providerScope.excluded},
       marketCoverage:{primaryHistoryDays:primaryMarketHistory.days,hasPrimaryHistory90d:hasPrimaryMarketHistory90d,internalOnlyProducts:providerScope.excluded.length},
@@ -429,7 +432,6 @@ export class GoLiveMigrationService {
         && realMarketSnapshots > 0
         && eligibleSnapshotCount === providerScope.eligible.length
         && sellerSpriteOwnedProductSnapshots > 0
-        && hasPrimaryMarketHistory90d
         && confirmedDirectCompetitorCount > 0
         && readyForDemoCleanup,
     };

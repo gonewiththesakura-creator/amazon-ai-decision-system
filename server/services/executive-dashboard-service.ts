@@ -28,6 +28,7 @@ import type { AppDatabase } from '../database/database.js';
 import { IntelligenceRepository } from '../repository/intelligence-repository.js';
 import { WorkflowRepository } from '../repository/workflow-repository.js';
 import { DashboardFreshnessService } from './dashboard-freshness-service.js';
+import { entityMarketMaturity } from './market-data-maturity.js';
 
 export interface RawTrendPoint {
   date: string;
@@ -108,7 +109,9 @@ export class ExecutiveDashboardService {
       : null;
     const ownedSkuPerformance = this.ownedPerformance(owned, formalOwnedInsights);
     const overviewOwned = selectOverviewProducts(owned, ownedSkuPerformance, skuId, comparisonSkuIds);
-    const rawTrend = this.generalTrendSeries(market, overviewOwned);
+    const limitedLongRange = RANGE_DAYS[range] >= 90 && market
+      && entityMarketMaturity(this.database,'market',market.node.id)?.status === 'LIMITED';
+    const rawTrend = this.generalTrendSeries(limitedLongRange ? null : market, overviewOwned);
     const trendComparison = buildIndexedSeries(rawTrend, range, 'overview');
     const fastGrowth = this.fastGrowthCompetitors(owned, settings.marketplace);
     const developmentOpportunities = this.developmentOpportunities(
@@ -339,7 +342,8 @@ export class ExecutiveDashboardService {
         points: product.snapshots.map(snapshotSalesPoint),
       },
     ];
-    if (market) {
+    if (market && !(RANGE_DAYS[range] >= 90
+      && entityMarketMaturity(this.database,'market',market.node.id)?.status === 'LIMITED')) {
       rawSeries.push({
         id: `market:${market.node.id}`,
         label: market.node.name,

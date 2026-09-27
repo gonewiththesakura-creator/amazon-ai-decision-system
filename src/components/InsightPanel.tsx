@@ -23,6 +23,7 @@ export function InsightPanel({ insight, title = 'AI 判断' }: { insight: Insigh
         </div>
       </header>
       <p className="insight-panel__summary">{insight.summary}</p>
+      {insight.marketDataMaturity ? <p role="status">{insight.marketDataMaturity.message}</p> : null}
 
       {!insufficientData ? <div className="insight-columns">
         <div>

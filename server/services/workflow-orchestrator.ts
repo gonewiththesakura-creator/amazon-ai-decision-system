@@ -19,6 +19,7 @@ import { IntelligenceRepository } from '../repository/intelligence-repository.js
 import { WorkflowRepository } from '../repository/workflow-repository.js';
 import { MetricAuthorityResolver, type MetricFact } from './metric-authority-resolver.js';
 import { isLiveObservationReadable } from './live-observation-readability.js';
+import { entityMarketMaturity, requires90DaySupport } from './market-data-maturity.js';
 
 export interface RetryResearchJobRequest {
   resolvedData: Record<string, unknown>;
@@ -291,6 +292,16 @@ export class WorkflowOrchestrator {
       dataVersion: job.dataVersion, ruleProfile: `${job.ruleProfileId}@${job.ruleProfileVersion}`,
     });
     const profile = this.repository.getLockedRuleProfile(job);
+    const maturity = entityMarketMaturity(this.database,'research_job',job.id);
+    if (maturity?.status === 'LIMITED' && requires90DaySupport([job.input,job.taskBook,requiredFields(profile)])) {
+      const missing = [{fieldName:'market_history_90d',reason:maturity.message,manualValidationRequired:false}];
+      this.repository.upsertMissingData(job.id,missing);
+      this.repository.saveRuleExecution(job,collected.values,{hardGateStatus:'needs_data',missing},'needs_data',null);
+      this.repository.finishStep(job.id,'validate','needs_data',{missing,marketDataMaturity:maturity});
+      this.repository.failJobDataTasks(job.id,maturity.message);
+      this.repository.transition(job.id,'needs_data');
+      return null;
+    }
     if (isProductResearch(job)) {
       const result = executeProductRules(profile, job.input, job.taskBook);
       const formalTaskBookMissing = result.hardGateStatus === 'reject'

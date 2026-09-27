@@ -846,6 +846,7 @@ describe('SellerSprite real-data sync', () => {
       candidateId: candidate.id,
       relationType: 'direct',
       reason: '人工核对后确认',
+      humanReview: {reviewer:'user',evidence:{source:'B-stage review',decision:'direct'}},
     });
 
     expect(confirmed).toMatchObject({ ownedProductId: 'owned-1', relationType: 'direct' });
@@ -860,8 +861,12 @@ describe('SellerSprite real-data sync', () => {
       FROM product_identity_events event
       WHERE event.product_id = ?
     `).get(confirmed.competitorProductId)).toEqual({
-      sourceType: 'mcp', syncRunId: result.runId,
+      sourceType: 'mcp', syncRunId: null,
     });
+    expect(database.prepare('SELECT reviewer,observation_id FROM competitor_human_reviews').get())
+      .toMatchObject({reviewer:'user',observation_id:expect.any(String)});
+    expect(()=>database!.exec("UPDATE competitor_human_reviews SET reviewer='changed'")).toThrow(/immutable/);
+    expect(()=>database!.exec('DELETE FROM competitor_human_reviews')).toThrow(/immutable/);
   });
 
   it('tracks standalone candidate discovery and preserves the same candidate across runs', async () => {

@@ -285,8 +285,6 @@ export async function runAcceptanceCli(
       ? 'confirmed' : 'missing';
     requireCondition(verification.sellerSpriteCriticalRunId === critical.runId
       && verification.readyForDemoCleanup
-      && verification.hasPrimaryMarketHistory90d
-      && verification.primaryMarketHistoryDays >= 90
       && verification.runLinkedCandidateGroups > 0
       && verification.confirmedDirectCompetitors > 0
       && verification.verifiedEvidenceEntities === jobs.length

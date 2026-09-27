@@ -948,6 +948,7 @@ export default function ResearchJobsPage() {
                     </div>
                   </div>
                   {detail.error ? <div className="alert alert-error" role="alert">{detail.error}</div> : null}
+                  {detail.marketDataMaturity ? <p role="status">{detail.marketDataMaturity.message}</p> : null}
                   <div className="research-progress">
                     <div><span>步骤进度</span><strong>{steps.length ? `${completedSteps} / ${steps.length}` : '尚未开始'}</strong></div>
                     <div className="progress-track" aria-label={`工作流完成 ${progress}%`}><i style={{ width: `${progress}%` }} /></div>

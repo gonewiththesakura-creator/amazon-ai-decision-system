@@ -2348,6 +2348,20 @@ migrations.push({ version: 35, apply(database: DatabaseSync) {
     BEGIN SELECT RAISE(ABORT,'Failed runs cannot satisfy coverage'); END;
 `); } });
 
+migrations.push({version:36,sql:`
+  CREATE TABLE competitor_human_reviews (
+    id TEXT PRIMARY KEY, candidate_id TEXT NOT NULL REFERENCES competitor_candidates(id),
+    relation_id TEXT NOT NULL REFERENCES competitor_relations(id),
+    observation_id TEXT REFERENCES competitor_candidate_observations(id),
+    reviewer TEXT NOT NULL, reviewed_at TEXT NOT NULL,
+    evidence_json TEXT NOT NULL CHECK(json_valid(evidence_json))
+  );
+  CREATE TRIGGER competitor_review_no_update BEFORE UPDATE ON competitor_human_reviews
+    BEGIN SELECT RAISE(ABORT,'Human review evidence is immutable'); END;
+  CREATE TRIGGER competitor_review_no_delete BEFORE DELETE ON competitor_human_reviews
+    BEGIN SELECT RAISE(ABORT,'Human review evidence is immutable'); END;
+`});
+
 export function migrate(database: DatabaseSync): void {
   database.exec(`
     CREATE TABLE IF NOT EXISTS schema_migrations (

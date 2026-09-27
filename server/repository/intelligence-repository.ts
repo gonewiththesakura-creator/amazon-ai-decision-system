@@ -24,6 +24,7 @@ import type { AppDatabase } from '../database/database.js';
 import { deriveSnapshotGrowth, type SnapshotGrowthPair } from '../domain/snapshot-growth.js';
 import { MetricAuthorityResolver, type MetricFact } from '../services/metric-authority-resolver.js';
 import { isLiveObservationReadable } from '../services/live-observation-readability.js';
+import { entityMarketMaturity } from '../services/market-data-maturity.js';
 
 type DbPrimitive = string | number | bigint | null;
 type DbRow = Record<string, DbPrimitive>;
@@ -827,6 +828,7 @@ export class IntelligenceRepository {
 
   private mapInsight(row: DbRow): Insight {
     return {
+      marketDataMaturity: entityMarketMaturity(this.database,stringValue(row.entity_type),stringValue(row.entity_id)),
       id: stringValue(row.id),
       entityType: stringValue(row.entity_type),
       entityId: stringValue(row.entity_id),
@@ -862,6 +864,7 @@ export class IntelligenceRepository {
 
   private emptyInsight(entityType: string, entityId: string, status: string): Insight {
     return {
+      marketDataMaturity: entityMarketMaturity(this.database,entityType,entityId),
       id: '', entityType, entityId, insightType: 'insufficient_data', status,
       title: '当前数据不足', summary: '当前数据不足，结论置信度低，建议先导入市场与产品快照。',
       facts: [], opportunities: [], risks: ['缺少可用历史快照'], recommendedActions: ['导入 CSV/XLSX 或连接数据源'],

@@ -225,11 +225,6 @@ describe('real SellerSprite acceptance runner', () => {
   });
 
   it.each([
-    ['89 days of primary-market history', {
-      primaryMarketHistoryDays: 89,
-      hasPrimaryMarketHistory90d: false,
-      confirmedDirectCompetitors: 1,
-    }],
     ['no human-confirmed active direct competitor', {
       primaryMarketHistoryDays: 92,
       hasPrimaryMarketHistory90d: true,

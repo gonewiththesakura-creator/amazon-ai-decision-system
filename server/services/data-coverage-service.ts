@@ -7,6 +7,7 @@ import type { AppDatabase } from '../database/database.js';
 import { confirmedDirectCompetitors } from './confirmed-direct-competitor-coverage.js';
 import { isLiveObservationReadable } from './live-observation-readability.js';
 import { validMarketHistorySpan, validProductHistorySpans } from './real-history-coverage.js';
+import { marketDataMaturity } from './market-data-maturity.js';
 
 interface CountRow {
   count: number;
@@ -290,7 +291,7 @@ export class DataCoverageService {
     primaryMarketId: string | null,
   ): Pick<DataCoverageReport,
     'primaryMarketHistory90d' | 'ownedProductHistory90d' | 'ownedProductHistory180d'
-    | 'coreCompetitorHistory90d' | 'coreDirectCompetitorTarget'> {
+    | 'coreCompetitorHistory90d' | 'coreDirectCompetitorTarget' | 'marketDataMaturity'> {
     const owned = this.database.prepare(`
       SELECT id FROM products
       WHERE marketplace = ? AND is_owned = 1 AND is_parent = 0
@@ -332,6 +333,7 @@ export class DataCoverageService {
     );
     return {
       primaryMarketHistory90d: counter(primaryMarketHistory.days >= 90 ? 1 : 0, 1),
+      marketDataMaturity: marketDataMaturity(this.database, marketplace, primaryMarketId),
       ownedProductHistory90d: counter(
         owned.filter((product) => (ownedSpans.get(product.id)?.days ?? 0) >= 90).length,
         owned.length,

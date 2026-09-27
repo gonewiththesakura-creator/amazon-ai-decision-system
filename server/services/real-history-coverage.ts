@@ -36,6 +36,7 @@ export function validMarketHistorySpan(
   database: AppDatabase,
   marketplace: string,
   marketId: string | null,
+  asOf = Number.POSITIVE_INFINITY,
 ): HistorySpan {
   if (!marketId) return emptySpan();
   const snapshots = database.prepare(`
@@ -56,7 +57,7 @@ export function validMarketHistorySpan(
     WHERE fact.entity_type = 'market' AND fact.marketplace = ? AND fact.entity_id = ?
       AND fact.source_type IN (${REAL_SOURCE_TYPES}) AND fact.numeric_value IS NOT NULL
   `).all(marketplace, marketId) as unknown as ObservationDateRow[];
-  return spanForRows(database, [...snapshots, ...facts]);
+  return spanForRows(database, [...snapshots, ...facts], asOf);
 }
 
 export function validProductHistorySpans(
@@ -98,10 +99,11 @@ export function validProductHistorySpans(
   return spans;
 }
 
-function spanForRows(database: AppDatabase, rows: ObservationDateRow[]): HistorySpan {
+function spanForRows(database: AppDatabase, rows: ObservationDateRow[], asOf = Number.POSITIVE_INFINITY): HistorySpan {
   const dates = new Set<number>();
   for (const row of rows) {
-    if (row.observationDay === null || !Number.isFinite(row.observationDay)) continue;
+    if (row.observationDay === null || !Number.isFinite(row.observationDay)
+      || row.observationDay > asOf / 86_400_000 + 2440587.5) continue;
     if (!isLiveObservationReadable(
       database, row.kind, row.id, row.sourceType, row.syncRunId,
     )) continue;

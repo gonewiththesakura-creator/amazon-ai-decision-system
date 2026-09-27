@@ -1,7 +1,7 @@
 import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import request from 'supertest';
 import type { AppSettings, DashboardData, MarketDetail, OwnedProductSummary } from '../shared/types.js';
 import type { SellerSpriteConnectionDiagnostics } from './adapters/sellersprite-mcp-adapter.js';
@@ -16,6 +16,7 @@ let database: AppDatabase | undefined;
 let temporaryDirectory: string | undefined;
 
 afterEach(() => {
+  vi.useRealTimers();
   database?.close();
   database = undefined;
   if (temporaryDirectory) rmSync(temporaryDirectory, { recursive: true, force: true });
@@ -1322,6 +1323,9 @@ describe('workflow mutations', () => {
   });
 
   it('uses a 30-day baseline after an additional same-day market sync', async () => {
+    // Keep the fixed Demo baseline within the comparable 30-day observation window.
+    vi.useFakeTimers({ toFake: ['Date'] });
+    vi.setSystemTime(new Date('2026-09-24T10:30:00+08:00'));
     const app = testApp();
     await request(app).post('/api/settings/demo').send({ enabled: true }).expect(200);
     const before = await request(app).get('/api/markets/mkt-memory-foam').expect(200);

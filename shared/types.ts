@@ -87,7 +87,16 @@ export interface Evidence {
   provenance: Provenance[];
 }
 
+export interface MarketDataMaturity {
+  status: 'LIMITED' | 'READY';
+  historyDays: number;
+  observationDates: number;
+  hardBlocker: false;
+  message: string;
+}
+
 export interface Insight {
+  marketDataMaturity?: MarketDataMaturity;
   id: string;
   entityType: string;
   entityId: string;
@@ -300,6 +309,7 @@ export interface DecisionRecord {
 }
 
 export interface ResearchJobSummary {
+  marketDataMaturity?: MarketDataMaturity;
   id: string;
   name: string;
   type: ResearchJobType;
@@ -828,6 +838,7 @@ export interface DirectCompetitorTargetCoverage extends DataCoverageCounter {
 }
 
 export interface DataCoverageReport {
+  marketDataMaturity?: MarketDataMaturity;
   generatedAt: string;
   marketplace: string;
   primaryMarket: DataCoverageCounter;

@@ -47,6 +47,7 @@ export interface SellerSpriteCandidateConfirmationInput {
   relationType: 'direct' | 'top100' | 'benchmark' | 'fast_growth' | 'price_peer';
   reason: string;
   similarityScore?: number;
+  humanReview?: {reviewer:string; evidence:Record<string,unknown>};
 }
 
 export interface SellerSpriteCandidateReviewInput {
@@ -507,7 +508,7 @@ export class SellerSpriteSyncService {
         asin: candidate.asin,
         parentAsin: existing ? undefined : stringOrNull(payload.parentAsin) ?? undefined,
         sourceType: 'mcp',
-        syncRunId: candidate.syncRunId ?? undefined,
+        // Human confirmation is not another acquisition by the original provider run.
       });
       if (!resolution.productId) throw new Error('竞争候选产品身份创建失败。');
       if (resolution.disposition === 'created') {
@@ -524,19 +525,29 @@ export class SellerSpriteSyncService {
           resolution.productId,
         );
       }
+      const relationId = randomUUID();
       this.database.prepare(`
         INSERT INTO competitor_relations (
           id, owned_product_id, competitor_product_id, relation_type,
           similarity_score, reason, ai_tags_json, created_at, last_verified_at
         ) VALUES (?, ?, ?, ?, ?, ?, '[]', ?, ?)
       `).run(
-        randomUUID(), owned.id, resolution.productId, input.relationType,
+        relationId, owned.id, resolution.productId, input.relationType,
         input.similarityScore ?? 0, input.reason,
         new Date().toISOString(), new Date().toISOString(),
       );
       this.database.prepare(`
         UPDATE competitor_candidates SET status = 'confirmed', reviewed_at = ? WHERE id = ?
       `).run(new Date().toISOString(), candidate.id);
+      if (input.humanReview) {
+        const observation = this.database.prepare(`SELECT id FROM competitor_candidate_observations
+          WHERE candidate_id=? ORDER BY collected_at DESC,rowid DESC LIMIT 1`).get(candidate.id);
+        this.database.prepare(`INSERT INTO competitor_human_reviews
+          (id,candidate_id,relation_id,observation_id,reviewer,reviewed_at,evidence_json) VALUES(?,?,?,?,?,?,?)`)
+          .run(randomUUID(),candidate.id,relationId,observation?.id ?? null,input.humanReview.reviewer,
+            new Date().toISOString(),JSON.stringify({...input.humanReview.evidence,relationType:input.relationType,
+              ownedProductId:owned.id,competitorAsin:candidate.asin,originalProviderRunId:candidate.syncRunId}));
+      }
       return {
         ownedProductId: owned.id,
         competitorProductId: resolution.productId,

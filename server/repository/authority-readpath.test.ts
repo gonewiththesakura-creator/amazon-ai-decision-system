@@ -312,7 +312,7 @@ describe('read-time metric authority', () => {
     expect(repository.getMarketSnapshots('market-us')).toHaveLength(2);
 
     const dashboard = new ExecutiveDashboardService(db, repository, new WorkflowRepository(db))
-      .getDashboard('90D');
+      .getDashboard('30D');
     expect(dashboard.trendComparison.find((series) => series.id === 'market:market-us')?.points)
       .toEqual(expect.arrayContaining([{ date: '2026-09-18', index: 210, relativeToMarket: null }]));
     const candidate = new DeterministicAIService(repository).preview({
