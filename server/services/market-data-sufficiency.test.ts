@@ -5,6 +5,7 @@ import {WorkflowRepository} from '../repository/workflow-repository.js';
 import {WorkflowOrchestrator} from './workflow-orchestrator.js';
 import {GoLiveMigrationService} from './go-live-migration-service.js';
 import {LIMITED_MARKET_MISSING_FIELDS,hasLimitedMarketEvidence} from './market-data-sufficiency.js';
+import {requires90DaySupport} from './market-data-maturity.js';
 
 let db:AppDatabase;
 afterEach(()=>db?.close());
@@ -24,6 +25,10 @@ function fixture() {
  return {runId,repo,job,go:new GoLiveMigrationService(db)};
 }
 describe('LIMITED market system evidence does not complete market analysis',()=>{
+ it('does not interpret an opaque certification UUID containing 90d as a 90-day request',()=>{
+  expect(requires90DaySupport({certificationRunId:'1111190d-1111-4111-8111-111111111111'})).toBe(false);
+  expect(requires90DaySupport({certificationRunId:'1111190d-1111-4111-8111-111111111111',analysisWindow:'90D'})).toBe(true);
+ });
  it('runs three unchanged full owned diagnoses in an explicitly complete synthetic baseline fixture',()=>{
   const {runId,repo,go}=fixture();
   db.exec("UPDATE research_jobs SET status='needs_data' WHERE job_type='owned_product'");

@@ -35,6 +35,8 @@ export function requires90DaySupport(value: unknown): boolean {
   if (typeof value === 'string') return pattern.test(value);
   if (Array.isArray(value)) return value.some(requires90DaySupport);
   if (value && typeof value === 'object') return Object.entries(value).some(([key,item]) =>
-    item !== null && item !== undefined && item !== false && (pattern.test(key) || requires90DaySupport(item)));
+    // Opaque lineage identifiers are not requests for a 90-day analysis window.
+    key !== 'certificationRunId' && item !== null && item !== undefined && item !== false
+      && (pattern.test(key) || requires90DaySupport(item)));
   return false;
 }
