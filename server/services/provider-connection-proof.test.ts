@@ -5,6 +5,17 @@ import {providerConnectionProof,recordExplicitConnectionProof} from './provider-
 let db:AppDatabase;
 afterEach(()=>db?.close());
 describe('run-bound connection proof',()=>{
+ it.each(['failed','partial','wrong-run','cached','missing-capability'])('rejects %s even with fresh manual connection evidence',kind=>{
+  db=openDatabase(':memory:');db.exec("INSERT INTO market_nodes(id,name,level,marketplace,source_type,status,created_at) VALUES('mkt-memory-foam','Synthetic',1,'US','import','active','2026-01-01')");
+  addVerifiedMcpCoverage(db);const run=String(db.prepare('SELECT id FROM data_coverage_runs LIMIT 1').get()!.id);
+  const now=new Date().toISOString();db.prepare("UPDATE data_sources SET status='connected',last_sync_at=? WHERE id='source-sellersprite-mcp'").run(now);recordExplicitConnectionProof(db,now);
+  db.prepare("UPDATE mcp_call_logs SET completed_at=started_at WHERE sync_run_id=? AND capability='LIST_TOOLS'").run(run);
+  if(kind==='failed'||kind==='partial')db.prepare('UPDATE data_tasks SET status=? WHERE id=?').run(kind,run);
+  if(kind==='cached')db.prepare("UPDATE mcp_call_logs SET cache_hit=1 WHERE sync_run_id=? AND capability='LIST_TOOLS'").run(run);
+  if(kind==='wrong-run')db.prepare("UPDATE mcp_call_logs SET sync_run_id=NULL WHERE sync_run_id=? AND capability='LIST_TOOLS'").run(run);
+  if(kind==='missing-capability')db.prepare('DELETE FROM provider_capability_snapshots WHERE sync_run_id=?').run(run);
+  expect(providerConnectionProof(db,run)).toBeNull();expect(providerConnectionProof(db,null)?.method).toBe('explicit_connection_test');
+ });
  it('requires immutable explicit test evidence, not a manually refreshed source timestamp',()=>{
   db=openDatabase(':memory:');const now=new Date().toISOString();
   db.prepare("UPDATE data_sources SET status='connected',last_sync_at=? WHERE id='source-sellersprite-mcp'").run(now);

@@ -302,6 +302,7 @@ export function addVerifiedMcpCoverage(
   ) VALUES (?, 'sellersprite', ?, ?, 'success', ?, ?, 1, ?, ?, ?, ?, ?)`);
   addCall.run(randomUUID(), 'LIST_TOOLS', `list-tools-${runId}`,
     null, null, now, runId, null, null, '{}');
+  database.prepare("UPDATE mcp_call_logs SET completed_at=started_at WHERE sync_run_id=? AND capability='LIST_TOOLS'").run(runId);
   for (const marketNode of marketNodes) {
     for (const marketMonth of marketMonths) {
       addCall.run(randomUUID(), 'MARKET_RESEARCH',

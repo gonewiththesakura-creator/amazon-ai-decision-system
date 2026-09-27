@@ -21,6 +21,8 @@ export function providerConnectionProof(db: AppDatabase, runId: string | null): 
         AND NOT EXISTS(SELECT 1 FROM data_tasks t WHERE t.sync_run_id=l.sync_run_id AND t.status IN ('failed','partial'))
       ORDER BY l.completed_at DESC LIMIT 1`).get(runId);
     if (row) return {provider:'sellersprite',runId,collectedAt:String(row.completed_at),status:'success',method:'fresh_list_tools'};
+    // A requested run can never inherit a manual test or another run's connection.
+    return null;
   }
   if(!db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='provider_connection_proofs'").get())return null;
   const explicit = db.prepare(`SELECT p.collected_at AS last_sync_at FROM provider_connection_proofs p

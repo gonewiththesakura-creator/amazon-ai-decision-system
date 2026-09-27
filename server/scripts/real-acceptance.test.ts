@@ -27,6 +27,27 @@ afterEach(async () => {
 });
 
 describe('real SellerSprite acceptance runner', () => {
+  it.each(['expired','fresh'])('keeps the 3 Owned / 5 competitor happy path at Base 12 when connection TTL is %s',async ttl=>{
+    const api=await startApi({finalScope:true}),output:string[]=[];
+    expect(await runAcceptanceCli(['--base-url',api.baseUrl,'--month','202608'],{writeOutput:v=>output.push(v)})).toBe(0);
+    // A legacy /test would spend one additional LIST_TOOLS only when its TTL expires.
+    const tests=api.requests.filter(r=>r==='POST /api/integrations/sellersprite/test').length;
+    const criticals=api.requests.filter(r=>r==='POST /api/integrations/sellersprite/sync/critical').length;
+    expect(criticals).toBe(1);expect(tests).toBe(0);
+    expect(criticals*(1+3+3+5)+(ttl==='expired'?tests:0)).toBe(12);
+    expect(JSON.parse(output[0]!).checks.connection).toBe(true);
+  });
+  it.each(['wrong-run','null','explicit'] as const)('rejects %s proof without a connection test fallback',async connectionProof=>{
+    const api=await startApi({connectionProof}),output:string[]=[];
+    expect(await runAcceptanceCli(['--base-url',api.baseUrl,'--month','202609'],{writeOutput:v=>output.push(v)})).toBe(1);
+    expect(JSON.parse(output[0]!).checks.connection).toBe(false);
+    expect(api.requests).not.toContain('POST /api/integrations/sellersprite/test');
+    expect(api.requests).not.toContain('POST /api/research-jobs');
+  });
+  it('never permits the legacy remote connection route in Certification',()=>{
+    expect(isAllowedAcceptanceRequest('POST','/api/integrations/sellersprite/test')).toBe(false);
+    expect(isAllowedAcceptanceRequest('GET',`/api/integrations/sellersprite/connection-proof?runId=${RUN_ID}`)).toBe(true);
+  });
   it.each(['ordinary needs_data','wrong insight','wrong gate','wrong decision','raw mapping error','mock'])('rejects invalid Owned completion: %s',kind=>{
     const done={id:'job',status:'needs_data',isDemo:false,error:null as string|null,latestInsight:{insightType:'owned_product_data_sufficiency',hardGate:'needs_data',decision:'needs_data'}};
     if(kind==='ordinary needs_data')done.latestInsight.insightType='';
@@ -142,8 +163,8 @@ describe('real SellerSprite acceptance runner', () => {
     expect(api.requests).toEqual([
       'GET /api/settings',
       'GET /api/markets',
-      'POST /api/integrations/sellersprite/test',
       'POST /api/integrations/sellersprite/sync/critical',
+      `GET /api/integrations/sellersprite/connection-proof?runId=${RUN_ID}`,
       `GET /api/integrations/sellersprite/sync/critical/${RUN_ID}/roster`,
       `GET /api/integrations/sellersprite/capabilities?runId=${RUN_ID}`,
       'GET /api/dashboard/executive?range=30D',
@@ -316,7 +337,7 @@ describe('real SellerSprite acceptance runner', () => {
     expect(output[0]).not.toMatch(/https?:\/\//);
     expect(JSON.parse(output[0]!)).toMatchObject({
       ok: false,
-      checks: { preflight: true, connection: true, schemas: false, criticalSync: false },
+      checks: { preflight: true, connection: false, schemas: false, criticalSync: false },
     });
     expect(api.requests).not.toContain('POST /api/research-jobs');
     expect(api.requests).not.toContain('GET /api/dashboard/executive?range=30D');
@@ -459,6 +480,8 @@ describe('real SellerSprite acceptance runner', () => {
 });
 
 interface ApiOptions {
+  finalScope?: boolean;
+  connectionProof?: 'wrong-run'|'null'|'explicit';
   limitedJob?: 'market' | 'owned';
   failPath?: string;
   failureBody?: unknown;
@@ -533,12 +556,10 @@ async function startApi(options: ApiOptions = {}): Promise<{
       ]);
       return;
     }
-    if (route === 'POST /api/integrations/sellersprite/test') {
-      respondData(response, {
-        connected: true, authenticated: true, toolCount: 9,
-        requiredCapabilityCount: 5, availableRequiredCapabilityCount: 5,
-        missingCapabilities: [], latencyMs: 8, debug: SECRET_CANARY,
-      });
+    if (route === `GET /api/integrations/sellersprite/connection-proof?runId=${RUN_ID}`) {
+      respondData(response, options.connectionProof==='null'?null:{provider:'sellersprite',status:'success',
+        runId:options.connectionProof==='wrong-run'?OTHER_RUN_ID:RUN_ID,collectedAt:new Date().toISOString(),
+        method:options.connectionProof==='explicit'?'explicit_connection_test':'fresh_list_tools'});
       return;
     }
     if (route === `GET /api/integrations/sellersprite/capabilities?runId=${RUN_ID}`) {
@@ -557,9 +578,9 @@ async function startApi(options: ApiOptions = {}): Promise<{
       respondData(response, {
         runId: RUN_ID, taskId: RUN_ID, marketSnapshots: 2, productSnapshots: 4,
         candidateCoverage: options.candidateCoverage
-          ?? { status: 'success', total: 2, success: 2, failed: 0, candidates: 1 },
+          ?? { status: 'success', total: options.finalScope?3:2, success: options.finalScope?3:2, failed: 0, candidates: 1 },
         competitorCoverage: options.competitorCoverage
-          ?? { status: 'success', total: 1, success: 1, failed: 0 },
+          ?? { status: 'success', total: options.finalScope?5:1, success: options.finalScope?5:1, failed: 0 },
         private: PRIVATE_CANARY,
       }, 201);
       return;
@@ -572,7 +593,7 @@ async function startApi(options: ApiOptions = {}): Promise<{
     if (route === `GET /api/integrations/sellersprite/sync/critical/${RUN_ID}/roster`) {
       respondData(response, {
         marketId: 'market-1',
-        ownedProductIds: ['owned-1', 'owned-2'],
+        ownedProductIds: options.finalScope?['owned-1','owned-2','owned-3']:['owned-1', 'owned-2'],
         private: PRIVATE_CANARY,
       });
       return;
@@ -614,7 +635,7 @@ async function startApi(options: ApiOptions = {}): Promise<{
     }
     if (route === 'GET /api/dashboard/executive?range=30D') {
       respondData(response, {
-        ownedSkuPerformance: (options.dashboardProductIds ?? ['demo-owned', 'owned-1', 'owned-2'])
+        ownedSkuPerformance: (options.dashboardProductIds ?? (options.finalScope?['owned-1','owned-2','owned-3']:['demo-owned', 'owned-1', 'owned-2']))
           .map((id) => ({ id })),
         market: { id: 'market-1', name: PRIVATE_CANARY },
         debug: SECRET_CANARY,
@@ -623,15 +644,15 @@ async function startApi(options: ApiOptions = {}): Promise<{
     }
     if (route === `GET /api/dashboard/executive/run-proof/${RUN_ID}`) {
       respondData(response, options.dashboardProof ?? {
-        passed: true, marketVerified: true, verifiedOwnedProducts: 2, requiredOwnedProducts: 2,
+        passed: true, marketVerified: true, verifiedOwnedProducts: options.finalScope?3:2, requiredOwnedProducts: options.finalScope?3:2,
       });
       return;
     }
     if (route === 'GET /api/go-live/verify') {
       respondData(response, {
         sellerSpriteCriticalRunId: RUN_ID,
-        verifiedEvidenceEntities: 3,
-        requiredEvidenceEntities: 3,
+        verifiedEvidenceEntities: options.finalScope?4:3,
+        requiredEvidenceEntities: options.finalScope?4:3,
         readyForDemoCleanup: true,
         hasMinimumRealCoverage: false,
         primaryMarketHistoryDays: 92,

@@ -18,12 +18,8 @@ const marketSchema = z.object({
   status: z.string(),
 });
 const connectionSchema = z.object({
-  connected: z.boolean(),
-  authenticated: z.boolean(),
-  toolCount: z.number().int().nonnegative(),
-  requiredCapabilityCount: z.number().int().positive(),
-  availableRequiredCapabilityCount: z.number().int().nonnegative(),
-  missingCapabilities: z.array(z.unknown()),
+  provider:z.literal('sellersprite'),runId:z.string().uuid(),
+  collectedAt:z.string().datetime(),status:z.literal('success'),method:z.literal('fresh_list_tools'),
 });
 const capabilitiesSchema = z.object({
   toolCount: z.number().int().nonnegative(),
@@ -171,16 +167,6 @@ export async function runAcceptanceCli(
       return 0;
     }
 
-    const connection = connectionSchema.parse(await request(
-      '/api/integrations/sellersprite/test', { method: 'POST', body: '{}' },
-    ));
-    requireCondition(connection.connected && connection.authenticated
-      && connection.availableRequiredCapabilityCount === connection.requiredCapabilityCount
-      && connection.missingCapabilities.length === 0);
-    summary.counts.tools = connection.toolCount;
-    summary.counts.requiredCapabilities = connection.requiredCapabilityCount;
-    summary.checks.connection = true;
-
     const critical = criticalRunSchema.parse(await request(
       '/api/integrations/sellersprite/sync/critical',
       { method: 'POST', body: JSON.stringify({ marketId: settings.defaultMarketId, month: parsed.month,
@@ -190,6 +176,11 @@ export async function runAcceptanceCli(
     summary.counts.marketSnapshots = critical.marketSnapshots;
     summary.counts.productSnapshots = critical.productSnapshots;
     summary.checks.criticalSync = true;
+    const connection=connectionSchema.parse(await request(
+      `/api/integrations/sellersprite/connection-proof?runId=${encodeURIComponent(critical.runId)}`,
+    ));
+    requireCondition(connection.runId===critical.runId);
+    summary.checks.connection=true;
     const candidate = critical.candidateCoverage;
     const competitor = critical.competitorCoverage;
     summary.counts.candidateDiscoveryProducts = candidate.success;
@@ -216,10 +207,11 @@ export async function runAcceptanceCli(
       `/api/integrations/sellersprite/capabilities?runId=${encodeURIComponent(critical.runId)}`,
     ));
     const hashes = capabilities.required.map((item) => item.schemaHash);
-    requireCondition(capabilities.required.length === connection.requiredCapabilityCount
-      && capabilities.required.every((item) => item.available)
+    requireCondition(capabilities.required.every((item) => item.available)
       && hashes.every((hash): hash is string => hash !== null));
     summary.schemaHashes = hashes.slice().sort();
+    summary.counts.tools=capabilities.toolCount;
+    summary.counts.requiredCapabilities=capabilities.required.length;
     summary.counts.schemaHashes = hashes.length;
     summary.checks.schemas = true;
 
@@ -360,12 +352,13 @@ export function isAllowedAcceptanceRequest(method: string, path: string): boolea
   const route = method === 'GET' ? [
     /^\/api\/(?:settings|markets|go-live\/verify)$/,
     /^\/api\/integrations\/sellersprite\/capabilities\?runId=[0-9a-fA-F-]{36}$/,
+    /^\/api\/integrations\/sellersprite\/connection-proof\?runId=[0-9a-fA-F-]{36}$/,
     /^\/api\/integrations\/sellersprite\/sync\/critical\/[0-9a-fA-F-]{36}\/roster$/,
     /^\/api\/dashboard\/executive\?range=30D$/,
     /^\/api\/dashboard\/executive\/run-proof\/[0-9a-fA-F-]{36}$/,
     /^\/api\/research-jobs\/[A-Za-z0-9_-]+\/evidence$/,
   ] : method === 'POST' ? [
-    /^\/api\/integrations\/sellersprite\/(?:test|sync\/critical|sync\/plan)$/,
+    /^\/api\/integrations\/sellersprite\/(?:sync\/critical|sync\/plan)$/,
     /^\/api\/research-jobs$/,
     /^\/api\/research-jobs\/[A-Za-z0-9_-]+\/run$/,
   ] : [];

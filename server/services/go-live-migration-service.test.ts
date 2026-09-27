@@ -1231,7 +1231,7 @@ describe('GoLiveMigrationService', () => {
     expect(service.verify().sellerSpriteCriticalRunId).toBeNull();
   });
 
-  it('allows partial direct-competitor coverage but rejects a fully failed current roster', () => {
+  it('rejects connection proof for partial or fully failed current acquisition', () => {
     database = openDatabase(':memory:');
     insertObservationFixture(database, 'mcp', 'mcp');
     database.exec(`
@@ -1278,7 +1278,8 @@ describe('GoLiveMigrationService', () => {
       .run(JSON.stringify(coverage), run.id);
     expect(service.verify()).toMatchObject({
       sellerSpriteCriticalRunId: run.id,
-      readyForDemoCleanup: true,
+      readyForDemoCleanup: false,
+      sellerSpriteConnectionVerified: false,
     });
 
     database.prepare(`
@@ -1537,14 +1538,14 @@ describe('GoLiveMigrationService', () => {
     database.prepare(`UPDATE data_sources SET status = 'disconnected'
       WHERE id = 'source-sellersprite-mcp'`).run();
     expect(service.verify()).toMatchObject({
-      sellerSpriteConnectionVerified: false, hasMinimumRealCoverage: false,
+      sellerSpriteConnectionVerified: true, hasMinimumRealCoverage: true,
     });
     database.prepare(`
       UPDATE data_sources SET status = 'connected', last_sync_at = ?
       WHERE id = 'source-sellersprite-mcp'
     `).run(new Date(Date.now() - 48 * 60 * 60 * 1000).toISOString());
     expect(service.verify()).toMatchObject({
-      sellerSpriteConnectionVerified: false, hasMinimumRealCoverage: false,
+      sellerSpriteConnectionVerified: true, hasMinimumRealCoverage: true,
     });
     database.prepare(`
       UPDATE data_sources SET last_sync_at = ? WHERE id = 'source-sellersprite-mcp'

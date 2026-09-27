@@ -1,6 +1,6 @@
 import { existsSync, mkdirSync } from 'node:fs';
 import { randomUUID } from 'node:crypto';
-import {recordExplicitConnectionProof} from './services/provider-connection-proof.js';
+import {recordExplicitConnectionProof,providerConnectionProof} from './services/provider-connection-proof.js';
 import { basename, join, resolve } from 'node:path';
 import express, { type NextFunction, type Request, type Response } from 'express';
 import multer from 'multer';
@@ -512,6 +512,10 @@ export function createApp(options: CreateAppOptions = {}): express.Express {
     if(result.connected && result.authenticated) recordExplicitConnectionProof(database,collectedAt);
     sendData(response, result, repository);
   }));
+  app.get('/api/integrations/sellersprite/connection-proof', (request, response) => {
+    const {runId}=z.object({runId:z.string().uuid()}).parse(request.query);
+    sendData(response,providerConnectionProof(database,runId),repository);
+  });
   app.get('/api/integrations/sellersprite/capabilities', (request, response) => {
     const query = z.object({ runId: z.string().uuid().optional() }).parse(request.query);
     const row = database.prepare(`
