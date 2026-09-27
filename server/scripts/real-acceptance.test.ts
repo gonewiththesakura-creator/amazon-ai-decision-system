@@ -7,7 +7,7 @@ import {
 } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { afterEach, describe, expect, it } from 'vitest';
-import { isAllowedAcceptanceRequest, runAcceptanceCli as rawRunAcceptanceCli } from './real-acceptance.js';
+import { acceptsResearchJob, isAllowedAcceptanceRequest, runAcceptanceCli as rawRunAcceptanceCli } from './real-acceptance.js';
 
 const RUN_ID = '11111111-1111-4111-8111-111111111111';
 const runAcceptanceCli: typeof rawRunAcceptanceCli = (args, dependencies) =>
@@ -27,12 +27,30 @@ afterEach(async () => {
 });
 
 describe('real SellerSprite acceptance runner', () => {
+  it.each(['ordinary needs_data','wrong insight','wrong gate','wrong decision','raw mapping error','mock'])('rejects invalid Owned completion: %s',kind=>{
+    const done={id:'job',status:'needs_data',isDemo:false,error:null as string|null,latestInsight:{insightType:'owned_product_data_sufficiency',hardGate:'needs_data',decision:'needs_data'}};
+    if(kind==='ordinary needs_data')done.latestInsight.insightType='';
+    if(kind==='wrong insight')done.latestInsight.insightType='market_data_sufficiency';
+    if(kind==='wrong gate')done.latestInsight.hardGate='pass';
+    if(kind==='wrong decision')done.latestInsight.decision='watch';
+    if(kind==='raw mapping error')done.error='ASIN_TREND_BUSINESS_MAPPING_MISMATCH';
+    if(kind==='mock')done.isDemo=true;
+    expect(acceptsResearchJob('owned_product',done)).toBe(false);
+  });
+  it('retains the Full Owned monitoring path',()=>{
+    expect(acceptsResearchJob('owned_product',{id:'job',status:'monitoring',isDemo:false,latestInsight:{insightType:'owned_product_diagnosis'}})).toBe(true);
+  });
+  it('does not accept Limited when the final evidence verifier rejects raw mapping',async()=>{
+    const api=await startApi({limitedJob:'owned',verification:{verifiedEvidenceEntities:3,readyForDemoCleanup:false}});
+    expect(await runAcceptanceCli(['--base-url',api.baseUrl,'--month','202609'],{writeOutput:()=>undefined})).toBe(1);
+    expect(api.requests).toContain('GET /api/go-live/verify');
+  });
   it.each(['market','owned'] as const)('permits LIMITED market evidence without relaxing %s diagnosis',async limitedJob=>{
     const api=await startApi({limitedJob});
     const output:string[]=[];
     const exit=await runAcceptanceCli(['--base-url',api.baseUrl,'--month','202609'],{writeOutput:value=>output.push(value)});
-    expect(exit).toBe(limitedJob==='market'?0:1);
-    if(limitedJob==='market') expect(api.requests).toContain('GET /api/go-live/verify');
+    expect(exit).toBe(0);
+    expect(api.requests).toContain('GET /api/go-live/verify');
   });
   it('defaults to a call plan with no connection test or remote execution', async () => {
     const api = await startApi();
@@ -461,6 +479,8 @@ interface ApiOptions {
     requiredOwnedProducts: number;
   };
   verification?: Partial<{
+    verifiedEvidenceEntities: number;
+    readyForDemoCleanup: boolean;
     primaryMarketHistoryDays: number;
     hasPrimaryMarketHistory90d: boolean;
     runLinkedCandidateGroups: number;
@@ -570,7 +590,7 @@ async function startApi(options: ApiOptions = {}): Promise<{
       const id=url.pathname.split('/')[3];
       const limited=options.limitedJob==='market'?id==='job-1':options.limitedJob==='owned'&&id==='job-2';
       respondData(response, { id, status: limited?'needs_data':'monitoring', isDemo: false, error: null,
-        ...(limited?{marketDataMaturity:{status:'LIMITED'},latestInsight:{insightType:'market_data_sufficiency',hardGate:'needs_data',decision:'needs_data'}}:
+        ...(limited?{marketDataMaturity:{status:'LIMITED'},latestInsight:{insightType:id==='job-1'?'market_data_sufficiency':'owned_product_data_sufficiency',hardGate:'needs_data',decision:'needs_data'}}:
           {latestInsight:{insightType:id==='job-1'?'market_diagnosis':'owned_product_diagnosis'}}) });
       return;
     }

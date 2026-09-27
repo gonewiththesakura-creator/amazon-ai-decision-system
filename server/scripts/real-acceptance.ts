@@ -314,16 +314,20 @@ async function createAndRunJob(
     `/api/research-jobs/${encodeURIComponent(created.id)}/run`,
     { method: 'POST', body: '{}' },
   ));
-  const limited = body.type==='existing_market' && completed.status==='needs_data'
-    && completed.marketDataMaturity?.status==='LIMITED'
-    && completed.latestInsight?.insightType==='market_data_sufficiency'
+  // The final same-run Go Live verifier validates the full evidence contract for either path.
+  requireCondition(completed.id === created.id && acceptsResearchJob(body.type,completed));
+  return created.id;
+}
+
+export function acceptsResearchJob(type:unknown,completed:z.infer<typeof jobSchema>):boolean {
+  if(type!=='existing_market'&&type!=='owned_product')return false;
+  const limited = completed.status==='needs_data'
+    && (type!=='existing_market'||completed.marketDataMaturity?.status==='LIMITED')
+    && completed.latestInsight?.insightType===(type==='existing_market'?'market_data_sufficiency':'owned_product_data_sufficiency')
     && completed.latestInsight.hardGate==='needs_data' && completed.latestInsight.decision==='needs_data';
   const full = completed.status==='monitoring' && completed.latestInsight?.insightType===
-    (body.type==='existing_market'?'market_diagnosis':'owned_product_diagnosis');
-  // The final same-run Go Live verifier validates the full evidence contract for either path.
-  requireCondition(completed.id === created.id && !completed.isDemo
-    && (full || limited) && !completed.error);
-  return created.id;
+    (type==='existing_market'?'market_diagnosis':'owned_product_diagnosis');
+  return !completed.isDemo && (full || limited) && !completed.error;
 }
 
 function createApiClient(baseUrl: URL, timeoutMs: number, fetchImpl: typeof fetch) {

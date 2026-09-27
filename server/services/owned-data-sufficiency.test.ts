@@ -54,6 +54,20 @@ function fixture(){
 }
 
 describe('Owned sufficiency never conceals acquisition or pipeline errors',()=>{
+ it('accepts ancillary-only differences but still reconciles all Snapshot/Fact metrics',()=>{
+  const {proof}=fixture();
+  const row=db.prepare("SELECT payload_json FROM mcp_local_observations WHERE request_key='synthetic-B0TEST0001'").get()!;
+  const local=JSON.parse(String(row.payload_json));local.asin.image='https://example.com/updated';local.updatedAt='ancillary';
+  db.prepare("UPDATE mcp_local_observations SET payload_json=? WHERE request_key='synthetic-B0TEST0001'").run(JSON.stringify(local));
+  expect(proof()?.closedMonthGrowth?.growth).toBe(-75);
+ });
+ it('rejects numeric differences between retained raw and normalized business projection',()=>{
+  const {proof}=fixture();
+  const row=db.prepare("SELECT payload_json FROM mcp_local_observations WHERE request_key='synthetic-B0TEST0001'").get()!;
+  const local=JSON.parse(String(row.payload_json));local.salesTrendPoints[0].childUnitSales=99;
+  db.prepare("UPDATE mcp_local_observations SET payload_json=? WHERE request_key='synthetic-B0TEST0001'").run(JSON.stringify(local));
+  expect(()=>proof()).toThrow('NORMALIZATION_AUDIT_MISMATCH');
+ });
  it('shows independent -75% closed growth, keeps needs_data and has no relative conclusion or decision',()=>{
   const {job,repo,runId,proof}=fixture();const j=job();const done=new WorkflowOrchestrator(db).run(j.id);
   expect(proof()?.closedMonthGrowth?.growth).toBe(-75);
@@ -108,7 +122,7 @@ describe('Owned sufficiency never conceals acquisition or pipeline errors',()=>{
   db.prepare("UPDATE ai_insights SET summary='outperform' WHERE research_job_id=?").run(j.id);
   expect(hasLimitedOwnedEvidence(db,runId,'US','owned-1')).toBe(false);
  });
- it.each(['c74c905a-5bc6-486d-90cf-aebb24f554f5','787a8019-7bb0-4d0d-a3ef-a6c014eb4236'])('never revives failed certification %s',failedId=>{
+ it.each(['c74c905a-5bc6-486d-90cf-aebb24f554f5','787a8019-7bb0-4d0d-a3ef-a6c014eb4236','f3f94995-07f5-4954-b0e6-f4474c53e489'])('never revives failed certification %s',failedId=>{
   const {runId,proof,go}=fixture();db.prepare("UPDATE data_tasks SET status='failed',failed=1,error_log=? WHERE id=?").run(failedId,runId);
   expect(proof()).toBeNull();expect(go.verify().systemCertification).toBe('FAIL');
   expect(()=>db.prepare("UPDATE data_tasks SET status='success' WHERE id=?").run(runId)).toThrow(/terminal/);

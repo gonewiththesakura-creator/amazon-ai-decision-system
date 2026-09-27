@@ -4,6 +4,7 @@ import {mcpCallToolResultSchema,sellerSpriteEnvelope,sellerSpriteAsinTrendSchema
 import {deriveSnapshotGrowth,monthlyPeriodState} from '../domain/snapshot-growth.js';
 import {entityMarketMaturity} from './market-data-maturity.js';
 import {requestKey} from '../adapters/mcp-policy.js';
+import {assertTrendBusinessEquality} from '../adapters/asin-trend-audit.js';
 
 export const OWNED_SUFFICIENCY_VERSION='owned-data-sufficiency.v1';
 export const OWNED_MISSING_ALLOWLIST=['market_growth_30d','market_growth_baseline','sku_growth_30d'] as const;
@@ -70,7 +71,7 @@ export function ownedSufficiencyProof(db:AppDatabase,runId:string,marketplace:st
   .get(requestKey([marketplace,p.asin,null]),schemaHash,call.raw_collected_at);
  try{
   const data=sellerSpriteAsinTrendSchema.parse(JSON.parse(String(normalized?.payload_json)));
-  if(requestKey(data)!==requestKey(raw))throw new Error();
+  assertTrendBusinessEquality(raw,data);
  }catch{throw new OwnedEvidenceError('NORMALIZATION_AUDIT_MISMATCH');}
  const observations:OwnedSufficiencyProof['observations']=[],facts:Row[]=[];
  for(const point of raw.salesTrendPoints){
