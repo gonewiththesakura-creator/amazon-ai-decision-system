@@ -12,7 +12,7 @@ import type {
 } from '../../shared/types.js';
 import { ManualInputAdapter } from '../adapters/manual-input-adapter.js';
 import { transaction, type AppDatabase } from '../database/database.js';
-import { deriveSnapshotGrowth, type SnapshotGrowthPair } from '../domain/snapshot-growth.js';
+import { deriveSnapshotGrowth, monthlyPeriodState, type SnapshotGrowthPair } from '../domain/snapshot-growth.js';
 import { assessReverseReview } from '../domain/reverse-review-engine.js';
 import { executeProductRules, type ProductRuleResult } from '../domain/workflow-rule-engine.js';
 import { IntelligenceRepository } from '../repository/intelligence-repository.js';
@@ -1758,6 +1758,8 @@ function comparableSnapshotGrowth(
   if (!latest || !latest.source) return null;
   return deriveSnapshotGrowth(points.map((point) => ({
     id: point.id, date: point.date,
+    periodState: point.source && /^(monthly|1M|closed_month|current_mtd)$/.test(point.source.period)
+      ? monthlyPeriodState(point.date, point.source.collectedAt) : undefined,
     value: comparableSources(latest.source, point.source) ? point.value : null,
   })));
 }

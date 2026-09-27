@@ -14,7 +14,7 @@ import {
   type McpResponseCacheStore,
   type McpCallLedgerEntry,
 } from './sellersprite-mcp-store.js';
-import { isCredentialFieldName, redactCredentialAssignments } from './sensitive-field.js';
+import { isCredentialFieldName, isSensitiveKey, redactCredentialAssignments } from './sensitive-field.js';
 import { currentExecution, McpBudgetManager, McpPolicyError, RemoteRequestSingleflight, requestKey } from './mcp-policy.js';
 
 export type SellerSpriteMcpErrorCode =
@@ -69,6 +69,9 @@ interface SellerSpriteMcpClientOptions {
 
 export function sanitizeMcpError(error: unknown): string {
   const message = error instanceof Error ? error.message : String(error);
+  if (message.trimStart().startsWith('{') || message.trimStart().startsWith('[')) {
+    try { return JSON.stringify(scrubSecrets(JSON.parse(message))); } catch { /* plain text below */ }
+  }
   return redactCredentialAssignments(message
     .replace(/https?:\/\/[^\s'"<>]+/gi, '[REDACTED]')
     .replace(/Authorization\s*[:=]\s*(?:Bearer\s+)?[^\s;,}]+/gi, '[REDACTED]')
@@ -501,7 +504,7 @@ export function scrubSecrets(value: unknown): unknown {
   if (Array.isArray(value)) return value.map(scrubSecrets);
   if (value && typeof value === 'object') {
     return Object.fromEntries(Object.entries(value).map(([key, item]) => [key,
-      isCredentialFieldName(key) || /endpoint|headers/i.test(key)
+      isSensitiveKey(key)
         ? '[REDACTED]' : scrubSecrets(item)]));
   }
   return value;

@@ -21,7 +21,7 @@ import type {
 } from '../../shared/types.js';
 import { calculateRelativePerformance, detectProductAnomalies, percentileRank } from '../domain/calculations.js';
 import type { AppDatabase } from '../database/database.js';
-import { deriveSnapshotGrowth, type SnapshotGrowthPair } from '../domain/snapshot-growth.js';
+import { deriveSnapshotGrowth, monthlyPeriodState, type SnapshotGrowthPair } from '../domain/snapshot-growth.js';
 import { MetricAuthorityResolver, type MetricFact } from '../services/metric-authority-resolver.js';
 import { isLiveObservationReadable } from '../services/live-observation-readability.js';
 import { entityMarketMaturity } from '../services/market-data-maturity.js';
@@ -304,6 +304,8 @@ export class IntelligenceRepository {
         id: stringValue(snapshot.id),
         date: stringValue(snapshot.date),
         value: nullableNumberValue(snapshot.estimated_sales),
+        periodState: /^(monthly|1M|closed_month|current_mtd)$/.test(stringValue(snapshot.period))
+          ? monthlyPeriodState(stringValue(snapshot.date), stringValue(snapshot.collected_at)) : undefined,
       })));
       return this.mapProductSnapshot(row, growth?.latest.id === stringValue(row.id) ? growth : null);
     });
@@ -799,6 +801,8 @@ export class IntelligenceRepository {
       snapshotAvailable: true,
       productId: stringValue(row.product_id),
       date: stringValue(row.date),
+      periodState: /^(monthly|1M|closed_month|current_mtd)$/.test(stringValue(row.period))
+        ? monthlyPeriodState(stringValue(row.date),stringValue(row.collected_at)) : undefined,
       price: nullableNumberValue(row.price),
       rating: nullableNumberValue(row.rating),
       reviewCount: nullableNumberValue(row.review_count),

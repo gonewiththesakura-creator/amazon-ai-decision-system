@@ -194,6 +194,7 @@ export interface ProductSnapshot {
   snapshotAvailable: boolean;
   productId: string;
   date: string;
+  periodState?: 'closed_month' | 'current_mtd';
   price: number | null;
   rating: number | null;
   reviewCount: number | null;

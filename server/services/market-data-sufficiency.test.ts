@@ -15,7 +15,7 @@ function fixture() {
  VALUES('market','Synthetic market',1,'US','import','active','2026-01-01');`);
  for(let i=1;i<=3;i++) db.prepare(`INSERT INTO products(id,asin,sku,brand,title,image_url,marketplace,product_type,is_owned,market_node_id,source_type,created_at)
  VALUES(?,?,?,'Fixture','Synthetic product','','US','pillow',1,'market','import','2026-01-01')`).run(`owned-${i}`,`B0TEST000${i}`,`TEST-${i}`);
- addVerifiedMcpCoverage(db,'market','owned-1',undefined,{includeHistoricalMarketObservation:false});
+ addVerifiedMcpCoverage(db,'market','owned-1',undefined,{includeHistoricalMarketObservation:false,closedMonths:true});
  const runId=String(db.prepare('SELECT id FROM data_coverage_runs').get()!.id);
  // Keep full owned evidence from the explicitly synthetic certification fixture; remove its market conclusion.
  db.exec(`UPDATE research_jobs SET status='needs_data' WHERE job_type='existing_market';`);
@@ -30,9 +30,9 @@ describe('LIMITED market system evidence does not complete market analysis',()=>
   expect(requires90DaySupport({certificationRunId:'1111190d-1111-4111-8111-111111111111',analysisWindow:'90D'})).toBe(true);
  });
  it('runs three unchanged full owned diagnoses in an explicitly complete synthetic baseline fixture',()=>{
-  const {runId,repo,go}=fixture();
+ const {runId,repo,go}=fixture();
   db.exec("UPDATE research_jobs SET status='needs_data' WHERE job_type='owned_product'");
-  for(const [date,sales] of [['2026-08-31',100],['2026-09-30',120]] as const){
+  for(const [date,sales] of [['2026-07-31',100],['2026-08-31',120]] as const){
    const id=`synthetic-market-sales-${date}`;
    db.prepare(`INSERT INTO metric_facts(id,entity_type,entity_id,marketplace,metric_name,numeric_value,source,source_id,source_type,is_estimated,confidence,observation_date,collected_at,sync_run_id)
     VALUES(?,'market','market','US','monthly_sales',?,'SellerSprite MCP','source-sellersprite-mcp','mcp',1,0.8,?,?,?)`)
@@ -42,7 +42,7 @@ describe('LIMITED market system evidence does not complete market analysis',()=>
   for(let i=1;i<=3;i++){
    const id=`synthetic-owned-baseline-${i}`,productId=`owned-${i}`;
    db.prepare(`INSERT INTO product_snapshots(id,product_id,date,observation_date,estimated_sales,source,source_type,collected_at,period,is_estimated,confidence,sync_run_id,dedup_key)
-    VALUES(?,?,'2026-08-31','2026-08-31',8,'SellerSprite MCP','mcp',?,'1M',1,0.8,?,?)`).run(id,productId,new Date().toISOString(),runId,id);
+    VALUES(?,?,'2026-07-31','2026-07-31',8,'SellerSprite MCP','mcp',?,'1M',1,0.8,?,?)`).run(id,productId,new Date().toISOString(),runId,id);
    db.prepare("INSERT INTO mcp_sync_observation_links VALUES(?,'product',?,?,'inserted')").run(runId,id,productId);
    const job=repo.createResearchJob({name:'Full owned synthetic fixture',type:'owned_product',entityType:'owned_product',entityId:productId,createdBy:'test'});
    const done=new WorkflowOrchestrator(db).run(job.id);
@@ -57,7 +57,7 @@ describe('LIMITED market system evidence does not complete market analysis',()=>
   const {job,runId,repo}=fixture();
   expect(new WorkflowOrchestrator(db).run(job.id).latestInsight?.insightType).toBe('market_data_sufficiency');
   // Explicitly synthetic fixture, not a repair or estimate of real business observations.
-  for(const [date,sales] of [['2026-08-31',100],['2026-09-30',120]] as const) {
+  for(const [date,sales] of [['2026-07-31',100],['2026-08-31',120]] as const) {
    for(const [metric,value] of Object.entries({monthly_sales:sales,monthly_revenue:sales*30,avg_price:30,median_reviews:10,top10_share:20,top20_share:35})) {
     const id=`full-${date}-${metric}`;
     db.prepare(`INSERT INTO metric_facts(id,entity_type,entity_id,marketplace,metric_name,numeric_value,source,source_id,source_type,is_estimated,confidence,observation_date,collected_at,sync_run_id)

@@ -45,6 +45,7 @@ export function addVerifiedMcpCoverage(
   options: {
     includeConfirmedDirectCompetitor?: boolean;
     includeHistoricalMarketObservation?: boolean;
+    closedMonths?: boolean;
   } = {},
 ): void {
   const now = new Date().toISOString();
@@ -169,7 +170,10 @@ export function addVerifiedMcpCoverage(
       candidate.confirmed ? now : null, runId);
     insertCandidateLink.run(runId, candidate.id, candidate.product.id, now);
   }
-  const marketMonths = [
+  const productDate = options.closedMonths ? '2026-08-31' : '2026-09-30';
+  const marketMonths = options.closedMonths ? [
+    {month:'202607',date:'2026-07-31'}, {month:'202608',date:'2026-08-31'},
+  ] : [
     { month: '202608', date: '2026-08-31' },
     { month: '202609', date: '2026-09-30' },
   ];
@@ -201,7 +205,7 @@ export function addVerifiedMcpCoverage(
       insertMarketFact.run(factId, marketNode.id, settings.marketplace, marketMonth.date, now,
         `verified-market-fact-${marketNode.id}-${marketMonth.month}-${runId}`, runId);
       insertFactLink.run(runId, factId, marketNode.id);
-      if (marketNode.id === marketId && marketMonth.month === '202609') marketSnapshotId = snapshotId;
+      if (marketNode.id === marketId && marketMonth === marketMonths.at(-1)) marketSnapshotId = snapshotId;
     }
   }
   if (options.includeHistoricalMarketObservation ?? true) {
@@ -218,8 +222,8 @@ export function addVerifiedMcpCoverage(
     database.prepare(`INSERT INTO product_snapshots (
       id, product_id, date, estimated_sales, source, source_type, collected_at,
       period, is_estimated, confidence, observation_date, dedup_key, sync_run_id
-    ) VALUES (?, ?, '2026-09-30', 10, 'SellerSprite MCP',
-      'mcp', ?, '1M', 1, 0.8, '2026-09-30', ?, ?)`)
+    ) VALUES (?, ?, '${productDate}', 10, 'SellerSprite MCP',
+      'mcp', ?, '1M', 1, 0.8, '${productDate}', ?, ?)`)
       .run(snapshotId, product.id, productObservationCollectedAt,
         `verified-product-${product.id}-${runId}`, runId);
     database.prepare(`INSERT INTO mcp_sync_observation_links (
@@ -231,7 +235,7 @@ export function addVerifiedMcpCoverage(
       source, source_id, source_type, is_estimated, confidence, observation_date,
       collected_at, dedup_key, sync_run_id
     ) VALUES (?, 'product', ?, ?, 'estimated_sales', 10, 'SellerSprite MCP',
-      'source-sellersprite-mcp', 'mcp', 1, 0.8, '2026-09-30', ?, ?, ?)`)
+      'source-sellersprite-mcp', 'mcp', 1, 0.8, '${productDate}', ?, ?, ?)`)
       .run(factId, product.id, settings.marketplace, productObservationCollectedAt,
         `verified-product-fact-${product.id}-${runId}`, runId);
     database.prepare(`INSERT INTO mcp_sync_observation_links (
@@ -244,8 +248,8 @@ export function addVerifiedMcpCoverage(
     database.prepare(`INSERT INTO product_snapshots (
       id, product_id, date, estimated_sales, source, source_type, collected_at,
       period, is_estimated, confidence, observation_date, dedup_key, sync_run_id
-    ) VALUES (?, ?, '2026-09-30', 10, 'SellerSprite MCP',
-      'mcp', ?, '1M', 1, 0.8, '2026-09-30', ?, ?)`)
+    ) VALUES (?, ?, '${productDate}', 10, 'SellerSprite MCP',
+      'mcp', ?, '1M', 1, 0.8, '${productDate}', ?, ?)`)
       .run(snapshotId, competitor.id, productObservationCollectedAt,
         `verified-competitor-${competitor.id}-${runId}`, runId);
     database.prepare(`INSERT INTO mcp_sync_observation_links (
@@ -257,7 +261,7 @@ export function addVerifiedMcpCoverage(
       source, source_id, source_type, is_estimated, confidence, observation_date,
       collected_at, dedup_key, sync_run_id
     ) VALUES (?, 'competitor', ?, ?, 'estimated_sales', 10, 'SellerSprite MCP',
-      'source-sellersprite-mcp', 'mcp', 1, 0.8, '2026-09-30', ?, ?, ?)`)
+      'source-sellersprite-mcp', 'mcp', 1, 0.8, '${productDate}', ?, ?, ?)`)
       .run(factId, competitor.id, settings.marketplace, productObservationCollectedAt,
         `verified-competitor-fact-${competitor.id}-${runId}`, runId);
     database.prepare(`INSERT INTO mcp_sync_observation_links (
@@ -330,7 +334,7 @@ export function addVerifiedMcpCoverage(
   database.prepare(`INSERT INTO data_coverage_runs (
     id, marketplace, run_type, coverage_json, is_complete, created_at
   ) VALUES (?, ?, 'critical_sync', ?, 1, ?)`).run(runId, settings.marketplace,
-    JSON.stringify({ marketId, nodeIdPath: '1055398:1063252', month: '202609', baselineMonth: '202608',
+    JSON.stringify({ marketId, nodeIdPath: '1055398:1063252', month: marketMonths[1].month, baselineMonth: marketMonths[0].month,
       marketMonths: marketMonths.map(({ month }) => month),
       marketNodes,
       ownedProducts: owned.map(({ id, asin, marketNodeId }) => ({ id, asin, marketNodeId })),

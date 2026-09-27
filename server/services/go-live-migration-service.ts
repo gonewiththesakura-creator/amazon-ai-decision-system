@@ -6,6 +6,7 @@ import { confirmedDirectCompetitors } from './confirmed-direct-competitor-covera
 import { validMarketHistorySpan } from './real-history-coverage.js';
 import { marketDataMaturity } from './market-data-maturity.js';
 import { hasLimitedMarketEvidence } from './market-data-sufficiency.js';
+import { providerConnectionProof } from './provider-connection-proof.js';
 import { ownedRosterState, sellerSpriteRosterScope, type OwnedRosterState } from './owned-roster-declaration.js';
 import { LocalObservationResolver, certifiedMarketCall } from './local-observation-resolver.js';
 
@@ -42,6 +43,7 @@ export interface GoLiveVerification extends OwnedRosterState {
   sellerSpriteMarketSnapshots: number;
   sellerSpriteOwnedProductSnapshots: number;
   sellerSpriteConnectionVerified: boolean;
+  providerConnectionProof: ReturnType<typeof providerConnectionProof>;
   sellerSpriteCapabilitiesAvailable: boolean;
   sellerSpriteMarketCalls: number;
   sellerSpriteAsinCalls: number;
@@ -317,12 +319,6 @@ export class GoLiveMigrationService {
         AND product.status = 'active' AND product.marketplace = ?
         AND snapshot.source_type = 'mcp' AND ${PRODUCT_METRICS}
     `, false, settings.marketplace);
-    const sellerSpriteConnectionVerified = this.count(`
-      SELECT COUNT(*) AS count FROM data_sources
-      WHERE id = 'source-sellersprite-mcp' AND status = 'connected'
-        AND julianday(last_sync_at) BETWEEN julianday('now', '-1 day')
-          AND julianday('now', '+5 minutes')
-    `) > 0;
     const sellerSpriteCapabilitiesAvailable = this.count(`
       SELECT CASE WHEN
         json_extract(capabilities_json, '$.capabilities.MARKET_RESEARCH') IS NOT NULL
@@ -387,6 +383,8 @@ export class GoLiveMigrationService {
         requiredEvidenceEntities: activeOwnedProducts + 1, runLinkedCandidateGroups: 0,
       };
     const sellerSpriteCriticalRunId = criticalProof.runId;
+    const connectionProof = providerConnectionProof(this.database,sellerSpriteCriticalRunId);
+    const sellerSpriteConnectionVerified = connectionProof !== null;
     const primaryMarketHistory = validMarketHistorySpan(
       this.database, settings.marketplace, settings.default_market_id,
     );
@@ -420,6 +418,7 @@ export class GoLiveMigrationService {
       sellerSpriteMarketSnapshots,
       sellerSpriteOwnedProductSnapshots,
       sellerSpriteConnectionVerified,
+      providerConnectionProof: connectionProof,
       sellerSpriteCapabilitiesAvailable,
       sellerSpriteMarketCalls,
       sellerSpriteAsinCalls,

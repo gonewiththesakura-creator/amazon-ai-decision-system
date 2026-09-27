@@ -1,9 +1,13 @@
-const CREDENTIAL_FIELD = /(?:^|[_-])(?:x[_-]?)?auth(?:entication|orization)?(?:$|[_-])|bearer|secret|token|api[_-]?key|password|credential|cookie|session|access[_-]?key|client[_-]?(?:id|secret)/i;
+const CREDENTIAL_FIELD = /^(?:x)?(?:auth(?:entication|orization)?(?:header|headers|info|data|value|key|params|scheme)?|bearer|secret(?:key)?|(?:access|refresh|id)?token|apikey|password|credentials?|cookies?|session(?:id|key|token)?|accesskey|client(?:id|secret))$/i;
 
 export function isCredentialFieldName(value: string): boolean {
   const compact = value.replace(/[_-]/g, '');
-  return /^(?:x)?auth(?:entication|orization)?(?:header|headers|info|data|value|key|params|scheme)$/i
-    .test(compact) || CREDENTIAL_FIELD.test(value);
+  return CREDENTIAL_FIELD.test(compact);
+}
+
+/** Whole keys, not substrings: endPoints and salesTrendPoints are business data. */
+export function isSensitiveKey(key: string): boolean {
+  return isCredentialFieldName(key) || key.toLowerCase() === 'endpoint' || key.toLowerCase() === 'headers';
 }
 
 export function redactCredentialAssignments(value: string): string {
