@@ -7,6 +7,7 @@ import { validMarketHistorySpan } from './real-history-coverage.js';
 import { marketDataMaturity } from './market-data-maturity.js';
 import { hasLimitedMarketEvidence } from './market-data-sufficiency.js';
 import { providerConnectionProof } from './provider-connection-proof.js';
+import {hasLimitedOwnedEvidence} from './owned-data-sufficiency.js';
 import { ownedRosterState, sellerSpriteRosterScope, type OwnedRosterState } from './owned-roster-declaration.js';
 import { LocalObservationResolver, certifiedMarketCall } from './local-observation-resolver.js';
 
@@ -31,6 +32,7 @@ export interface GoLivePreview {
 export interface GoLiveVerification extends OwnedRosterState {
   systemCertification: 'PASS' | 'FAIL';
   marketAnalysisReadiness: 'LIMITED' | 'READY';
+  ownedAnalysisReadiness: 'LIMITED' | 'READY' | 'UNVERIFIED';
   marketDataMaturity: ReturnType<typeof marketDataMaturity>;
   ownedProductRosterCoverage: {confirmed:number;total:number;passed:boolean};
   sellerSpriteEnrichmentCoverage: {required:number;covered:number;excluded:ReturnType<typeof sellerSpriteRosterScope>['excluded']};
@@ -406,6 +408,8 @@ export class GoLiveMigrationService {
       ...rosterState,
       systemCertification: readyForDemoCleanup ? 'PASS' : 'FAIL',
       marketAnalysisReadiness: marketDataMaturity(this.database,settings.marketplace,settings.default_market_id).status,
+      ownedAnalysisReadiness: !sellerSpriteCriticalRunId ? 'UNVERIFIED'
+        : providerScope.eligible.some(p=>hasLimitedOwnedEvidence(this.database,sellerSpriteCriticalRunId,settings.marketplace,String(p.id))) ? 'LIMITED' : 'READY',
       marketDataMaturity: marketDataMaturity(this.database,settings.marketplace,settings.default_market_id),
       ownedProductRosterCoverage:{confirmed:rosterState.ownedRosterMatches?providerScope.rows.length:0,total:providerScope.rows.length,passed:rosterState.ownedRosterMatches},
       sellerSpriteEnrichmentCoverage:{required:providerScope.eligible.length,covered:eligibleSnapshotCount,excluded:providerScope.excluded},
@@ -711,7 +715,7 @@ export class GoLiveMigrationService {
       const verifiedEvidenceEntities = Number(this.hasLinkedWorkflowEvidence(
         run.id, marketplace, 'market', marketId, strictAcquisition,
       )) + owned.filter((product) => this.hasLinkedWorkflowEvidence(
-        run.id, marketplace, 'owned_product', product.id,
+        run.id, marketplace, 'owned_product', product.id, strictAcquisition,
       )).length;
       latestEvidenceCount ??= verifiedEvidenceEntities;
       if (verifiedEvidenceEntities === requiredEvidenceEntities) {
@@ -729,6 +733,7 @@ export class GoLiveMigrationService {
     entityType: 'market' | 'owned_product', entityId: string, allowLimited = false,
   ): boolean {
     if(allowLimited && entityType==='market' && hasLimitedMarketEvidence(this.database,runId,marketplace,entityId)) return true;
+    if(allowLimited && entityType==='owned_product' && hasLimitedOwnedEvidence(this.database,runId,marketplace,entityId)) return true;
     const snapshotKind = entityType === 'market' ? 'market' : 'product';
     const snapshotTable = entityType === 'market' ? 'market_snapshots' : 'product_snapshots';
     const snapshotEntityColumn = entityType === 'market' ? 'market_node_id' : 'product_id';

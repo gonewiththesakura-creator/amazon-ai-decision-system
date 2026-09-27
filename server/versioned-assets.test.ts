@@ -10,7 +10,7 @@ const workflowAssets = [
   },
   {
     jobType: 'owned_product',
-    prompts: ['owned-sku-analysis.v1.md'],
+    prompts: ['owned-sku-analysis.v1.md','owned-sku-analysis.v2.md'],
     skill: 'owned-sku-analysis',
   },
   {

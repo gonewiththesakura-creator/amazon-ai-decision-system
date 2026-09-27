@@ -1,5 +1,6 @@
 import { existsSync, mkdirSync } from 'node:fs';
 import { randomUUID } from 'node:crypto';
+import {recordExplicitConnectionProof} from './services/provider-connection-proof.js';
 import { basename, join, resolve } from 'node:path';
 import express, { type NextFunction, type Request, type Response } from 'express';
 import multer from 'multer';
@@ -498,6 +499,7 @@ export function createApp(options: CreateAppOptions = {}): express.Express {
 
   app.post('/api/integrations/sellersprite/test', adminOnly, asyncHandler(async (_request, response) => {
     const result: SellerSpriteConnectionDiagnostics = await sellerSpriteDiagnostics.testConnection();
+    const collectedAt=new Date().toISOString();
     database.prepare(`
       UPDATE data_sources
       SET status = ?, last_sync_at = CASE WHEN ? = 1 THEN ? ELSE last_sync_at END
@@ -505,8 +507,9 @@ export function createApp(options: CreateAppOptions = {}): express.Express {
     `).run(
       result.connected ? 'connected' : result.authenticated ? 'disconnected' : 'needs_configuration',
       result.connected ? 1 : 0,
-      new Date().toISOString(),
+      collectedAt,
     );
+    if(result.connected && result.authenticated) recordExplicitConnectionProof(database,collectedAt);
     sendData(response, result, repository);
   }));
   app.get('/api/integrations/sellersprite/capabilities', (request, response) => {

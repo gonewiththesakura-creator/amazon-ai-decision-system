@@ -1,4 +1,5 @@
 import type { AppDatabase } from '../database/database.js';
+import {randomUUID} from 'node:crypto';
 
 export interface ProviderConnectionProof {
   provider: 'sellersprite';
@@ -21,7 +22,17 @@ export function providerConnectionProof(db: AppDatabase, runId: string | null): 
       ORDER BY l.completed_at DESC LIMIT 1`).get(runId);
     if (row) return {provider:'sellersprite',runId,collectedAt:String(row.completed_at),status:'success',method:'fresh_list_tools'};
   }
-  const explicit = db.prepare(`SELECT last_sync_at FROM data_sources WHERE id='source-sellersprite-mcp'
-    AND status='connected' AND julianday(last_sync_at) BETWEEN julianday('now','-1 day') AND julianday('now','+5 minutes')`).get();
+  if(!db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='provider_connection_proofs'").get())return null;
+  const explicit = db.prepare(`SELECT p.collected_at AS last_sync_at FROM provider_connection_proofs p
+    JOIN data_sources s ON s.id='source-sellersprite-mcp' AND s.status='connected' AND s.last_sync_at=p.collected_at
+    WHERE p.provider='sellersprite' AND p.status='success' AND p.method='explicit_connection_test'
+      AND julianday(p.collected_at) BETWEEN julianday('now','-1 day') AND julianday('now','+5 minutes')
+      AND julianday(p.expires_at)>julianday('now') ORDER BY p.collected_at DESC LIMIT 1`).get();
   return explicit ? {provider:'sellersprite',runId:null,collectedAt:String(explicit.last_sync_at),status:'success',method:'explicit_connection_test'} : null;
+}
+
+/** Only the explicit connection-test route calls this after successful authentication. */
+export function recordExplicitConnectionProof(db:AppDatabase,collectedAt:string):void {
+  db.prepare(`INSERT INTO provider_connection_proofs VALUES(?,'sellersprite',NULL,?,?,'success','explicit_connection_test')`)
+    .run(randomUUID(),collectedAt,new Date(Date.parse(collectedAt)+86400000).toISOString());
 }

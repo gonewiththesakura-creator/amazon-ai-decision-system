@@ -4,6 +4,7 @@ import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { openDatabase, type AppDatabase } from '../database/database.js';
 import { GoLiveMigrationService } from './go-live-migration-service.js';
+import {recordExplicitConnectionProof} from './provider-connection-proof.js';
 import { seedDemoData } from '../database/demo-seed.js';
 import { IntelligenceService } from './intelligence-service.js';
 import { IntelligenceRepository } from '../repository/intelligence-repository.js';
@@ -1514,7 +1515,7 @@ describe('GoLiveMigrationService', () => {
       WHERE id = 'source-sellersprite-mcp'
     `).run(new Date().toISOString());
     expect(service.verify()).toMatchObject({
-      sellerSpriteConnectionVerified: true, hasMinimumRealCoverage: false,
+      sellerSpriteConnectionVerified: false, hasMinimumRealCoverage: false,
     });
     addVerifiedMcpCoverage(database, 'market-us', 'owned-product');
     expect(service.verify()).toMatchObject({
@@ -1548,6 +1549,7 @@ describe('GoLiveMigrationService', () => {
     database.prepare(`
       UPDATE data_sources SET last_sync_at = ? WHERE id = 'source-sellersprite-mcp'
     `).run(new Date().toISOString());
+    recordExplicitConnectionProof(database,String(database.prepare("SELECT last_sync_at FROM data_sources WHERE id='source-sellersprite-mcp'").get()!.last_sync_at));
     expect(service.verify()).toMatchObject({ hasMinimumRealCoverage: true });
     service.activateLiveMode();
     expect(database.prepare('SELECT mode FROM app_settings WHERE id = 1').get()).toEqual({ mode: 'live' });

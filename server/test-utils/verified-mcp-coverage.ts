@@ -1,5 +1,6 @@
 import type { AppDatabase } from '../database/database.js';
 import { randomUUID } from 'node:crypto';
+import {recordExplicitConnectionProof} from '../services/provider-connection-proof.js';
 import { sellerSpriteSchemaHash } from '../adapters/sellersprite-tool-registry.js';
 import { seedConfirmedOwnedRoster } from './owned-roster-declaration.js';
 
@@ -46,6 +47,7 @@ export function addVerifiedMcpCoverage(
     includeConfirmedDirectCompetitor?: boolean;
     includeHistoricalMarketObservation?: boolean;
     closedMonths?: boolean;
+    ownedSales?: Record<string,number|null>;
   } = {},
 ): void {
   const now = new Date().toISOString();
@@ -219,12 +221,13 @@ export function addVerifiedMcpCoverage(
   addWorkflowEvidence(database, runId, settings.marketplace, 'market', marketId, marketSnapshotId, now);
   for (const product of owned) {
     const snapshotId = randomUUID();
+    const sales=options.ownedSales && product.id in options.ownedSales ? options.ownedSales[product.id] : 10;
     database.prepare(`INSERT INTO product_snapshots (
       id, product_id, date, estimated_sales, source, source_type, collected_at,
       period, is_estimated, confidence, observation_date, dedup_key, sync_run_id
-    ) VALUES (?, ?, '${productDate}', 10, 'SellerSprite MCP',
+    ) VALUES (?, ?, '${productDate}', ?, 'SellerSprite MCP',
       'mcp', ?, '1M', 1, 0.8, '${productDate}', ?, ?)`)
-      .run(snapshotId, product.id, productObservationCollectedAt,
+      .run(snapshotId, product.id, sales, productObservationCollectedAt,
         `verified-product-${product.id}-${runId}`, runId);
     database.prepare(`INSERT INTO mcp_sync_observation_links (
       sync_run_id, snapshot_kind, snapshot_id, entity_id, disposition
@@ -234,9 +237,9 @@ export function addVerifiedMcpCoverage(
       id, entity_type, entity_id, marketplace, metric_name, numeric_value,
       source, source_id, source_type, is_estimated, confidence, observation_date,
       collected_at, dedup_key, sync_run_id
-    ) VALUES (?, 'product', ?, ?, 'estimated_sales', 10, 'SellerSprite MCP',
+    ) VALUES (?, 'product', ?, ?, 'estimated_sales', ?, 'SellerSprite MCP',
       'source-sellersprite-mcp', 'mcp', 1, 0.8, '${productDate}', ?, ?, ?)`)
-      .run(factId, product.id, settings.marketplace, productObservationCollectedAt,
+      .run(factId, product.id, settings.marketplace, sales, productObservationCollectedAt,
         `verified-product-fact-${product.id}-${runId}`, runId);
     database.prepare(`INSERT INTO mcp_sync_observation_links (
       sync_run_id, snapshot_kind, snapshot_id, entity_id, disposition
@@ -355,6 +358,7 @@ export function addVerifiedMcpCoverage(
     }), now);
   database.prepare(`UPDATE data_sources SET status = 'connected', last_sync_at = ?
     WHERE id = 'source-sellersprite-mcp'`).run(now);
+  recordExplicitConnectionProof(database,now);
 }
 
 function addWorkflowEvidence(

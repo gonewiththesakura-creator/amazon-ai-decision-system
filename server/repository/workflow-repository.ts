@@ -1435,7 +1435,7 @@ function assertTaskBookMarketplace(marketplace: string, taskBook: Record<string,
 
 function promptVersionFor(type: ResearchJobType): string {
   if (type === 'existing_market') return 'market-analysis.v2';
-  if (type === 'owned_product') return 'owned-sku-analysis.v1';
+  if (type === 'owned_product') return 'owned-sku-analysis.v2';
   return 'product-research.v1+reverse-review.v1';
 }
 

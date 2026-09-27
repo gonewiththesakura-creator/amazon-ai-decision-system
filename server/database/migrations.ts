@@ -2362,6 +2362,16 @@ migrations.push({version:36,sql:`
     BEGIN SELECT RAISE(ABORT,'Human review evidence is immutable'); END;
 `});
 
+migrations.push({version:37,sql:`
+  CREATE TABLE provider_connection_proofs (
+    id TEXT PRIMARY KEY, provider TEXT NOT NULL, sync_run_id TEXT,
+    collected_at TEXT NOT NULL, expires_at TEXT NOT NULL,
+    status TEXT NOT NULL CHECK(status='success'), method TEXT NOT NULL CHECK(method='explicit_connection_test')
+  );
+  CREATE TRIGGER connection_proof_no_update BEFORE UPDATE ON provider_connection_proofs
+    BEGIN SELECT RAISE(ABORT,'Connection proof is immutable'); END;
+`});
+
 export function migrate(database: DatabaseSync): void {
   database.exec(`
     CREATE TABLE IF NOT EXISTS schema_migrations (
