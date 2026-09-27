@@ -5,6 +5,7 @@ import { transaction } from '../database/database.js';
 import { confirmedDirectCompetitors } from './confirmed-direct-competitor-coverage.js';
 import { validMarketHistorySpan } from './real-history-coverage.js';
 import { marketDataMaturity } from './market-data-maturity.js';
+import { hasLimitedMarketEvidence } from './market-data-sufficiency.js';
 import { ownedRosterState, sellerSpriteRosterScope, type OwnedRosterState } from './owned-roster-declaration.js';
 import { LocalObservationResolver, certifiedMarketCall } from './local-observation-resolver.js';
 
@@ -27,6 +28,8 @@ export interface GoLivePreview {
 }
 
 export interface GoLiveVerification extends OwnedRosterState {
+  systemCertification: 'PASS' | 'FAIL';
+  marketAnalysisReadiness: 'LIMITED' | 'READY';
   marketDataMaturity: ReturnType<typeof marketDataMaturity>;
   ownedProductRosterCoverage: {confirmed:number;total:number;passed:boolean};
   sellerSpriteEnrichmentCoverage: {required:number;covered:number;excluded:ReturnType<typeof sellerSpriteRosterScope>['excluded']};
@@ -403,6 +406,8 @@ export class GoLiveMigrationService {
       AND ${PRODUCT_METRICS} LIMIT 1`).get(p.id))).length;
     return {
       ...rosterState,
+      systemCertification: readyForDemoCleanup ? 'PASS' : 'FAIL',
+      marketAnalysisReadiness: marketDataMaturity(this.database,settings.marketplace,settings.default_market_id).status,
       marketDataMaturity: marketDataMaturity(this.database,settings.marketplace,settings.default_market_id),
       ownedProductRosterCoverage:{confirmed:rosterState.ownedRosterMatches?providerScope.rows.length:0,total:providerScope.rows.length,passed:rosterState.ownedRosterMatches},
       sellerSpriteEnrichmentCoverage:{required:providerScope.eligible.length,covered:eligibleSnapshotCount,excluded:providerScope.excluded},
@@ -437,7 +442,14 @@ export class GoLiveMigrationService {
     };
   }
 
-  private completeCriticalRun(marketplace: string, marketId: string, nodeIdPath: string): {
+  /** Read-only acquisition contract, without requiring research conclusions. */
+  certifiedAcquisitionRun(marketplace: string, marketId: string): string | null {
+    const node=this.database.prepare('SELECT sellersprite_confirmed_node_path FROM market_nodes WHERE id=? AND marketplace=?').get(marketId,marketplace);
+    if(!node?.sellersprite_confirmed_node_path) return null;
+    return this.completeCriticalRun(marketplace,marketId,String(node.sellersprite_confirmed_node_path),true).runId;
+  }
+
+  private completeCriticalRun(marketplace: string, marketId: string, nodeIdPath: string, acquisitionOnly = false): {
     runId: string | null;
     verifiedEvidenceEntities: number;
     requiredEvidenceEntities: number;
@@ -604,6 +616,10 @@ export class GoLiveMigrationService {
         isFresh: number;
       }>;
       if (calls.length === 0 || calls.some((call) => call.cacheHit !== 0 || call.isFresh !== 1)) continue;
+      const strictAcquisition = calls.every(call=>call.status==='success')
+        && competitorSummary.status==='success' && competitorSummary.failed===0
+        && competitorSummary.success===directCompetitorRoster.length;
+      if(acquisitionOnly && !strictAcquisition) continue;
       const certifiedMarketCapabilities = [
         'MARKET_RESEARCH', 'MARKET_STATISTICS', 'PRODUCT_CONCENTRATION',
       ];
@@ -692,8 +708,9 @@ export class GoLiveMigrationService {
         hasProductLink(product.id) && hasProductFact(product.id, 'competitor')
       ));
       if (!allProductFactsLinked || !coveredCompetitorsLinked) continue;
+      if (acquisitionOnly) return {runId:run.id,verifiedEvidenceEntities:0,requiredEvidenceEntities,runLinkedCandidateGroups};
       const verifiedEvidenceEntities = Number(this.hasLinkedWorkflowEvidence(
-        run.id, marketplace, 'market', marketId,
+        run.id, marketplace, 'market', marketId, strictAcquisition,
       )) + owned.filter((product) => this.hasLinkedWorkflowEvidence(
         run.id, marketplace, 'owned_product', product.id,
       )).length;
@@ -710,8 +727,9 @@ export class GoLiveMigrationService {
 
   private hasLinkedWorkflowEvidence(
     runId: string, marketplace: string,
-    entityType: 'market' | 'owned_product', entityId: string,
+    entityType: 'market' | 'owned_product', entityId: string, allowLimited = false,
   ): boolean {
+    if(allowLimited && entityType==='market' && hasLimitedMarketEvidence(this.database,runId,marketplace,entityId)) return true;
     const snapshotKind = entityType === 'market' ? 'market' : 'product';
     const snapshotTable = entityType === 'market' ? 'market_snapshots' : 'product_snapshots';
     const snapshotEntityColumn = entityType === 'market' ? 'market_node_id' : 'product_id';

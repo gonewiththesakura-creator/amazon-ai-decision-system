@@ -58,6 +58,8 @@ const jobSchema = z.object({
   status: z.string().min(1),
   isDemo: z.boolean(),
   error: z.string().nullable().optional(),
+  latestInsight: z.object({insightType:z.string(),hardGate:z.string().optional(),decision:z.string().optional()}).optional(),
+  marketDataMaturity:z.object({status:z.enum(['LIMITED','READY'])}).optional(),
 });
 const evidenceSchema = z.array(z.object({
   sourceType: z.string(),
@@ -312,8 +314,15 @@ async function createAndRunJob(
     `/api/research-jobs/${encodeURIComponent(created.id)}/run`,
     { method: 'POST', body: '{}' },
   ));
+  const limited = body.type==='existing_market' && completed.status==='needs_data'
+    && completed.marketDataMaturity?.status==='LIMITED'
+    && completed.latestInsight?.insightType==='market_data_sufficiency'
+    && completed.latestInsight.hardGate==='needs_data' && completed.latestInsight.decision==='needs_data';
+  const full = completed.status==='monitoring' && completed.latestInsight?.insightType===
+    (body.type==='existing_market'?'market_diagnosis':'owned_product_diagnosis');
+  // The final same-run Go Live verifier validates the full evidence contract for either path.
   requireCondition(completed.id === created.id && !completed.isDemo
-    && completed.status === 'monitoring' && !completed.error);
+    && (full || limited) && !completed.error);
   return created.id;
 }
 

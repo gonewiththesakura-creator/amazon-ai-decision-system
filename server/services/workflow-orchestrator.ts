@@ -17,6 +17,8 @@ import { assessReverseReview } from '../domain/reverse-review-engine.js';
 import { executeProductRules, type ProductRuleResult } from '../domain/workflow-rule-engine.js';
 import { IntelligenceRepository } from '../repository/intelligence-repository.js';
 import { WorkflowRepository } from '../repository/workflow-repository.js';
+import { GoLiveMigrationService } from './go-live-migration-service.js';
+import { marketSufficiencyProof, sufficiencyContent, SUFFICIENCY_VERSION } from './market-data-sufficiency.js';
 import { MetricAuthorityResolver, type MetricFact } from './metric-authority-resolver.js';
 import { isLiveObservationReadable } from './live-observation-readability.js';
 import { entityMarketMaturity, requires90DaySupport } from './market-data-maturity.js';
@@ -336,11 +338,43 @@ export class WorkflowOrchestrator {
       const output = { hardGateStatus: 'needs_data', missing };
       this.repository.saveRuleExecution(job, collected.values, output, 'needs_data', null);
       this.repository.finishStep(job.id, 'validate', 'needs_data', output);
+      this.repository.finishStep(job.id, 'hard_gate', 'needs_data', output);
+      if (this.recordMarketSufficiency(job,missing.map(item=>item.fieldName))) return null;
       this.repository.failJobDataTasks(job.id, '缺少可比较的历史快照。');
       this.repository.transition(job.id, 'needs_data');
       return null;
     }
     this.repository.finishStep(job.id, 'validate', 'completed', { valid: true, required });
+    return true;
+  }
+
+  private recordMarketSufficiency(job: ResearchJobDetail, missingFields: string[]): boolean {
+    if(job.type!=='existing_market'||job.isDemo||!job.entityId||job.promptVersion!=='market-analysis.v2') return false;
+    const runId=new GoLiveMigrationService(this.database).certifiedAcquisitionRun(job.marketplace,job.entityId);
+    if(!runId || (job.input.certificationRunId && job.input.certificationRunId!==runId)) return false;
+    const proof=marketSufficiencyProof(this.database,runId,job.marketplace,job.entityId,
+      `${job.ruleProfileId}@${job.ruleProfileVersion}`,missingFields);
+    if(!proof) return false;
+    transaction(this.database,()=>{
+      const evidence=proof.facts.map(f=>this.repository.createEvidence(job.id,{
+        claim:`真实市场观察：${f.metric_name}；不代表市场趋势。`,metricName:String(f.metric_name),metricValue:f.numeric_value,
+        source:String(f.source),sourceType:'mcp',sourceRecordId:String(f.id),syncRunId:runId,
+        collectedAt:String(f.collected_at),period:'monthly',isEstimated:f.is_estimated===1,confidence:Number(f.confidence),
+        calculation:`Reported numeric fact ${f.id}; snapshot ${f.snapshot_id}; no extrapolation.`,dataVersion:job.dataVersion,
+      }));
+      evidence.push(this.repository.createEvidence(job.id,{
+        claim:'确定性字段充分性检查：缺失业务指标，禁止市场结论。',metricName:'market_data_sufficiency',
+        metricValue:{maturity:'LIMITED',missingFields:proof.missingFields},source:SUFFICIENCY_VERSION,sourceType:'manual',
+        collectedAt:new Date().toISOString(),period:'research_run',isEstimated:false,confidence:1,
+        calculation:JSON.stringify(proof),dataVersion:job.dataVersion,
+      }));
+      this.repository.completeJobDataTasks(job.id);
+      this.repository.startStep(job.id,'ai_analysis',{method:SUFFICIENCY_VERSION,deterministic:true});
+      this.repository.saveWorkflowInsight(job,{...sufficiencyContent(proof),evidenceIds:evidence.map(e=>e.id),confidence:1});
+      this.repository.finishStep(job.id,'ai_analysis','completed',{method:SUFFICIENCY_VERSION,evidenceIds:evidence.map(e=>e.id)});
+      this.repository.finishStep(job.id,'report','completed',{systemEvidenceOnly:true,marketAnalysisReadiness:'LIMITED',runId});
+      this.repository.transition(job.id,'needs_data');
+    });
     return true;
   }
 

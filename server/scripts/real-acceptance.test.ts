@@ -27,6 +27,13 @@ afterEach(async () => {
 });
 
 describe('real SellerSprite acceptance runner', () => {
+  it.each(['market','owned'] as const)('permits LIMITED market evidence without relaxing %s diagnosis',async limitedJob=>{
+    const api=await startApi({limitedJob});
+    const output:string[]=[];
+    const exit=await runAcceptanceCli(['--base-url',api.baseUrl,'--month','202609'],{writeOutput:value=>output.push(value)});
+    expect(exit).toBe(limitedJob==='market'?0:1);
+    if(limitedJob==='market') expect(api.requests).toContain('GET /api/go-live/verify');
+  });
   it('defaults to a call plan with no connection test or remote execution', async () => {
     const api = await startApi();
     const output: string[] = [];
@@ -434,6 +441,7 @@ describe('real SellerSprite acceptance runner', () => {
 });
 
 interface ApiOptions {
+  limitedJob?: 'market' | 'owned';
   failPath?: string;
   failureBody?: unknown;
   evidenceRunId?: string;
@@ -559,7 +567,11 @@ async function startApi(options: ApiOptions = {}): Promise<{
       return;
     }
     if (/^POST \/api\/research-jobs\/job-\d+\/run$/.test(route)) {
-      respondData(response, { id: url.pathname.split('/')[3], status: 'monitoring', isDemo: false, error: null });
+      const id=url.pathname.split('/')[3];
+      const limited=options.limitedJob==='market'?id==='job-1':options.limitedJob==='owned'&&id==='job-2';
+      respondData(response, { id, status: limited?'needs_data':'monitoring', isDemo: false, error: null,
+        ...(limited?{marketDataMaturity:{status:'LIMITED'},latestInsight:{insightType:'market_data_sufficiency',hardGate:'needs_data',decision:'needs_data'}}:
+          {latestInsight:{insightType:id==='job-1'?'market_diagnosis':'owned_product_diagnosis'}}) });
       return;
     }
     if (/^GET \/api\/research-jobs\/job-\d+\/evidence$/.test(route)) {

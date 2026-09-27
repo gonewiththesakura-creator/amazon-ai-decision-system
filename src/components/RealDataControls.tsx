@@ -35,6 +35,8 @@ interface GoLivePreview {
 }
 
 interface GoLiveVerification {
+  systemCertification?: 'PASS' | 'FAIL';
+  marketAnalysisReadiness?: 'LIMITED' | 'READY';
   mockObservations: number;
   realMarketSnapshots: number;
   realOwnedProductSnapshots: number;
@@ -272,6 +274,7 @@ export default function RealDataControls({
             <span>{verification.readyForDemoCleanup ? '清理前真实链路已通过' : '清理前真实链路未通过'} ·
               {' '}{verification.hasMinimumRealCoverage ? 'Live 切换条件已满足' : 'Live 切换条件未满足'} ·
               {' '}主市场 {verification.realMarketSnapshots} · 自有 SKU {verification.realOwnedProductSnapshots} / {verification.activeOwnedProducts} · Mock {verification.mockObservations}
+              <br />系统验收 {verification.systemCertification ?? 'FAIL'} · 市场分析就绪度 {verification.marketAnalysisReadiness ?? 'LIMITED'}
               <br />主档声明 {verification.activeOwnedProducts} / {verification.expectedOwnedProducts ?? '—'} ·
               {' '}{verification.ownedRosterDeclarationStatus === 'confirmed' && verification.ownedRosterMatches
                 ? '已确认'
