@@ -2372,6 +2372,20 @@ migrations.push({version:37,sql:`
     BEGIN SELECT RAISE(ABORT,'Connection proof is immutable'); END;
 `});
 
+migrations.push({version:38,sql:`
+  CREATE TABLE product_trend_acquisitions (
+    acquisition_key TEXT PRIMARY KEY, product_id TEXT NOT NULL REFERENCES products(id),
+    provider TEXT NOT NULL, collected_at TEXT NOT NULL, sync_run_id TEXT,
+    call_id TEXT, request_hash TEXT, schema_hash TEXT,
+    sanitized_raw_json TEXT, normalized_payload_json TEXT NOT NULL,
+    period TEXT NOT NULL, CHECK(json_valid(normalized_payload_json))
+  );
+  CREATE TRIGGER product_trend_acquisition_no_update BEFORE UPDATE ON product_trend_acquisitions
+    BEGIN SELECT RAISE(ABORT,'Trend acquisition is immutable'); END;
+  CREATE TRIGGER product_trend_acquisition_no_delete BEFORE DELETE ON product_trend_acquisitions
+    BEGIN SELECT RAISE(ABORT,'Trend acquisition is immutable'); END;
+`});
+
 export function migrate(database: DatabaseSync): void {
   database.exec(`
     CREATE TABLE IF NOT EXISTS schema_migrations (

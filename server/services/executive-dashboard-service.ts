@@ -378,6 +378,9 @@ export class ExecutiveDashboardService {
       trendComparison: trendComparison.series,
       trendComparisonMeta: comparisonMeta(trendComparison),
       operatingMetrics: {
+        periodState: product.latest.periodState,
+        periodMonth: product.latest.periodMonth,
+        collectedAt: product.latest.provenance.collectedAt,
         estimatedSales: product.latest.estimatedSales,
         estimatedRevenue: product.latest.estimatedRevenue,
         price: product.latest.price,

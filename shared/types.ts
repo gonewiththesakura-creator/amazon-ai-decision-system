@@ -195,6 +195,7 @@ export interface ProductSnapshot {
   productId: string;
   date: string;
   periodState?: 'closed_month' | 'current_mtd';
+  periodMonth?: string;
   price: number | null;
   rating: number | null;
   reviewCount: number | null;
@@ -789,6 +790,9 @@ export interface ExecutiveSkuFocus {
   trendComparison: IndexedTrendSeries[];
   trendComparisonMeta: IndexedTrendComparisonMeta;
   operatingMetrics: {
+    periodState?: 'closed_month' | 'current_mtd';
+    periodMonth?: string;
+    collectedAt?: string;
     estimatedSales: number | null;
     estimatedRevenue: number | null;
     price: number | null;

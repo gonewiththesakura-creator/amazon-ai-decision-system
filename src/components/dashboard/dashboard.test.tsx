@@ -488,4 +488,15 @@ describe('executive dashboard presentation invariants', () => {
     expect(screen.getByText('进一步诊断仍需：广告、流量和转化数据')).toBeInTheDocument();
     expect(screen.getByRole('button', { name: /返回全部自有 SKU/ })).toBeInTheDocument();
   });
+  it('labels latest MTD sales and collection date without implying a closed month',()=>{
+    render(<SkuFocusView data={{
+      sku:{id:'sku',name:'Pillow',asin:'B0TEST',sku:null},market:{id:'market',name:'Market'},trendComparison:[],
+      trendComparisonMeta:{commonBaselineDate:null,excludedSeries:[]},
+      operatingMetrics:{periodState:'current_mtd',periodMonth:'202609',collectedAt:'2026-09-28T01:00:00Z',
+        estimatedSales:31,estimatedRevenue:1240,price:40,rating:null,reviews:null,bsr:null,growth30d:null,marketGrowth30d:null,relativeDelta:null},
+      directCompetitors:[],insight:null,missingDataLabels:[]}} onBack={()=>undefined}/>);
+    expect(screen.getByText('MTD 销量（未闭月）').closest('div')).toHaveTextContent('31');
+    expect(screen.getByText('MTD 销售额（未闭月）')).toBeInTheDocument();
+    expect(screen.getByText(/202609.*2026-09-28/)).toBeInTheDocument();
+  });
 });

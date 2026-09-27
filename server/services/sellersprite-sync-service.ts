@@ -11,7 +11,9 @@ import type {
 import type { AppDatabase } from '../database/database.js';
 import { transaction } from '../database/database.js';
 import { ProductIdentityResolver } from '../domain/product-identity-resolver.js';
-import { sanitizeMcpError } from '../adapters/sellersprite-mcp-client.js';
+import {productObservationPeriod,productObservationSuffix} from '../domain/product-observation-period.js';
+import { sanitizeMcpError, scrubSecrets } from '../adapters/sellersprite-mcp-client.js';
+import {assertTrendBusinessEquality} from '../adapters/asin-trend-audit.js';
 import { requireConfirmedOwnedRoster, sellerSpriteRosterScope, ownedRosterState } from './owned-roster-declaration.js';
 import { LocalObservationResolver } from './local-observation-resolver.js';
 import { reusableCapabilitySnapshot, SELLERSPRITE_CAPABILITIES } from '../adapters/sellersprite-tool-registry.js';
@@ -140,6 +142,7 @@ interface PreparedMarketObservation {
 }
 
 interface PreparedProductObservation {
+  acquisitionResponse?: SellerSpriteAsinTrend;
   product: ProductRow;
   parentAsin: string | null;
   provenance: Provenance;
@@ -1075,6 +1078,7 @@ export class SellerSpriteSyncService {
     return {
       product,
       parentAsin: stringOrNull(info.parent)?.toUpperCase() ?? null,
+      acquisitionResponse: response.data,
       provenance: response.provenance,
       points,
     };
@@ -1144,6 +1148,23 @@ export class SellerSpriteSyncService {
   private persistProduct(
     prepared: PreparedProductObservation, entityType: 'product' | 'competitor' = 'product', runId?: string,
   ): number {
+    if(prepared.acquisitionResponse){
+      const key=requestKey(['sellersprite',prepared.product.marketplace,prepared.product.asin,prepared.provenance.collectedAt,prepared.provenance.period]);
+      const old=this.database.prepare('SELECT normalized_payload_json FROM product_trend_acquisitions WHERE acquisition_key=?').get(key);
+      if(old)assertTrendBusinessEquality(JSON.parse(String(old.normalized_payload_json)),prepared.acquisitionResponse);
+      else {
+        const call=this.database.prepare(`SELECT l.id,l.request_hash,c.response_json FROM mcp_call_logs l
+          JOIN mcp_response_cache c ON c.cache_key=l.request_hash AND c.provider_id=l.provider_id
+          WHERE l.sync_run_id=? AND l.entity_id=? AND l.capability='ASIN_SALES_TREND' AND l.status='success'
+           AND c.created_at=? ORDER BY l.completed_at DESC LIMIT 1`).get(runId??null,prepared.product.asin,prepared.provenance.collectedAt);
+        const local=this.database.prepare(`SELECT schema_hash FROM mcp_local_observations WHERE capability='ASIN_SALES_TREND'
+          AND scope_key=? AND collected_at=?`).get(requestKey([prepared.product.marketplace,prepared.product.asin,null]),prepared.provenance.collectedAt);
+        this.database.prepare(`INSERT INTO product_trend_acquisitions VALUES(?,?,?,?,?,?,?,?,?,?,?)`).run(
+          key,prepared.product.id,'sellersprite',prepared.provenance.collectedAt,runId??null,
+          call?.id??null,call?.request_hash??null,local?.schema_hash??null,call?.response_json??null,
+          JSON.stringify(scrubSecrets(prepared.acquisitionResponse)),prepared.provenance.period);
+      }
+    }
     if (prepared.parentAsin) {
       this.identityResolver.resolve({
         marketplace: prepared.product.marketplace,
@@ -1163,7 +1184,7 @@ export class SellerSpriteSyncService {
       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, ?, 'mcp', ?, ?, ?, ?, ?, ?, ?)
     `);
     for (const point of prepared.points) {
-      const existing = this.database.prepare(`
+      const candidates = this.database.prepare(`
         SELECT * FROM product_snapshots
         WHERE product_id = ? AND COALESCE(observation_date, date) = ?
           AND source_type = 'mcp' AND LOWER(TRIM(period)) = LOWER(TRIM(?))
@@ -1171,15 +1192,17 @@ export class SellerSpriteSyncService {
             OR bsr IS NOT NULL OR estimated_sales IS NOT NULL OR estimated_revenue IS NOT NULL
             OR seller_count IS NOT NULL OR growth_7d IS NOT NULL OR growth_30d IS NOT NULL
             OR growth_90d IS NOT NULL)
-        LIMIT 1
-      `).get(prepared.product.id, point.observationDate, prepared.provenance.period) as Record<string, unknown> | undefined;
+      `).all(prepared.product.id, point.observationDate, prepared.provenance.period) as Record<string, unknown>[];
+      const periodState=productObservationPeriod(point.observationDate,prepared.provenance.collectedAt,prepared.provenance.period).periodState;
+      const existing=candidates.find(row=>row.source===prepared.provenance.source
+        && productObservationPeriod(point.observationDate,String(row.collected_at),String(row.period)).periodState===periodState
+        && (periodState==='closed_month'||row.collected_at===prepared.provenance.collectedAt));
       if (existing) {
-        if (runId) {
           const matches = PRODUCT_METRICS.every((metric) => existing[PRODUCT_METRIC_COLUMNS[metric]] === point[metric]);
           if (!matches || existing.source !== prepared.provenance.source) {
             throw new Error('本次 SellerSprite 产品数据与同周期不可变观察不一致，需人工核对后重新同步。');
           }
-          this.linkObservation(runId, 'product', String(existing.id), prepared.product.id, 'reused');
+          if(runId)this.linkObservation(runId, 'product', String(existing.id), prepared.product.id, 'reused');
           for (const metric of PRODUCT_METRICS) {
             this.persistFact(
               entityType, prepared.product.id, prepared.product.marketplace,
@@ -1187,13 +1210,12 @@ export class SellerSpriteSyncService {
               prepared.provenance, runId,
             );
           }
-        }
         continue;
       }
       const dedupKey = snapshotDedupKey(
         'product', prepared.product.marketplace, prepared.product.id,
         point.observationDate, prepared.provenance,
-      );
+      )+productObservationSuffix(point.observationDate,prepared.provenance.collectedAt,prepared.provenance.period);
       const snapshotId = randomUUID();
       const result = statement.run(
         snapshotId, prepared.product.id, point.observationDate, point.price, point.rating,
@@ -1221,26 +1243,28 @@ export class SellerSpriteSyncService {
     runId?: string,
   ): void {
     const period = normalizeKeyPart(provenance.period);
-    const dedupKey = [
+    const legacyKey = [
       'fact', entityType, normalizeKeyPart(marketplace), entityId, metricName,
       observationDate, SOURCE_ID, period,
     ].join('|');
+    const isProduct=entityType!=='market';
+    const dedupKey=legacyKey+(isProduct?productObservationSuffix(observationDate,provenance.collectedAt,provenance.period):'');
     const existing = this.database.prepare(`
       SELECT id, numeric_value AS numericValue, source, source_id AS sourceId,
-        source_type AS sourceType
-      FROM metric_facts WHERE dedup_key = ?
-    `).get(dedupKey) as {
+        source_type AS sourceType, collected_at AS collectedAt
+      FROM metric_facts WHERE dedup_key IN (?,?)
+    `).all(dedupKey,legacyKey).find(row=>!isProduct||
+      (productObservationPeriod(observationDate,String(row.collectedAt),provenance.period).periodState===productObservationPeriod(observationDate,provenance.collectedAt,provenance.period).periodState
+       && (productObservationPeriod(observationDate,provenance.collectedAt,provenance.period).periodState==='closed_month'||row.collectedAt===provenance.collectedAt))) as {
       id: string; numericValue: number | null; source: string;
       sourceId: string | null; sourceType: string;
     } | undefined;
     if (existing) {
-      if (runId) {
         if (existing.numericValue !== value || existing.source !== provenance.source
           || existing.sourceId !== SOURCE_ID || existing.sourceType !== 'mcp') {
           throw new Error('本次 SellerSprite 指标与同周期不可变事实不一致，需人工核对后重新同步。');
         }
-        this.linkObservation(runId, 'fact', existing.id, entityId, 'reused');
-      }
+        if(runId)this.linkObservation(runId, 'fact', existing.id, entityId, 'reused');
       return;
     }
     const factId = randomUUID();
@@ -1266,7 +1290,7 @@ export class SellerSpriteSyncService {
     this.database.prepare(`
       INSERT INTO mcp_sync_observation_links (
         sync_run_id, snapshot_kind, snapshot_id, entity_id, disposition
-      ) VALUES (?, ?, ?, ?, ?)
+      ) VALUES (?, ?, ?, ?, ?) ON CONFLICT(sync_run_id,snapshot_kind,snapshot_id) DO NOTHING
     `).run(runId, snapshotKind, snapshotId, entityId, disposition);
   }
 

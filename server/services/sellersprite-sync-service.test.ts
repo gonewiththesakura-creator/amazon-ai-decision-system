@@ -7,6 +7,9 @@ import { DashboardFreshnessService } from './dashboard-freshness-service.js';
 import { proveDashboardRunReadPath } from './dashboard-run-read-proof.js';
 import { seedConfirmedOwnedRoster } from '../test-utils/owned-roster-declaration.js';
 import { GoLiveMigrationService } from './go-live-migration-service.js';
+import {mcpExecution} from '../adapters/mcp-policy.js';
+import {productObservationPeriod} from '../domain/product-observation-period.js';
+import {deriveSnapshotGrowth} from '../domain/snapshot-growth.js';
 
 let database: AppDatabase | undefined;
 
@@ -119,6 +122,97 @@ function count(table: 'market_snapshots' | 'product_snapshots' | 'competitor_can
 }
 
 describe('SellerSprite real-data sync', () => {
+  it.each(['product','competitor'] as const)('appends MTD and reuses immutable closed observations for %s',async entity=>{
+    database=fixtureDatabase();
+    if(entity==='competitor'){
+      database.exec(`INSERT INTO products(id,asin,brand,title,image_url,marketplace,product_type,is_owned,market_node_id,source_type,created_at)
+        VALUES('comp','B0COMP0001','Test','Test','','US','pillow',0,'market-1','import','2026-01-01');
+        INSERT INTO competitor_relations(id,owned_product_id,competitor_product_id,relation_type,similarity_score,reason,created_at)
+        VALUES('rel','owned-1','comp','direct',1,'Synthetic review','2026-01-01')`);
+    }
+    const id=entity==='product'?'owned-1':'comp';
+    let sales=30,august=7,at='2026-09-27T01:00:00.000Z';
+    const port=fixturePort({async fetchAsinSalesTrend(input){return {data:{asin:{asin:input.asin,marketplace:'US'},
+      salesTrendPoints:[{month:'2026-07',childUnitSales:28,price:40},{month:'2026-08',childUnitSales:august,price:40},
+        {month:'2026-09',childUnitSales:sales,childSalesRevenue:sales*40,price:40,rating:4.5,ratings:80,bsr:100,sellers:1}]},provenance:{...provenance,collectedAt:at}};}});
+    const service=new SellerSpriteSyncService(database,port);
+    const run=()=>mcpExecution.run({syncMode:'force',remaining:0},()=>entity==='product'?service.syncOwnedProduct({productId:id}):service.syncConfirmedCompetitor({ownedProductId:'owned-1',competitorProductId:id}));
+    const first=await run();expect(first.inserted).toBe(3);
+    sales=31;at='2026-09-28T01:00:00.000Z';const second=await run();expect(second.inserted).toBe(1);
+    expect((await run()).inserted).toBe(0);
+    const rows=database.prepare("SELECT * FROM product_snapshots WHERE product_id=? ORDER BY date,collected_at").all(id);
+    expect(rows.map(r=>r.estimated_sales)).toEqual([28,7,30,31]);
+    expect(rows.slice(-2).map(r=>r.sync_run_id)).toEqual([first.runId,second.runId]);
+    expect(rows.slice(-2).map(r=>r.collected_at)).toEqual(['2026-09-27T01:00:00.000Z','2026-09-28T01:00:00.000Z']);
+    expect(rows.slice(-2).map(r=>productObservationPeriod(String(r.date),String(r.collected_at),String(r.period)).periodState)).toEqual(['current_mtd','current_mtd']);
+    expect(database.prepare("SELECT numeric_value FROM metric_facts WHERE entity_id=? AND metric_name='estimated_sales' ORDER BY observation_date,collected_at").all(id).map(r=>r.numeric_value)).toEqual([28,7,30,31]);
+    expect(database.prepare("SELECT count(*) n FROM metric_facts WHERE entity_id=? AND observation_date='2026-09-30'").get(id)?.n).toBe(14);
+    expect(database.prepare('SELECT count(*) n FROM product_trend_acquisitions WHERE product_id=?').get(id)?.n).toBe(2);
+    const history=new IntelligenceRepository(database).getProductSnapshots(id);
+    expect(history.at(-1)).toMatchObject({estimatedSales:31,periodState:'current_mtd',periodMonth:'202609',growth30d:null});
+    expect(history.find(p=>p.date==='2026-08-31')?.growth30d).toBe(-75);
+    expect(deriveSnapshotGrowth(rows.map(r=>({id:String(r.id),date:String(r.date),value:r.estimated_sales as number,
+      periodState:productObservationPeriod(String(r.date),String(r.collected_at),String(r.period)).periodState})))?.growth).toBe(-75);
+    august=8;at='2026-09-29T01:00:00.000Z';await expect(run()).rejects.toThrow(/不可变/);
+    expect(database.prepare('SELECT count(*) n FROM product_snapshots WHERE product_id=?').get(id)?.n).toBe(4);
+    expect(database.prepare('SELECT count(*) n FROM product_trend_acquisitions WHERE product_id=?').get(id)?.n).toBe(2);
+  });
+  it('rejects a changed closed Fact independently of Snapshot equality',async()=>{
+    database=fixtureDatabase();const service=new SellerSpriteSyncService(database,fixturePort());
+    await service.syncOwnedProduct({productId:'owned-1'});
+    expect(()=>service['persistFact']('product','owned-1','US','estimated_sales',101,'2026-07-31',provenance)).toThrow(/不可变/);
+  });
+  it('archives raw lineage before cache replacement and rejects same-acquisition mutation',async()=>{
+    database=fixtureDatabase();let sales=30,at='2026-09-27T02:00:00.000Z',sequence=0;
+    const port=fixturePort({async fetchAsinSalesTrend(input,context){
+      const data={asin:{asin:input.asin,marketplace:'US'},salesTrendPoints:[{month:'2026-09',childUnitSales:sales,price:40}]};
+      const raw=JSON.stringify({content:[{type:'text',text:JSON.stringify({code:'OK',data})}]});
+      database!.prepare("INSERT OR REPLACE INTO mcp_response_cache VALUES('test-request','sellersprite',?,?,?)").run(raw,at,'2099-01-01');
+      database!.prepare(`INSERT INTO mcp_call_logs(id,provider_id,capability,request_hash,entity_id,status,started_at,completed_at,sync_run_id)
+        VALUES(?,'sellersprite','ASIN_SALES_TREND','test-request',?,'success',?,?,?)`).run(`call-${++sequence}`,input.asin,at,at,context!.runId!);
+      return {data,provenance:{...provenance,collectedAt:at}};
+    }});
+    const service=new SellerSpriteSyncService(database,port),run=()=>mcpExecution.run({syncMode:'force',remaining:0},()=>service.syncOwnedProduct({productId:'owned-1'}));
+    const first=await run();sales=31;at='2026-09-28T02:00:00.000Z';const second=await run();
+    const archive=database.prepare('SELECT * FROM product_trend_acquisitions ORDER BY collected_at').all();
+    expect(archive.map(a=>a.sync_run_id)).toEqual([first.runId,second.runId]);
+    expect(archive.map(a=>a.call_id)).toEqual(['call-1','call-2']);
+    expect(archive.map(a=>JSON.parse(JSON.parse(String(a.sanitized_raw_json)).content[0].text).data.salesTrendPoints[0].childUnitSales)).toEqual([30,31]);
+    expect(()=>database!.exec("UPDATE product_trend_acquisitions SET collected_at='x'")).toThrow(/immutable/);
+    expect(()=>database!.exec('DELETE FROM product_trend_acquisitions')).toThrow(/immutable/);
+    sales=32;await expect(run()).rejects.toThrow(/BUSINESS_MAPPING_MISMATCH/);
+    expect(database.prepare('SELECT count(*) n FROM product_snapshots').get()?.n).toBe(2);
+  });
+  it('keeps MTD distinct when the same month later closes',async()=>{
+    database=fixtureDatabase();let at='2026-09-27T02:00:00.000Z',sales=30;
+    const service=new SellerSpriteSyncService(database,fixturePort({async fetchAsinSalesTrend(input){return {
+      data:{asin:{asin:input.asin,marketplace:'US'},salesTrendPoints:[{month:'2026-09',childUnitSales:sales,price:40}]},provenance:{...provenance,collectedAt:at}};}}));
+    const run=()=>mcpExecution.run({syncMode:'force',remaining:0},()=>service.syncOwnedProduct({productId:'owned-1'}));
+    await run();at='2026-10-01T02:00:00.000Z';sales=35;expect((await run()).inserted).toBe(1);
+    expect((await run()).inserted).toBe(0);at='2026-10-02T02:00:00.000Z';sales=36;await expect(run()).rejects.toThrow(/不可变/);
+    expect(database.prepare("SELECT numeric_value FROM metric_facts WHERE metric_name='estimated_sales' ORDER BY collected_at").all().map(r=>r.numeric_value)).toEqual([30,35]);
+  });
+  it('replays one acquisition twice in the same run without duplicate links or observations',async()=>{
+    database=fixtureDatabase();const service=new SellerSpriteSyncService(database,fixturePort());
+    const result=await service.syncOwnedProduct({productId:'owned-1'});
+    const product={id:'owned-1',asin:'B0OWNED001',marketplace:'US',marketNodeId:'market-1'};
+    const prepared=await mcpExecution.run({syncMode:'force',remaining:0},()=>service['prepareProduct'](product,result.runId));
+    const before=database.prepare('SELECT count(*) n FROM mcp_sync_observation_links').get()?.n;
+    expect(service['persistProduct'](prepared,'product',result.runId)).toBe(0);
+    expect(database.prepare('SELECT count(*) n FROM mcp_sync_observation_links').get()?.n).toBe(before);
+  });
+  it('appends after legacy MTD without rewriting the legacy key or values',async()=>{
+    database=fixtureDatabase();database.prepare(`INSERT INTO product_snapshots(id,product_id,date,observation_date,
+      estimated_sales,price,source,source_type,collected_at,period,is_estimated,confidence,dedup_key)
+      VALUES('legacy-mtd','owned-1','2026-09-30','2026-09-30',30,40,'SellerSprite MCP','mcp','2026-09-27T02:00:00Z','1M',1,0.85,'product|us|owned-1|2026-09-30|source-sellersprite-mcp|1m')`).run();
+    database.prepare(`INSERT INTO metric_facts(id,entity_type,entity_id,marketplace,metric_name,numeric_value,source,source_type,source_id,observation_date,collected_at,is_estimated,confidence,dedup_key)
+      VALUES('legacy-fact','product','owned-1','US','estimated_sales',30,'SellerSprite MCP','mcp','source-sellersprite-mcp','2026-09-30','2026-09-27T02:00:00Z',1,0.85,'fact|product|us|owned-1|estimated_sales|2026-09-30|source-sellersprite-mcp|1m')`).run();
+    const before=database.prepare("SELECT * FROM product_snapshots WHERE id='legacy-mtd'").get();
+    const service=new SellerSpriteSyncService(database,fixturePort({async fetchAsinSalesTrend(input){return {data:{asin:{asin:input.asin,marketplace:'US'},salesTrendPoints:[{month:'2026-09',childUnitSales:31,price:40}]},provenance:{...provenance,collectedAt:'2026-09-28T02:00:00Z'}};}}));
+    expect((await mcpExecution.run({syncMode:'force',remaining:0},()=>service.syncOwnedProduct({productId:'owned-1'}))).inserted).toBe(1);
+    expect(database.prepare("SELECT * FROM product_snapshots WHERE id='legacy-mtd'").get()).toEqual(before);
+    expect(database.prepare("SELECT numeric_value FROM metric_facts WHERE metric_name='estimated_sales' ORDER BY collected_at").all().map(r=>r.numeric_value)).toEqual([30,31]);
+  });
   it('rejects a critical batch without a confirmed owned-roster declaration before contacting MCP', async () => {
     database = fixtureDatabase();
     database.prepare(`DELETE FROM owned_roster_declarations WHERE marketplace = 'US'`).run();

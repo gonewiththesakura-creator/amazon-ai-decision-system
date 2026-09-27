@@ -22,8 +22,8 @@ export function SkuFocusView({ data, range, currency = 'USD', onRangeChange, onB
     { label: 'Rating', value: data.operatingMetrics.rating?.toFixed(1) ?? '—', tone: 'neutral' },
     { label: 'Review', value: formatInteger(data.operatingMetrics.reviews), tone: 'neutral' },
     { label: 'BSR', value: formatInteger(data.operatingMetrics.bsr), tone: 'neutral' },
-    { label: '月销量', value: formatInteger(data.operatingMetrics.estimatedSales), tone: 'neutral' },
-    { label: '月销售额', value: formatCurrency(data.operatingMetrics.estimatedRevenue, currency), tone: 'neutral' },
+    { label: data.operatingMetrics.periodState==='current_mtd'?'MTD 销量（未闭月）':'月销量', value: formatInteger(data.operatingMetrics.estimatedSales), tone: 'neutral' },
+    { label: data.operatingMetrics.periodState==='current_mtd'?'MTD 销售额（未闭月）':'月销售额', value: formatCurrency(data.operatingMetrics.estimatedRevenue, currency), tone: 'neutral' },
     {
       label: '30D Growth',
       value: data.operatingMetrics.growth30d === null ? '—' : formatSignedPercent(data.operatingMetrics.growth30d),
@@ -49,6 +49,7 @@ export function SkuFocusView({ data, range, currency = 'USD', onRangeChange, onB
           <span>SKU FOCUS</span>
           <h2>{data.sku.name}</h2>
           <p>ASIN: {data.sku.asin}{data.sku.sku ? ` · SKU: ${data.sku.sku}` : ''}</p>
+          {data.operatingMetrics.periodState==='current_mtd'&&<p>MTD · {data.operatingMetrics.periodMonth} · 采集于 {data.operatingMetrics.collectedAt}</p>}
         </div>
       </header>
 

@@ -765,6 +765,9 @@ export class IntelligenceRepository {
       reviewCount: nullableNumberValue(row.snapshot_review_count),
       bsr: nullableNumberValue(row.snapshot_bsr),
       estimatedSales: nullableNumberValue(row.snapshot_estimated_sales),
+      periodState: /^(monthly|1M|closed_month|current_mtd)$/.test(stringValue(row.snapshot_period))
+        ? monthlyPeriodState(stringValue(row.snapshot_date),stringValue(row.snapshot_collected_at)) : undefined,
+      periodMonth: stringValue(row.snapshot_date).slice(0,7).replace('-',''),
       estimatedRevenue: nullableNumberValue(row.snapshot_estimated_revenue),
       sellerCount: nullableNumberValue(row.snapshot_seller_count),
       growth7d: nullableNumberValue(row.snapshot_growth_7d),
@@ -803,6 +806,7 @@ export class IntelligenceRepository {
       date: stringValue(row.date),
       periodState: /^(monthly|1M|closed_month|current_mtd)$/.test(stringValue(row.period))
         ? monthlyPeriodState(stringValue(row.date),stringValue(row.collected_at)) : undefined,
+      periodMonth: stringValue(row.date).slice(0,7).replace('-',''),
       price: nullableNumberValue(row.price),
       rating: nullableNumberValue(row.rating),
       reviewCount: nullableNumberValue(row.review_count),
