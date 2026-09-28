@@ -19,6 +19,11 @@ import { indexedTrendDomain } from './format';
 
 afterEach(() => cleanup());
 
+it.each([0,5])('distinguishes direct coverage %s from an empty growth series',count=>{
+  render(<CompetitorGrowthChart competitors={[]} directCompetitorCount={count}/>);
+  expect(screen.getByText(count?'已建立直接竞品，暂无可比较增长基线':'尚未建立直接竞品组')).toBeInTheDocument();
+});
+
 Object.defineProperty(window, 'requestAnimationFrame', {
   configurable: true,
   value: (callback: FrameRequestCallback) => {
@@ -495,8 +500,8 @@ describe('executive dashboard presentation invariants', () => {
       operatingMetrics:{periodState:'current_mtd',periodMonth:'202609',collectedAt:'2026-09-28T01:00:00Z',
         estimatedSales:31,estimatedRevenue:1240,price:40,rating:null,reviews:null,bsr:null,growth30d:null,marketGrowth30d:null,relativeDelta:null},
       directCompetitors:[],insight:null,missingDataLabels:[]}} onBack={()=>undefined}/>);
-    expect(screen.getByText('MTD 销量（未闭月）').closest('div')).toHaveTextContent('31');
-    expect(screen.getByText('MTD 销售额（未闭月）')).toBeInTheDocument();
+    expect(screen.getByText('本月累计销量 MTD').closest('div')).toHaveTextContent('31');
+    expect(screen.getByText('本月累计销售额 MTD')).toBeInTheDocument();
     expect(screen.getByText(/202609.*2026-09-28/)).toBeInTheDocument();
   });
 });

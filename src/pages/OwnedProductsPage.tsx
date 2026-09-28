@@ -1,4 +1,6 @@
 import { type FormEvent, useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import {ProductPeriod} from '../components/ProductPeriod';
+import {salesLabel} from '../lib/productPeriod';
 import { Link, useNavigate, useParams, useSearchParams } from 'react-router-dom';
 import {
   ArrowDown,
@@ -137,7 +139,7 @@ function SkuSelector({ product, active }: { product: OwnedProductSummary; active
         <Badge tone={hasTrustedData ? performance.tone : 'warning'}>{hasTrustedData ? performance.label : hasProductData ? '基线不足' : '待补数据'}</Badge>
       </div>
       <div className="sku-selector__metrics">
-        <span><small>月销量</small><strong>{hasProductData ? formatInteger(product.latest.estimatedSales) : '—'}</strong></span>
+        <span><small>{salesLabel(product.latest)}</small><strong>{hasProductData ? formatInteger(product.latest.estimatedSales) : '—'}</strong><ProductPeriod snapshot={product.latest} /></span>
         <span><small>SKU 30D</small><strong className={hasTrustedData ? product.latest.growth30d >= 0 ? 'text-positive' : 'text-critical' : ''}>{hasTrustedData ? formatPercent(product.latest.growth30d) : '—'}</strong></span>
         <span><small>相对市场</small><strong className={hasTrustedData ? product.relativeDelta >= 0 ? 'text-positive' : 'text-critical' : ''}>{hasTrustedData ? formatPercent(product.relativeDelta) : '—'}</strong></span>
       </div>
@@ -284,8 +286,8 @@ function CompetitorTable({
                 <th>产品 / ASIN</th><th>竞品组</th>
                 <th><SortButton label="价格" value="price" active={sortKey} descending={descending} onClick={changeSort} /></th>
                 <th>Rating / Review</th><th>BSR</th>
-                <th><SortButton label="月销量" value="sales" active={sortKey} descending={descending} onClick={changeSort} /></th>
-                <th>月销售额</th><th>7D</th>
+                <th><SortButton label="销量（周期见明细）" value="sales" active={sortKey} descending={descending} onClick={changeSort} /></th>
+                <th>销售额（周期见明细）</th><th>7D</th>
                 <th><SortButton label="30D" value="growth" active={sortKey} descending={descending} onClick={changeSort} /></th>
                 <th>90D</th><th><SortButton label="相似度" value="similarity" active={sortKey} descending={descending} onClick={changeSort} /></th><th>AI 标签</th>{canEdit ? <th><span className="visually-hidden">管理</span></th> : null}
               </tr>
@@ -310,8 +312,8 @@ function CompetitorTable({
                   <td>{item.latest.snapshotAvailable ? formatCurrency(item.latest.price, currency) : '—'}</td>
                   <td>{item.latest.snapshotAvailable ? <span className="rating-cell">{item.latest.rating !== null ? <Star size={13} fill="currentColor" aria-hidden="true" /> : null}{formatDecimal(item.latest.rating)} <small>({formatCompact(item.latest.reviewCount)})</small></span> : <Badge tone="warning">待补数据</Badge>}</td>
                   <td>{item.latest.bsr !== null ? `#${formatInteger(item.latest.bsr)}` : '—'}</td>
-                  <td><strong>{formatInteger(item.latest.estimatedSales)}</strong></td>
-                  <td>{formatCurrency(item.latest.estimatedRevenue, currency, true)}</td>
+                  <td><small>{salesLabel(item.latest)}</small><strong>{formatInteger(item.latest.estimatedSales)}</strong><ProductPeriod snapshot={item.latest} /></td>
+                  <td><small>{salesLabel(item.latest,true)}</small>{formatCurrency(item.latest.estimatedRevenue, currency, true)}<ProductPeriod snapshot={item.latest} /></td>
                   <td className={item.latest.growth7d !== null ? item.latest.growth7d >= 0 ? 'text-positive' : 'text-critical' : ''}>{formatPercent(item.latest.growth7d)}</td>
                   <td className={item.latest.growth30dAvailable && item.latest.growth30d !== null ? item.latest.growth30d >= 0 ? 'text-positive' : 'text-critical' : ''}><strong>{item.latest.growth30dAvailable ? formatPercent(item.latest.growth30d) : '—'}</strong></td>
                   <td className={item.latest.growth90d !== null ? item.latest.growth90d >= 0 ? 'text-positive' : 'text-critical' : ''}>{formatPercent(item.latest.growth90d)}</td>
@@ -564,8 +566,8 @@ export default function OwnedProductsPage() {
           <div><span>Rating</span><strong>{hasProductData ? <>{formatDecimal(detail.latest.rating)} <Star size={13} fill="currentColor" aria-hidden="true" /></> : '—'}</strong></div>
           <div><span>Review</span><strong>{hasProductData ? formatInteger(detail.latest.reviewCount) : '—'}</strong></div>
           <div><span>BSR</span><strong>{hasProductData ? `#${formatInteger(detail.latest.bsr)}` : '—'}</strong></div>
-          <div><span>月销量</span><strong>{hasProductData ? formatInteger(detail.latest.estimatedSales) : '—'}</strong></div>
-          <div><span>月销售额</span><strong>{hasProductData ? formatCurrency(detail.latest.estimatedRevenue, settings.currency, true) : '—'}</strong></div>
+          <div><span>{salesLabel(detail.latest)}</span><strong>{hasProductData ? formatInteger(detail.latest.estimatedSales) : '—'}</strong><ProductPeriod snapshot={detail.latest} /></div>
+          <div><span>{salesLabel(detail.latest,true)}</span><strong>{hasProductData ? formatCurrency(detail.latest.estimatedRevenue, settings.currency, true) : '—'}</strong><ProductPeriod snapshot={detail.latest} /></div>
         </div>
       </section>
 
@@ -650,12 +652,12 @@ export default function OwnedProductsPage() {
                     <YAxis yAxisId="price" orientation="right" tickFormatter={(value: number) => formatCurrency(value, settings.currency)} tick={{ fill: '#73807d', fontSize: 11 }} axisLine={false} tickLine={false} width={58} />
                     <Tooltip labelFormatter={(value) => formatDate(String(value), 'yyyy-MM-dd')} contentStyle={{ border: '1px solid #dfe5e3', borderRadius: 6 }} />
                     <Legend iconType="plainline" wrapperStyle={{ fontSize: 12 }} />
-                    <Line yAxisId="sales" type="monotone" dataKey="estimatedSales" name="预估月销量" stroke="#16836f" strokeWidth={2.2} dot={false} connectNulls={false} />
+                    <Line yAxisId="sales" type="monotone" dataKey="estimatedSales" name={salesLabel(detail.latest)} stroke="#16836f" strokeWidth={2.2} dot={false} connectNulls={false} />
                     <Line yAxisId="price" type="stepAfter" dataKey="price" name="价格" stroke="#b46a24" strokeWidth={1.8} dot={false} connectNulls={false} />
                   </LineChart>
                 </ResponsiveContainer>
               </div>
-              <footer className="snapshot-footer"><Clock3 size={14} aria-hidden="true" />最近快照 {formatDateTime(detail.latest.provenance.collectedAt)} · {detail.latest.estimatedSales === null ? '快照来源' : '月销量来源'}：{detail.latest.provenance.source}{detail.latest.provenance.isEstimated ? ' · 估算' : ''}{new Set(Object.values(detail.latest.metricProvenance ?? {}).map((source) => source.sourceRecordId)).size > 1 ? ' · 多来源指标' : ''}</footer>
+              <footer className="snapshot-footer"><Clock3 size={14} aria-hidden="true" /><ProductPeriod snapshot={detail.latest} />最近快照 {formatDateTime(detail.latest.provenance.collectedAt)} · {detail.latest.estimatedSales === null ? '快照来源' : salesLabel(detail.latest)+'来源'}：{detail.latest.provenance.source}{detail.latest.provenance.isEstimated ? ' · 估算' : ''}{new Set(Object.values(detail.latest.metricProvenance ?? {}).map((source) => source.sourceRecordId)).size > 1 ? ' · 多来源指标' : ''}</footer>
             </section>
           </div>
         </>

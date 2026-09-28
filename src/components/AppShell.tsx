@@ -1,4 +1,5 @@
 import { Suspense, useEffect, useMemo, useRef, useState } from 'react';
+import {CollectionStatus} from './CollectionStatus';
 import { Link, NavLink, Outlet, useLocation } from 'react-router-dom';
 import clsx from 'clsx';
 import {
@@ -25,7 +26,6 @@ import {
 } from 'lucide-react';
 import type { LucideIcon } from 'lucide-react';
 import { useApp } from '../lib/AppContext';
-import { formatFreshness } from '../lib/format';
 import { ExecutiveAiDrawer } from './ExecutiveAiDrawer';
 import { PageLoading } from './StateViews';
 
@@ -300,7 +300,7 @@ export function AppShell() {
             <span className={clsx('status-dot', settings.mode === 'live' ? 'is-live' : settings.mode === 'demo' ? 'is-demo' : '')} />
             <div>
               <strong>{settings.mode === 'live' ? 'Live 工作区' : settings.mode === 'demo' ? 'Demo 数据源' : '等待数据接入'}</strong>
-              <small>{formatFreshness(settings.lastSuccessfulSync)}</small>
+              <CollectionStatus settings={settings} />
             </div>
           </div>
           <Link to="/settings?tab=sources" aria-label="管理数据源"><Blocks size={17} aria-hidden="true" /></Link>
@@ -337,12 +337,9 @@ export function AppShell() {
               </select>
               <ChevronDown size={14} aria-hidden="true" />
             </label>
-            <div className="freshness-control" title={settings.lastSuccessfulSync ?? '尚未同步'}>
+            <div className="freshness-control" title={settings.latestSuccessfulCritical?.runId}>
               <DatabaseZap size={16} aria-hidden="true" />
-              <span>
-                <small>{settings.mode === 'demo' ? 'Mock Adapter' : settings.mode === 'live' ? '系统最近同步' : '尚未同步'}</small>
-                <strong>{formatFreshness(settings.lastSuccessfulSync)}</strong>
-              </span>
+              <CollectionStatus settings={settings} />
             </div>
             <ExecutiveAiDrawer />
             <button className="button button--secondary button--sm top-refresh" type="button" onClick={() => void manualRefresh()} disabled={syncing || settings.role === 'viewer'} title={settings.role === 'viewer' ? 'Viewer 预览仅可查看数据' : '提交全量刷新任务'}>

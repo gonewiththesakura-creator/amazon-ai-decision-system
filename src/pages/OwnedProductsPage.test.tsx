@@ -185,6 +185,17 @@ afterEach(() => {
 });
 
 describe('OwnedProductsPage competitor deep link', () => {
+  it.each(['current_mtd','closed_month'] as const)('labels selector and KPI sales/revenue with %s semantics',periodState=>{
+    const value={...detail,latest:{...detail.latest,periodState}};
+    useApiMock.mockImplementation((path:string|null)=>({data:path?.startsWith('/api/owned-products/owned-1?')?value:[value],loading:false,error:null,reload:vi.fn()}));
+    const router=createMemoryRouter([{path:'/owned-products/:productId',element:<OwnedProductsPage/>}],{initialEntries:['/owned-products/owned-1']});
+    render(<RouterProvider router={router}/>);
+    const sales=periodState==='current_mtd'?'本月累计销量 MTD':'月销量';
+    expect(screen.getAllByText(sales).length).toBeGreaterThanOrEqual(2);
+    expect(screen.getByText(periodState==='current_mtd'?'本月累计销售额 MTD':'月销售额')).toBeInTheDocument();
+    if(periodState==='current_mtd')expect(screen.getAllByText(/截至 .*MTD 未闭月/).length).toBeGreaterThanOrEqual(3);
+    else expect(screen.queryByText(/MTD 未闭月/)).not.toBeInTheDocument();
+  });
   function createRouter(competitorId: string) {
     return createMemoryRouter([
       { path: '/owned-products/:productId', element: <OwnedProductsPage /> },

@@ -176,6 +176,15 @@ afterEach(() => {
 });
 
 describe('MarketPage V2.1 hierarchy', () => {
+  it('does not render unavailable concentration rows or promote samples to whole-market shares',()=>{
+    const value={...detail,concentration:[{tier:'',share:null,avgPrice:null,avgSales:null}],priceBands:[],kpis:{...detail.kpis,top10Share:null,top20Share:null}};
+    useApiMock.mockImplementation((path:string|null)=>({data:path?.includes('/products')?[]:path?.startsWith('/api/markets/market-memory-foam?')?value:[market],loading:false,error:null,reload:vi.fn()}));
+    const {container}=render(<MemoryRouter initialEntries={['/market?market=market-memory-foam']}><MarketPage/></MemoryRouter>);
+    expect(screen.getByText('当前没有合法全市场集中度数据')).toBeInTheDocument();
+    expect(screen.getByText('现有 TOP100 样本未作为全市场指标使用。')).toBeInTheDocument();
+    expect(container.querySelectorAll('.concentration-row')).toHaveLength(0);
+    expect(screen.queryByText('TOP10 销量占比')).not.toBeInTheDocument();
+  });
   it('shows imported market observations before Live activation, but keeps empty onboarding', () => {
     modeMock.value = 'empty';
     const view = render(<MemoryRouter initialEntries={['/market?market=market-memory-foam']}><MarketPage /></MemoryRouter>);

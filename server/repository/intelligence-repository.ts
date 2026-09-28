@@ -1,3 +1,4 @@
+import {providerConnectionProof, connectionFreshness} from '../services/provider-connection-proof.js';
 import type {
   AppSettings,
   Competitor,
@@ -96,7 +97,16 @@ export class IntelligenceRepository {
 
   getSettings(): AppSettings {
     const row = this.database.prepare('SELECT * FROM app_settings WHERE id = 1').get() as DbRow;
+    const critical = this.database.prepare(`SELECT t.id, t.completed_at FROM data_tasks t
+      JOIN data_coverage_runs c ON c.id=t.id AND c.is_complete=1
+      WHERE t.task_type='critical_sync' AND t.sync_run_id=t.id AND t.status='success'
+        AND t.source_id='source-sellersprite-mcp' AND t.marketplace=? AND t.failed=0
+        AND NOT EXISTS(SELECT 1 FROM data_tasks bad WHERE bad.sync_run_id=t.id AND bad.status IN ('failed','partial'))
+      ORDER BY t.completed_at DESC LIMIT 1`).get(stringValue(row.marketplace,'US'));
+    const proof = providerConnectionProof(this.database, critical ? String(critical.id) : null);
     return {
+      latestSuccessfulCritical: critical ? {runId:String(critical.id),completedAt:String(critical.completed_at)} : null,
+      connectionFreshness: connectionFreshness(proof),
       mode: stringValue(row.mode, 'empty') as AppSettings['mode'],
       role: stringValue(row.role, 'admin') as AppSettings['role'],
       marketplace: stringValue(row.marketplace, 'US'),

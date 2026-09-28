@@ -1,4 +1,5 @@
 import { FormEvent, useCallback, useEffect, useState } from 'react';
+import {CollectionStatus} from '../components/CollectionStatus';
 import { Link, useSearchParams } from 'react-router-dom';
 import {
   Bot,
@@ -374,7 +375,7 @@ export default function SettingsPage() {
     <main className="page settings-page">
       <header className="page-header">
         <div><div className="eyebrow">系统管理</div><h1>设置</h1><p>管理自有产品、数据连接、刷新策略与 AI 分析配置。</p></div>
-        <div className="settings-sync"><span>最近成功同步</span><strong>{formatDate(settings.lastSuccessfulSync)}</strong></div>
+        <div className="settings-sync"><CollectionStatus settings={settings} /></div>
       </header>
 
       {error && <div className="alert alert-error" role="alert">{error}<button type="button" onClick={() => void loadSettings()}>重新加载</button></div>}

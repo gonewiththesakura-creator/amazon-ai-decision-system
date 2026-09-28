@@ -335,6 +335,7 @@ export function addVerifiedMcpCoverage(
     addCall.run(randomUUID(), 'ASIN_SALES_TREND', `competitor-${competitor.id}-${runId}`,
       'product', competitor.asin.toUpperCase(), now, runId, null, 'asin_sales_trend', '{}');
   }
+  database.prepare('UPDATE mcp_call_logs SET completed_at=started_at WHERE sync_run_id=?').run(runId);
   database.prepare(`INSERT INTO data_coverage_runs (
     id, marketplace, run_type, coverage_json, is_complete, created_at
   ) VALUES (?, ?, 'critical_sync', ?, 1, ?)`).run(runId, settings.marketplace,

@@ -203,7 +203,7 @@ export default function DashboardPage() {
 
           <div className="executive-dashboard-grid executive-dashboard-grid--equal">
             <SkuRelativeBarChart items={data.ownedSkuPerformance} onSelectSku={(skuId) => updateParameter('sku', skuId)} />
-            <CompetitorGrowthChart competitors={data.fastGrowthCompetitors} currency={settings.currency} />
+            <CompetitorGrowthChart competitors={data.fastGrowthCompetitors} directCompetitorCount={data.directCompetitorCount} currency={settings.currency} />
           </div>
 
           <DailyInsights insights={data.dailyInsights} maxItems={5} />

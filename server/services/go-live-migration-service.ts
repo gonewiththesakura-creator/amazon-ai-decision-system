@@ -6,7 +6,7 @@ import { confirmedDirectCompetitors } from './confirmed-direct-competitor-covera
 import { validMarketHistorySpan } from './real-history-coverage.js';
 import { marketDataMaturity } from './market-data-maturity.js';
 import { hasLimitedMarketEvidence } from './market-data-sufficiency.js';
-import { providerConnectionProof } from './provider-connection-proof.js';
+import { providerConnectionProof, connectionFreshness } from './provider-connection-proof.js';
 import {hasLimitedOwnedEvidence} from './owned-data-sufficiency.js';
 import { ownedRosterState, sellerSpriteRosterScope, type OwnedRosterState } from './owned-roster-declaration.js';
 import { LocalObservationResolver, certifiedMarketCall } from './local-observation-resolver.js';
@@ -30,6 +30,8 @@ export interface GoLivePreview {
 }
 
 export interface GoLiveVerification extends OwnedRosterState {
+  certificationValidity: 'PASS' | 'FAIL';
+  connectionFreshness: ReturnType<typeof connectionFreshness>;
   systemCertification: 'PASS' | 'FAIL';
   marketAnalysisReadiness: 'LIMITED' | 'READY';
   ownedAnalysisReadiness: 'LIMITED' | 'READY' | 'UNVERIFIED';
@@ -321,19 +323,6 @@ export class GoLiveMigrationService {
         AND product.status = 'active' AND product.marketplace = ?
         AND snapshot.source_type = 'mcp' AND ${PRODUCT_METRICS}
     `, false, settings.marketplace);
-    const sellerSpriteCapabilitiesAvailable = this.count(`
-      SELECT CASE WHEN
-        json_extract(capabilities_json, '$.capabilities.MARKET_RESEARCH') IS NOT NULL
-        AND json_extract(capabilities_json, '$.capabilities.MARKET_STATISTICS') IS NOT NULL
-        AND json_extract(capabilities_json, '$.capabilities.PRODUCT_CONCENTRATION') IS NOT NULL
-        AND json_extract(capabilities_json, '$.capabilities.ASIN_SALES_TREND') IS NOT NULL
-        AND json_extract(capabilities_json, '$.capabilities.ASIN_COMPETITOR_DISCOVERY') IS NOT NULL
-        AND julianday(collected_at) BETWEEN julianday('now', '-1 day')
-          AND julianday('now', '+5 minutes')
-        THEN 1 ELSE 0 END AS count
-      FROM provider_capability_snapshots WHERE provider_id = 'sellersprite'
-      ORDER BY collected_at DESC, rowid DESC LIMIT 1
-    `) === 1;
     const sellerSpriteMarketCalls = this.count(`
       SELECT COUNT(*) AS count FROM mcp_call_logs
       WHERE provider_id = 'sellersprite' AND status = 'success'
@@ -385,6 +374,8 @@ export class GoLiveMigrationService {
         requiredEvidenceEntities: activeOwnedProducts + 1, runLinkedCandidateGroups: 0,
       };
     const sellerSpriteCriticalRunId = criticalProof.runId;
+    // A certified run already validates its own capability/schema snapshot; current cache age is unrelated.
+    const sellerSpriteCapabilitiesAvailable = sellerSpriteCriticalRunId !== null;
     const connectionProof = providerConnectionProof(this.database,sellerSpriteCriticalRunId);
     const sellerSpriteConnectionVerified = connectionProof !== null;
     const primaryMarketHistory = validMarketHistorySpan(
@@ -406,6 +397,8 @@ export class GoLiveMigrationService {
       AND ${PRODUCT_METRICS} LIMIT 1`).get(p.id))).length;
     return {
       ...rosterState,
+      certificationValidity: readyForDemoCleanup ? 'PASS' : 'FAIL',
+      connectionFreshness: connectionFreshness(connectionProof),
       systemCertification: readyForDemoCleanup ? 'PASS' : 'FAIL',
       marketAnalysisReadiness: marketDataMaturity(this.database,settings.marketplace,settings.default_market_id).status,
       ownedAnalysisReadiness: !sellerSpriteCriticalRunId ? 'UNVERIFIED'
@@ -506,20 +499,20 @@ export class GoLiveMigrationService {
     let latestEvidenceCount: number | null = null;
 
     const runs = this.database.prepare(`
-      SELECT run.id, run.coverage_json AS coverageJson
+      SELECT run.id, run.coverage_json AS coverageJson, task.started_at AS startedAt, task.completed_at AS completedAt
       FROM data_coverage_runs run
       JOIN data_tasks task ON task.id = run.id AND task.sync_run_id = run.id
       WHERE run.marketplace = ? AND run.run_type = 'critical_sync' AND run.is_complete = 1
         AND task.marketplace = ? AND task.task_type = 'critical_sync' AND task.target = ?
         AND task.source_id = 'source-sellersprite-mcp' AND task.status = 'success'
         AND task.total = ? AND task.success = task.total AND task.failed = 0
-        AND julianday(run.created_at) BETWEEN julianday('now', '-1 day')
-          AND julianday('now', '+5 minutes')
-        AND julianday(task.completed_at) BETWEEN julianday('now', '-1 day')
-          AND julianday('now', '+5 minutes')
+        AND julianday(task.completed_at) >= julianday(task.started_at)
+        AND julianday(task.started_at) >= julianday(task.created_at)
+        AND julianday(run.created_at) BETWEEN julianday(task.started_at) AND julianday(task.completed_at)
+        AND NOT EXISTS (SELECT 1 FROM data_tasks bad WHERE bad.sync_run_id=run.id AND bad.status IN ('failed','partial'))
       ORDER BY run.created_at DESC, run.id DESC
     `).all(marketplace, marketplace, marketId, owned.length + marketNodes.length) as Array<{
-      id: string; coverageJson: string;
+      id: string; coverageJson: string; startedAt: string; completedAt: string;
     }>;
     for (const run of runs) {
       let coverage: Record<string, unknown>;
@@ -580,13 +573,12 @@ export class GoLiveMigrationService {
           AND json_extract(capabilities_json, '$.capabilities.PRODUCT_CONCENTRATION') IS NOT NULL
           AND json_extract(capabilities_json, '$.capabilities.ASIN_SALES_TREND') IS NOT NULL
           AND json_extract(capabilities_json, '$.capabilities.ASIN_COMPETITOR_DISCOVERY') IS NOT NULL
-          AND julianday(collected_at) BETWEEN julianday('now', '-1 day')
-            AND julianday('now', '+5 minutes')
+          AND julianday(collected_at) BETWEEN julianday(?) AND julianday(?)
           THEN 1 ELSE 0 END AS count
         FROM provider_capability_snapshots
         WHERE provider_id = 'sellersprite' AND sync_run_id = ?
         ORDER BY collected_at DESC, rowid DESC LIMIT 1
-      `, false, run.id) === 1;
+      `, false, run.startedAt, run.completedAt, run.id) === 1;
       if (!runCapabilitiesAvailable) continue;
       const capabilityRow = this.database.prepare(`
         SELECT capabilities_json AS capabilitiesJson FROM provider_capability_snapshots
@@ -600,12 +592,11 @@ export class GoLiveMigrationService {
           status, result_count AS resultCount, cache_hit AS cacheHit,
           observation_month AS observationMonth, actual_tool AS actualTool,
           response_metadata_json AS responseMetadataJson,
-          CASE WHEN julianday(started_at) BETWEEN julianday('now', '-1 day')
-            AND julianday('now', '+5 minutes')
-            AND julianday(COALESCE(completed_at, started_at)) BETWEEN julianday('now', '-1 day')
-            AND julianday('now', '+5 minutes') THEN 1 ELSE 0 END AS isFresh
+          CASE WHEN julianday(started_at) >= julianday(?)
+            AND julianday(completed_at) >= julianday(started_at)
+            AND julianday(completed_at) <= julianday(?) THEN 1 ELSE 0 END AS isRunBound
         FROM mcp_call_logs WHERE sync_run_id = ?
-      `).all(run.id) as Array<{
+      `).all(run.startedAt, run.completedAt, run.id) as Array<{
         providerId: string;
         capability: string;
         entityType: string | null;
@@ -616,13 +607,13 @@ export class GoLiveMigrationService {
         observationMonth: string | null;
         actualTool: string | null;
         responseMetadataJson: string;
-        isFresh: number;
+        isRunBound: number;
       }>;
-      if (calls.length === 0 || calls.some((call) => call.cacheHit !== 0 || call.isFresh !== 1)) continue;
+      if (calls.length === 0 || calls.some((call) => call.cacheHit !== 0 || call.isRunBound !== 1)) continue;
       const strictAcquisition = calls.every(call=>call.status==='success')
         && competitorSummary.status==='success' && competitorSummary.failed===0
         && competitorSummary.success===directCompetitorRoster.length;
-      if(acquisitionOnly && !strictAcquisition) continue;
+      if(!strictAcquisition) continue;
       const certifiedMarketCapabilities = [
         'MARKET_RESEARCH', 'MARKET_STATISTICS', 'PRODUCT_CONCENTRATION',
       ];
@@ -898,9 +889,10 @@ export class GoLiveMigrationService {
       SELECT status, total, success, failed FROM data_tasks
       WHERE id = ? AND sync_run_id = ? AND marketplace = ?
         AND source_id = 'source-sellersprite-mcp' AND task_type = ? AND target = ?
-        AND julianday(completed_at) BETWEEN julianday('now', '-1 day')
-          AND julianday('now', '+5 minutes')
-    `).get(value.taskId, runId, marketplace, taskType, target) as {
+        AND julianday(completed_at) >= julianday(started_at)
+        AND julianday(started_at) >= (SELECT julianday(started_at) FROM data_tasks WHERE id = ?)
+        AND julianday(completed_at) <= (SELECT julianday(completed_at) FROM data_tasks WHERE id = ?)
+    `).get(value.taskId, runId, marketplace, taskType, target, runId, runId) as {
       status: string; total: number; success: number; failed: number;
     } | undefined;
     if (!task) return false;

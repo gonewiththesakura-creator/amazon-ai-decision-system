@@ -809,6 +809,7 @@ export interface ExecutiveSkuFocus {
 }
 
 export interface ExecutiveDashboardViewModel {
+  directCompetitorCount?: number;
   generatedAt: string;
   range: TimeRange;
   marketplace: string;
@@ -859,6 +860,8 @@ export interface DataCoverageReport {
 }
 
 export interface AppSettings {
+  latestSuccessfulCritical?: { runId: string; completedAt: string } | null;
+  connectionFreshness?: 'FRESH' | 'STALE' | 'UNKNOWN';
   mode: DataMode;
   role: Role;
   marketplace: string;

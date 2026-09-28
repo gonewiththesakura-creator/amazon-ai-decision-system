@@ -85,6 +85,40 @@ function addChildMarketCriticalFixture(db: AppDatabase): string {
 }
 
 describe('GoLiveMigrationService', () => {
+  it.each([23,25,168])('preserves immutable certification after %s hours, independently of connection age', hours=>{
+    const wallClock=Date.now();
+    // Seed genuinely aged timestamps: SQLite's wall clock is not affected by vi timers.
+    vi.useFakeTimers();vi.setSystemTime(wallClock-hours*3600000);
+    database=openDatabase(':memory:');insertObservationFixture(database,'mcp');
+    addVerifiedMcpCoverage(database,'market-us','owned-product');
+    const initial=new GoLiveMigrationService(database).verify();
+    expect(initial.systemCertification).toBe('PASS');
+    const at=Date.parse(initial.providerConnectionProof!.collectedAt);
+    vi.useFakeTimers();vi.setSystemTime(at+hours*3600000);
+    expect(new GoLiveMigrationService(database).verify()).toMatchObject({systemCertification:'PASS',certificationValidity:'PASS',
+      sellerSpriteCriticalRunId:initial.sellerSpriteCriticalRunId,verifiedEvidenceEntities:initial.verifiedEvidenceEntities,
+      connectionFreshness:hours<=24?'FRESH':'STALE'});
+    const before=database.prepare('SELECT * FROM app_settings').all();
+    expect(new IntelligenceRepository(database).getSettings()).toMatchObject({
+      latestSuccessfulCritical:{runId:initial.sellerSpriteCriticalRunId},connectionFreshness:hours<=24?'FRESH':'STALE'});
+    expect(database.prepare('SELECT * FROM app_settings').all()).toEqual(before);
+  });
+  it.each(['scope','owned','direct','evidence','list','cached','failed','partial','call-time','capability-time'])('rejects %s corruption even after wall-clock age is decoupled',kind=>{
+    database=openDatabase(':memory:');insertObservationFixture(database,'mcp');addVerifiedMcpCoverage(database,'market-us','owned-product');
+    const service=new GoLiveMigrationService(database), run=service.verify().sellerSpriteCriticalRunId!;
+    expect(service.verify().systemCertification).toBe('PASS');
+    if(kind==='scope')database.prepare("UPDATE data_coverage_runs SET coverage_json=json_set(coverage_json,'$.rosterScopeDigest','wrong') WHERE id=?").run(run);
+    if(kind==='owned')database.exec("UPDATE products SET asin='B0DIFFERNT' WHERE id='owned-product'");
+    if(kind==='direct')database.exec("UPDATE competitor_relations SET relation_type='benchmark' WHERE relation_type='direct'");
+    if(kind==='evidence')database.prepare('DELETE FROM evidence_records WHERE sync_run_id=?').run(run);
+    if(kind==='list')database.prepare("DELETE FROM mcp_call_logs WHERE sync_run_id=? AND capability='LIST_TOOLS'").run(run);
+    if(kind==='cached')database.prepare("UPDATE mcp_call_logs SET cache_hit=1 WHERE sync_run_id=? AND capability='LIST_TOOLS'").run(run);
+    if(kind==='failed'||kind==='partial')database.prepare('UPDATE data_tasks SET status=? WHERE id=?').run(kind,run);
+    if(kind==='call-time')database.prepare("UPDATE mcp_call_logs SET completed_at='2000-01-01' WHERE sync_run_id=?").run(run);
+    if(kind==='capability-time')database.prepare("UPDATE provider_capability_snapshots SET collected_at='2000-01-01' WHERE sync_run_id=?").run(run);
+    vi.useFakeTimers();vi.setSystemTime(Date.now()+7*86400000);
+    expect(service.verify().systemCertification).toBe('FAIL');
+  });
   it('does not certify a complete-looking critical run without a declared owned roster', () => {
     database = openDatabase(':memory:');
     insertObservationFixture(database, 'mcp');
@@ -729,7 +763,7 @@ describe('GoLiveMigrationService', () => {
     });
   });
 
-  it('requires the latest SellerSprite capability catalog to be fresh', () => {
+  it('rejects a capability snapshot moved outside its run window', () => {
     database = openDatabase(':memory:');
     insertObservationFixture(database, 'mcp', 'mcp');
     addVerifiedMcpCoverage(database, 'market-us', 'owned-product');
@@ -1054,7 +1088,7 @@ describe('GoLiveMigrationService', () => {
     });
   });
 
-  it('requires the run, completed task, and call ledger to be within 24 hours', () => {
+  it('requires coverage, completed task and call ledger to stay in their run window', () => {
     database = openDatabase(':memory:');
     insertObservationFixture(database, 'mcp', 'mcp');
     addVerifiedMcpCoverage(database, 'market-us', 'owned-product');
@@ -1076,7 +1110,7 @@ describe('GoLiveMigrationService', () => {
       hasMinimumRealCoverage: false,
     });
     database.prepare(`
-      UPDATE data_coverage_runs SET created_at = datetime('now') WHERE id = ?
+      UPDATE data_coverage_runs SET created_at = (SELECT started_at FROM data_tasks WHERE id=data_coverage_runs.id) WHERE id = ?
     `).run(run.id);
     database.prepare(`
       UPDATE data_tasks SET completed_at = datetime('now', '-25 hours') WHERE id = ?
@@ -1089,7 +1123,7 @@ describe('GoLiveMigrationService', () => {
       hasMinimumRealCoverage: false,
     });
     database.prepare(`
-      UPDATE data_tasks SET completed_at = datetime('now') WHERE id = ?
+      UPDATE data_tasks SET completed_at = started_at WHERE id = ?
     `).run(run.id);
     expect(service.verify().sellerSpriteCriticalRunId).toBe(run.id);
     database.prepare(`
@@ -1277,9 +1311,8 @@ describe('GoLiveMigrationService', () => {
     database.prepare(`UPDATE data_coverage_runs SET coverage_json = ? WHERE id = ?`)
       .run(JSON.stringify(coverage), run.id);
     expect(service.verify()).toMatchObject({
-      sellerSpriteCriticalRunId: run.id,
+      sellerSpriteCriticalRunId: null,
       readyForDemoCleanup: false,
-      sellerSpriteConnectionVerified: false,
     });
 
     database.prepare(`

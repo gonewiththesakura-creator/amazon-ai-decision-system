@@ -158,6 +158,7 @@ export class ExecutiveDashboardService {
       ownedSkuPerformance,
       marketDistribution: buildMarketDistribution(market),
       fastGrowthCompetitors: fastGrowth.items,
+      directCompetitorCount: competitorProductIds.length,
       dailyInsights,
       developmentOpportunities,
       researchStatus: buildResearchStatus(developmentOpportunities),

@@ -7,11 +7,12 @@ import type { CompetitorGrowthItem } from './types';
 
 export interface CompetitorGrowthChartProps {
   competitors: CompetitorGrowthItem[];
+  directCompetitorCount?: number;
   currency?: string;
   onSelectCompetitor?: (competitorId: string) => void;
 }
 
-export function CompetitorGrowthChart({ competitors, currency = 'USD', onSelectCompetitor }: CompetitorGrowthChartProps) {
+export function CompetitorGrowthChart({ competitors, directCompetitorCount = competitors.length, currency = 'USD', onSelectCompetitor }: CompetitorGrowthChartProps) {
   const plotted = useMemo(() => competitors
     .filter((item): item is CompetitorGrowthItem & { growth: number } => item.growth !== null && Number.isFinite(item.growth))
     .sort((left, right) => right.growth - left.growth)
@@ -105,7 +106,7 @@ export function CompetitorGrowthChart({ competitors, currency = 'USD', onSelectC
           </table>
         </>
       ) : (
-        <ChartEmptyState title="尚未建立直接竞品组" description="建立竞品关系并积累历史快照后展示增长排行。" />
+        <ChartEmptyState title={directCompetitorCount > 0 ? '已建立直接竞品，暂无可比较增长基线' : '尚未建立直接竞品组'} description="建立竞品关系并积累合法增长基线后展示排行；缺失增长不填0。" />
       )}
     </ChartCard>
   );
