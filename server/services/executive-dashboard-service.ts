@@ -28,6 +28,7 @@ import type { AppDatabase } from '../database/database.js';
 import { IntelligenceRepository } from '../repository/intelligence-repository.js';
 import { WorkflowRepository } from '../repository/workflow-repository.js';
 import { DashboardFreshnessService } from './dashboard-freshness-service.js';
+import { entityMarketMaturity } from './market-data-maturity.js';
 
 export interface RawTrendPoint {
   date: string;
@@ -86,16 +87,16 @@ export class ExecutiveDashboardService {
   private readonly freshness: DashboardFreshnessService;
 
   constructor(
-    database: AppDatabase,
+    private readonly database: AppDatabase,
     private readonly intelligence: IntelligenceRepository,
     private readonly workflow: WorkflowRepository,
   ) {
     this.freshness = new DashboardFreshnessService(database);
   }
 
-  getDashboard(range: TimeRange, skuId?: string): ExecutiveDashboardViewModel {
+  getDashboard(range: TimeRange, skuId?: string, comparisonSkuIds?: string[]): ExecutiveDashboardViewModel {
     const settings = this.intelligence.getSettings();
-    const owned = this.intelligence.getOwnedProducts();
+    const owned = this.activeOwnedProducts(settings.marketplace);
     const market = settings.defaultMarketId
       ? this.intelligence.getMarket(settings.defaultMarketId)
       : null;
@@ -103,12 +104,15 @@ export class ExecutiveDashboardService {
       product.id,
       this.intelligence.getCurrentWorkflowInsightForEntity('owned_product', product.id),
     ]));
-    const rawTrend = this.generalTrendSeries(market, owned);
-    const trendComparison = buildIndexedSeries(rawTrend, range, 'overview');
     const marketGrowth = market?.node.growth30dAvailable
       ? market.node.growth30d
       : null;
     const ownedSkuPerformance = this.ownedPerformance(owned, formalOwnedInsights);
+    const overviewOwned = selectOverviewProducts(owned, ownedSkuPerformance, skuId, comparisonSkuIds);
+    const limitedLongRange = RANGE_DAYS[range] >= 90 && market
+      && entityMarketMaturity(this.database,'market',market.node.id)?.status === 'LIMITED';
+    const rawTrend = this.generalTrendSeries(limitedLongRange ? null : market, overviewOwned);
+    const trendComparison = buildIndexedSeries(rawTrend, range, 'overview');
     const fastGrowth = this.fastGrowthCompetitors(owned, settings.marketplace);
     const developmentOpportunities = this.developmentOpportunities(
       this.intelligence.getDevelopmentProjects(),
@@ -150,15 +154,25 @@ export class ExecutiveDashboardService {
       },
       trendComparison: trendComparison.series,
       trendComparisonMeta: comparisonMeta(trendComparison),
+      comparisonSkuIds: overviewOwned.map((product) => product.id),
       ownedSkuPerformance,
       marketDistribution: buildMarketDistribution(market),
       fastGrowthCompetitors: fastGrowth.items,
+      directCompetitorCount: competitorProductIds.length,
       dailyInsights,
       developmentOpportunities,
       researchStatus: buildResearchStatus(developmentOpportunities),
       ...freshness,
       skuFocus: skuId ? this.skuFocus(skuId, range) : null,
     };
+  }
+
+  private activeOwnedProducts(marketplace: string): OwnedProductSummary[] {
+    const activeIds = new Set((this.database.prepare(`
+      SELECT id FROM products
+      WHERE marketplace = ? AND is_owned = 1 AND status = 'active' AND is_parent = 0
+    `).all(marketplace) as unknown as Array<{ id: string }>).map((row) => row.id));
+    return this.intelligence.getOwnedProducts().filter((product) => activeIds.has(product.id));
   }
 
   private generalTrendSeries(
@@ -329,7 +343,8 @@ export class ExecutiveDashboardService {
         points: product.snapshots.map(snapshotSalesPoint),
       },
     ];
-    if (market) {
+    if (market && !(RANGE_DAYS[range] >= 90
+      && entityMarketMaturity(this.database,'market',market.node.id)?.status === 'LIMITED')) {
       rawSeries.push({
         id: `market:${market.node.id}`,
         label: market.node.name,
@@ -364,6 +379,9 @@ export class ExecutiveDashboardService {
       trendComparison: trendComparison.series,
       trendComparisonMeta: comparisonMeta(trendComparison),
       operatingMetrics: {
+        periodState: product.latest.periodState,
+        periodMonth: product.latest.periodMonth,
+        collectedAt: product.latest.provenance.collectedAt,
         estimatedSales: product.latest.estimatedSales,
         estimatedRevenue: product.latest.estimatedRevenue,
         price: product.latest.price,
@@ -418,6 +436,64 @@ interface PreparedTrendSeries extends RawTrendSeries {
   baselineDates: string[];
 }
 
+export function selectOverviewProducts(
+  owned: OwnedProductSummary[],
+  performance: ExecutiveSkuPerformance[],
+  focusSkuId?: string,
+  comparisonSkuIds?: string[],
+): OwnedProductSummary[] {
+  if (owned.length <= 5) return owned;
+  const byId = new Map(owned.map((product) => [product.id, product]));
+  if (comparisonSkuIds?.length) {
+    return comparisonSkuIds
+      .map((id) => byId.get(id))
+      .filter((product): product is OwnedProductSummary => Boolean(product))
+      .slice(0, 5);
+  }
+  const performanceById = new Map(performance.map((item) => [item.id, item]));
+  const selected: OwnedProductSummary[] = [];
+  const selectedIds = new Set<string>();
+  const add = (id: string | undefined) => {
+    if (!id || selectedIds.has(id) || selected.length >= 5) return;
+    const product = byId.get(id);
+    if (!product) return;
+    selected.push(product);
+    selectedIds.add(id);
+  };
+
+  add(focusSkuId);
+  performance
+    .filter((item) => item.attention)
+    .sort((left, right) => (
+      compareNullableAscending(left.relativeDelta, right.relativeDelta)
+      || left.id.localeCompare(right.id)
+    ))
+    .forEach((item) => add(item.id));
+
+  const comparable = owned
+    .filter((product) => !selectedIds.has(product.id)
+      && typeof performanceById.get(product.id)?.relativeDelta === 'number')
+    .sort((left, right) => {
+      const leftDelta = performanceById.get(left.id)?.relativeDelta ?? 0;
+      const rightDelta = performanceById.get(right.id)?.relativeDelta ?? 0;
+      return rightDelta - leftDelta || left.id.localeCompare(right.id);
+    });
+  const weakest = comparable.slice().sort((left, right) => {
+    const leftDelta = performanceById.get(left.id)?.relativeDelta ?? 0;
+    const rightDelta = performanceById.get(right.id)?.relativeDelta ?? 0;
+    return leftDelta - rightDelta || left.id.localeCompare(right.id);
+  });
+  for (let index = 0; selected.length < 5 && index < comparable.length; index += 1) {
+    add(comparable[index]?.id);
+    add(weakest[index]?.id);
+  }
+  owned
+    .slice()
+    .sort((left, right) => left.id.localeCompare(right.id))
+    .forEach((product) => add(product.id));
+  return selected;
+}
+
 export function buildIndexedSeries(
   series: RawTrendSeries[],
   range: TimeRange,
@@ -456,7 +532,7 @@ export function buildIndexedSeries(
     commonBaselineDate ??= firstCommonBaseline(participants);
   } else {
     const owned = eligible.filter((item) => item.kind === 'owned_sku');
-    if (owned.length < 2) return emptyTrendComparisonFromPrepared(prepared);
+    if (owned.length < 1) return emptyTrendComparisonFromPrepared(prepared);
     commonBaselineDate = firstCommonBaseline(eligible);
     participants = commonBaselineDate ? eligible : [];
     if (!commonBaselineDate) {
@@ -961,6 +1037,13 @@ function compareNullableDescending(left: number | null, right: number | null): n
   if (left === null) return 1;
   if (right === null) return -1;
   return right - left;
+}
+
+function compareNullableAscending(left: number | null, right: number | null): number {
+  if (left === null && right === null) return 0;
+  if (left === null) return 1;
+  if (right === null) return -1;
+  return left - right;
 }
 
 function newestTrendTime(points: RawTrendPoint[]): number | null {

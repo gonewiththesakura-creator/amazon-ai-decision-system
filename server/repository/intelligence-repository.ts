@@ -1,3 +1,4 @@
+import {providerConnectionProof, connectionFreshness} from '../services/provider-connection-proof.js';
 import type {
   AppSettings,
   Competitor,
@@ -8,6 +9,7 @@ import type {
   Insight,
   MarketDetail,
   MarketNode,
+  MetricProvenance,
   Opportunity,
   OwnedProductDetail,
   OwnedProductSummary,
@@ -20,7 +22,10 @@ import type {
 } from '../../shared/types.js';
 import { calculateRelativePerformance, detectProductAnomalies, percentileRank } from '../domain/calculations.js';
 import type { AppDatabase } from '../database/database.js';
-import { deriveSnapshotGrowth, type SnapshotGrowthPair } from '../domain/snapshot-growth.js';
+import { deriveSnapshotGrowth, monthlyPeriodState, type SnapshotGrowthPair } from '../domain/snapshot-growth.js';
+import { MetricAuthorityResolver, type MetricFact } from '../services/metric-authority-resolver.js';
+import { isLiveObservationReadable } from '../services/live-observation-readability.js';
+import { entityMarketMaturity } from '../services/market-data-maturity.js';
 
 type DbPrimitive = string | number | bigint | null;
 type DbRow = Record<string, DbPrimitive>;
@@ -75,12 +80,33 @@ const PRODUCT_SELECT = `
   )
 `;
 
+const MARKET_METRICS = [
+  'monthly_sales', 'monthly_revenue', 'product_count', 'seller_count', 'brand_count',
+  'avg_price', 'median_price', 'avg_rating', 'median_reviews', 'top10_share',
+  'top20_share', 'new_product_share',
+] as const;
+const PRODUCT_METRICS = [
+  'price', 'rating', 'review_count', 'bsr', 'estimated_sales', 'estimated_revenue',
+  'seller_count', 'growth_7d', 'growth_30d', 'growth_90d',
+] as const;
+
 export class IntelligenceRepository {
+  private readonly metricLineage = new WeakMap<DbRow, Record<string, MetricProvenance>>();
+
   constructor(readonly database: AppDatabase) {}
 
   getSettings(): AppSettings {
     const row = this.database.prepare('SELECT * FROM app_settings WHERE id = 1').get() as DbRow;
+    const critical = this.database.prepare(`SELECT t.id, t.completed_at FROM data_tasks t
+      JOIN data_coverage_runs c ON c.id=t.id AND c.is_complete=1
+      WHERE t.task_type='critical_sync' AND t.sync_run_id=t.id AND t.status='success'
+        AND t.source_id='source-sellersprite-mcp' AND t.marketplace=? AND t.failed=0
+        AND NOT EXISTS(SELECT 1 FROM data_tasks bad WHERE bad.sync_run_id=t.id AND bad.status IN ('failed','partial'))
+      ORDER BY t.completed_at DESC LIMIT 1`).get(stringValue(row.marketplace,'US'));
+    const proof = providerConnectionProof(this.database, critical ? String(critical.id) : null);
     return {
+      latestSuccessfulCritical: critical ? {runId:String(critical.id),completedAt:String(critical.completed_at)} : null,
+      connectionFreshness: connectionFreshness(proof),
       mode: stringValue(row.mode, 'empty') as AppSettings['mode'],
       role: stringValue(row.role, 'admin') as AppSettings['role'],
       marketplace: stringValue(row.marketplace, 'US'),
@@ -165,11 +191,17 @@ export class IntelligenceRepository {
       concentration: latest ? jsonValue(latest.concentration_json, []) : [],
       insight,
       provenance,
+      metricProvenance: latest ? this.metricLineage.get(latest) : undefined,
     };
   }
 
   getMarketSnapshots(id: string): TrendPoint[] {
     return this.getMarketSnapshotRows(id).map((row) => this.mapTrend(row));
+  }
+
+  getSelectedMarketSnapshotId(id: string): string | null {
+    const latest = this.getMarketSnapshotRows(id).at(-1);
+    return latest ? stringValue(latest.id) : null;
   }
 
   getMarketProducts(id: string): Product[] {
@@ -180,22 +212,38 @@ export class IntelligenceRepository {
         SELECT child.id FROM market_nodes child JOIN descendants parent ON child.parent_id = parent.id
       )
       ${PRODUCT_SELECT}
-      WHERE p.market_node_id IN (SELECT id FROM descendants)
-      ORDER BY ps.estimated_sales DESC
+      WHERE p.market_node_id IN (SELECT id FROM descendants) AND p.status = 'active'
+        AND p.is_parent = 0
+      ORDER BY p.id
     `).all(id) as DbRow[];
-    return rows.map((row) => this.mapProduct(row));
+    return rows.map((row) => this.mapProduct(row)).sort((left, right) => (
+      (right.latest.estimatedSales ?? Number.NEGATIVE_INFINITY)
+        - (left.latest.estimatedSales ?? Number.NEGATIVE_INFINITY)
+      || left.id.localeCompare(right.id)
+    ));
   }
 
   getOwnedProducts(): OwnedProductSummary[] {
+    return this.getOwnedProductSummaries(false);
+  }
+
+  getSellableOwnedProducts(): OwnedProductSummary[] {
+    return this.getOwnedProductSummaries(true);
+  }
+
+  private getOwnedProductSummaries(sellableOnly: boolean): OwnedProductSummary[] {
     const rows = this.database.prepare(`
-      ${PRODUCT_SELECT} WHERE p.is_owned = 1 AND p.marketplace = ? ORDER BY p.created_at, p.id
-    `).all(this.getSettings().marketplace) as DbRow[];
+      ${PRODUCT_SELECT}
+      WHERE p.is_owned = 1 AND p.status = 'active' AND p.marketplace = ?
+        AND (? = 0 OR p.is_parent = 0)
+      ORDER BY p.created_at, p.id
+    `).all(this.getSettings().marketplace, sellableOnly ? 1 : 0) as DbRow[];
     return rows.map((row) => this.mapOwnedSummary(row));
   }
 
   getOwnedProduct(id: string): OwnedProductDetail | null {
     const row = this.database.prepare(`
-      ${PRODUCT_SELECT} WHERE p.id = ? AND p.is_owned = 1 AND p.marketplace = ?
+      ${PRODUCT_SELECT} WHERE p.id = ? AND p.is_owned = 1 AND p.status = 'active' AND p.marketplace = ?
     `).get(id, this.getSettings().marketplace) as DbRow | undefined;
     if (!row) return null;
     const summary = this.mapOwnedSummary(row);
@@ -246,14 +294,28 @@ export class IntelligenceRepository {
   }
 
   getProductSnapshots(productId: string): ProductSnapshot[] {
+    const live = this.getSettings().mode === 'live';
     const rows = this.database.prepare(`
-      SELECT * FROM product_snapshots WHERE product_id = ? ORDER BY date, collected_at
+      SELECT * FROM product_snapshots WHERE product_id = ?
+      ORDER BY observation_date, collected_at, id
     `).all(productId) as DbRow[];
-    return rows.map((row, index) => {
-      const growth = deriveSnapshotGrowth(rows.slice(0, index + 1).map((snapshot) => ({
+    const readableRows = live ? rows.filter((row) => isLiveObservationReadable(
+      this.database, 'product', stringValue(row.id), stringValue(row.source_type),
+      row.sync_run_id === null ? null : stringValue(row.sync_run_id),
+    )) : rows;
+    const product = this.database.prepare('SELECT is_owned FROM products WHERE id = ?')
+      .get(productId) as DbRow | undefined;
+    const entityType = product && !booleanValue(product.is_owned) ? 'competitor' : 'product';
+    const selectedRows = this.authoritativeSnapshotRows(
+      readableRows, entityType, productId, PRODUCT_METRICS, 'estimated_sales',
+    );
+    return selectedRows.map((row, index) => {
+      const growth = deriveSnapshotGrowth(selectedRows.slice(0, index + 1).map((snapshot) => ({
         id: stringValue(snapshot.id),
         date: stringValue(snapshot.date),
         value: nullableNumberValue(snapshot.estimated_sales),
+        periodState: /^(monthly|1M|closed_month|current_mtd)$/.test(stringValue(snapshot.period))
+          ? monthlyPeriodState(stringValue(snapshot.date), stringValue(snapshot.collected_at)) : undefined,
       })));
       return this.mapProductSnapshot(row, growth?.latest.id === stringValue(row.id) ? growth : null);
     });
@@ -314,6 +376,7 @@ export class IntelligenceRepository {
         WHERE latest.marketplace = ? AND latest.entity_id = ?
           AND latest.entity_type IN (${entityPlaceholders})
           AND latest.job_type IN (${jobPlaceholders})
+          AND (? = 0 OR latest.is_demo = 0)
         ORDER BY latest.updated_at DESC, latest.created_at DESC, latest.id DESC
         LIMIT 1
       )
@@ -341,6 +404,7 @@ export class IntelligenceRepository {
       entityId,
       ...mapping.entityTypes,
       ...mapping.jobTypes,
+      this.getSettings().mode === 'live' ? 1 : 0,
     ) as DbRow[];
 
     for (const row of rows) {
@@ -481,10 +545,7 @@ export class IntelligenceRepository {
   }
 
   private getMarketGrowthPair(id: string): SnapshotGrowthPair | null {
-    const rows = this.database.prepare(`
-      SELECT id, date, monthly_sales FROM market_snapshots
-      WHERE market_node_id = ? ORDER BY date DESC, collected_at DESC
-    `).all(id) as DbRow[];
+    const rows = this.getMarketSnapshotRows(id);
     return deriveSnapshotGrowth(rows.map((row) => ({
       id: stringValue(row.id),
       date: stringValue(row.date),
@@ -493,10 +554,7 @@ export class IntelligenceRepository {
   }
 
   private mapMarketNode(row: DbRow): MarketNode {
-    const latest = this.database.prepare(`
-      SELECT * FROM market_snapshots WHERE market_node_id = ?
-      ORDER BY date DESC, collected_at DESC LIMIT 1
-    `).get(stringValue(row.id)) as DbRow | undefined;
+    const latest = this.getMarketSnapshotRows(stringValue(row.id)).at(-1);
     return {
       id: stringValue(row.id),
       name: stringValue(row.name),
@@ -504,6 +562,9 @@ export class IntelligenceRepository {
       level: numberValue(row.level),
       marketplace: stringValue(row.marketplace),
       categoryId: row.category_id === null ? undefined : stringValue(row.category_id),
+      sellerSpriteNodePath: row.sellersprite_confirmed_node_path === null
+        ? undefined
+        : stringValue(row.sellersprite_confirmed_node_path),
       keywords: jsonValue(row.keywords_json, []),
       status: stringValue(row.status),
       snapshotAvailable: Boolean(latest),
@@ -519,9 +580,87 @@ export class IntelligenceRepository {
   }
 
   private getMarketSnapshotRows(id: string): DbRow[] {
-    return this.database.prepare(`
-      SELECT * FROM market_snapshots WHERE market_node_id = ? ORDER BY date, collected_at
+    const live = this.getSettings().mode === 'live';
+    const rows = this.database.prepare(`
+      SELECT * FROM market_snapshots WHERE market_node_id = ?
+      ORDER BY observation_date, collected_at, id
     `).all(id) as DbRow[];
+    const readableRows = live ? rows.filter((row) => isLiveObservationReadable(
+      this.database, 'market', stringValue(row.id), stringValue(row.source_type),
+      row.sync_run_id === null ? null : stringValue(row.sync_run_id),
+    )) : rows;
+    return this.authoritativeSnapshotRows(readableRows, 'market', id, MARKET_METRICS, 'monthly_sales');
+  }
+
+  private authoritativeSnapshotRows(
+    rows: DbRow[], entityType: 'market' | 'product' | 'competitor', entityId: string,
+    metrics: readonly string[], primaryMetric: string,
+  ): DbRow[] {
+    const byDate = new Map<string, DbRow[]>();
+    for (const row of rows) {
+      const date = stringValue(row.observation_date, stringValue(row.date));
+      const candidates = byDate.get(date) ?? [];
+      candidates.push(row);
+      byDate.set(date, candidates);
+    }
+    const authority = new MetricAuthorityResolver(this.database);
+    const live = this.getSettings().mode === 'live';
+    return [...byDate.entries()].map(([date, candidates]) => {
+      const resolve = (metric: string): MetricFact | null => {
+        const resolution = authority.resolveMetric({
+          entityType, entityId, metric, observationDate: date,
+        });
+        const selected = [resolution.selected, ...resolution.alternatives]
+          .find((fact) => fact && (!live || fact.sourceType !== 'mock')) ?? null;
+        if (entityType !== 'competitor'
+          || (selected?.sourceRecordType === 'metric_fact' && selected.sourceType === 'mcp'
+            && selected.sourceId === 'source-sellersprite-mcp')) return selected;
+
+        // Pre-fix competitor syncs saved facts under 'product'. Keep those immutable
+        // records usable until a canonical competitor fact exists for this metric.
+        const historical = authority.resolveMetric({
+          entityType: 'product', entityId, metric, observationDate: date,
+        });
+        return [historical.selected, ...historical.alternatives].find((fact) => (
+          fact?.sourceRecordType === 'metric_fact' && fact.sourceType === 'mcp'
+            && fact.sourceId === 'source-sellersprite-mcp'
+        )) ?? selected;
+      };
+      const primary = resolve(primaryMetric);
+      const representative = candidates.find((row) => row.id === primary?.id)
+        ?? candidates.find((row) => (
+          row.source_type === primary?.sourceType && row.source === primary.source
+        ))
+        ?? candidates.at(-1)!;
+      const selected: DbRow = { ...representative, date, observation_date: date };
+      const lineage: Record<string, MetricProvenance> = {};
+      for (const metric of metrics) {
+        const fact = resolve(metric);
+        selected[metric] = fact?.value ?? null;
+        if (fact) lineage[metric] = {
+          sourceRecordId: fact.id,
+          sourceRecordType: fact.sourceRecordType,
+          source: fact.source,
+          sourceType: fact.sourceType as Provenance['sourceType'],
+          collectedAt: fact.collectedAt,
+          period: fact.period ?? '',
+          isEstimated: fact.isEstimated,
+          confidence: fact.confidence,
+        };
+      }
+      this.metricLineage.set(selected, lineage);
+      if (primary) this.applyFactProvenance(selected, primary);
+      return selected;
+    });
+  }
+
+  private applyFactProvenance(row: DbRow, fact: MetricFact): void {
+    row.source = fact.source;
+    row.source_type = fact.sourceType;
+    row.collected_at = fact.collectedAt;
+    row.is_estimated = fact.isEstimated ? 1 : 0;
+    row.confidence = fact.confidence;
+    if (fact.period) row.period = fact.period;
   }
 
   private mapTrend(row: DbRow): TrendPoint {
@@ -552,8 +691,11 @@ export class IntelligenceRepository {
 
   private mapProduct(row: DbRow): Product {
     const productId = stringValue(row.id);
-    const latest = this.mapJoinedSnapshot(row, productId);
-    const growth = this.getProductGrowth(productId);
+    const snapshots = this.getProductSnapshots(productId);
+    const latest = snapshots.at(-1)
+      ?? (this.getSettings().mode === 'live'
+        ? this.emptyProductSnapshot(productId)
+        : this.mapJoinedSnapshot(row, productId));
     return {
       id: productId,
       asin: stringValue(row.asin),
@@ -569,11 +711,7 @@ export class IntelligenceRepository {
       marketPath: this.getMarketPath(stringValue(row.market_node_id)),
       keywords: jsonValue(row.keywords_json, []),
       monitoringEnabled: booleanValue(row.monitoring_enabled),
-      latest: {
-        ...latest,
-        growth30d: growth?.growth ?? null,
-        growth30dAvailable: growth !== null,
-      },
+      latest,
     };
   }
 
@@ -614,7 +752,8 @@ export class IntelligenceRepository {
   }
 
   private mapJoinedSnapshot(row: DbRow, productId: string): ProductSnapshot {
-    if (row.snapshot_id === null || row.snapshot_id === undefined) {
+    if (row.snapshot_id === null || row.snapshot_id === undefined
+      || (this.getSettings().mode === 'live' && row.snapshot_source_type === 'mock')) {
       const provenance: Provenance = {
         source: '尚未导入数据', sourceType: 'import', collectedAt: '', period: '30D',
         isEstimated: true, confidence: 0,
@@ -636,6 +775,9 @@ export class IntelligenceRepository {
       reviewCount: nullableNumberValue(row.snapshot_review_count),
       bsr: nullableNumberValue(row.snapshot_bsr),
       estimatedSales: nullableNumberValue(row.snapshot_estimated_sales),
+      periodState: /^(monthly|1M|closed_month|current_mtd)$/.test(stringValue(row.snapshot_period))
+        ? monthlyPeriodState(stringValue(row.snapshot_date),stringValue(row.snapshot_collected_at)) : undefined,
+      periodMonth: stringValue(row.snapshot_date).slice(0,7).replace('-',''),
       estimatedRevenue: nullableNumberValue(row.snapshot_estimated_revenue),
       sellerCount: nullableNumberValue(row.snapshot_seller_count),
       growth7d: nullableNumberValue(row.snapshot_growth_7d),
@@ -653,12 +795,28 @@ export class IntelligenceRepository {
     };
   }
 
+  private emptyProductSnapshot(productId: string): ProductSnapshot {
+    const provenance: Provenance = {
+      source: '尚未导入数据', sourceType: 'import', collectedAt: '', period: '30D',
+      isEstimated: true, confidence: 0,
+    };
+    return {
+      id: '', snapshotAvailable: false, productId, date: '', price: null, rating: null,
+      reviewCount: null, bsr: null, estimatedSales: null, estimatedRevenue: null,
+      sellerCount: null, growth7d: null, growth30d: null, growth30dAvailable: false,
+      growth90d: null, provenance,
+    };
+  }
+
   private mapProductSnapshot(row: DbRow, growth: SnapshotGrowthPair | null = null): ProductSnapshot {
     return {
       id: stringValue(row.id),
       snapshotAvailable: true,
       productId: stringValue(row.product_id),
       date: stringValue(row.date),
+      periodState: /^(monthly|1M|closed_month|current_mtd)$/.test(stringValue(row.period))
+        ? monthlyPeriodState(stringValue(row.date),stringValue(row.collected_at)) : undefined,
+      periodMonth: stringValue(row.date).slice(0,7).replace('-',''),
       price: nullableNumberValue(row.price),
       rating: nullableNumberValue(row.rating),
       reviewCount: nullableNumberValue(row.review_count),
@@ -671,19 +829,8 @@ export class IntelligenceRepository {
       growth30dAvailable: growth !== null,
       growth90d: nullableNumberValue(row.growth_90d),
       provenance: this.provenanceFromRow(row),
+      metricProvenance: this.metricLineage.get(row),
     };
-  }
-
-  private getProductGrowth(productId: string): SnapshotGrowthPair | null {
-    const rows = this.database.prepare(`
-      SELECT id, date, estimated_sales FROM product_snapshots
-      WHERE product_id = ? ORDER BY date DESC, collected_at DESC
-    `).all(productId) as DbRow[];
-    return deriveSnapshotGrowth(rows.map((row) => ({
-      id: stringValue(row.id),
-      date: stringValue(row.date),
-      value: nullableNumberValue(row.estimated_sales),
-    })));
   }
 
   private provenanceFromRow(row: DbRow): Provenance {
@@ -699,6 +846,7 @@ export class IntelligenceRepository {
 
   private mapInsight(row: DbRow): Insight {
     return {
+      marketDataMaturity: entityMarketMaturity(this.database,stringValue(row.entity_type),stringValue(row.entity_id)),
       id: stringValue(row.id),
       entityType: stringValue(row.entity_type),
       entityId: stringValue(row.entity_id),
@@ -734,6 +882,7 @@ export class IntelligenceRepository {
 
   private emptyInsight(entityType: string, entityId: string, status: string): Insight {
     return {
+      marketDataMaturity: entityMarketMaturity(this.database,entityType,entityId),
       id: '', entityType, entityId, insightType: 'insufficient_data', status,
       title: '当前数据不足', summary: '当前数据不足，结论置信度低，建议先导入市场与产品快照。',
       facts: [], opportunities: [], risks: ['缺少可用历史快照'], recommendedActions: ['导入 CSV/XLSX 或连接数据源'],
@@ -860,11 +1009,16 @@ export class IntelligenceRepository {
     if (!insight.researchJobId || evidenceIds.length === 0 || insight.evidence.length === 0) {
       return false;
     }
+    const live = this.getSettings().mode === 'live';
+    if (live && insight.evidence.some((item) => (
+      item.provenance.some((source) => source.sourceType === 'mock')
+    ))) return false;
     const placeholders = evidenceIds.map(() => '?').join(',');
     const rows = this.database.prepare(`
       SELECT id FROM evidence_records
       WHERE research_job_id = ? AND data_version = ? AND id IN (${placeholders})
-    `).all(insight.researchJobId, insight.dataVersion, ...evidenceIds) as DbRow[];
+        AND (? = 0 OR source_type <> 'mock')
+    `).all(insight.researchJobId, insight.dataVersion, ...evidenceIds, live ? 1 : 0) as DbRow[];
     return rows.length === evidenceIds.length;
   }
 
@@ -920,6 +1074,8 @@ export class IntelligenceRepository {
   private mapDataTask(row: DbRow): DataTask {
     return {
       id: stringValue(row.id),
+      syncRunId: row.sync_run_id === null || row.sync_run_id === undefined
+        ? null : stringValue(row.sync_run_id),
       name: stringValue(row.name),
       taskType: stringValue(row.task_type),
       target: stringValue(row.target),

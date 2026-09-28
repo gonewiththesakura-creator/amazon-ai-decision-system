@@ -5,6 +5,7 @@ import { transaction } from './database.js';
 
 const DEMO_NOW = '2026-09-09T10:20:00+08:00';
 const DEMO_SOURCE = '演示数据 / Mock Adapter';
+const DEMO_SEED_ID = 'v2-demo-seed';
 
 const marketNodes = [
   ['mkt-pillow', 'Pillow', null, 1, ['pillow'], '已监控', 69, 70],
@@ -268,6 +269,7 @@ const scoreBreakdowns: Record<string, ScoreBreakdown> = {
 
 export function clearBusinessData(database: AppDatabase): void {
   const tables = [
+    'demo_seed_records',
     'import_batches', 'decisions', 'research_jobs', 'development_projects', 'watchlist_items', 'research_results',
     'opportunities', 'competitor_relations', 'product_snapshots', 'products', 'market_snapshots',
     'ai_insights', 'data_tasks', 'market_nodes',
@@ -276,9 +278,23 @@ export function clearBusinessData(database: AppDatabase): void {
 }
 
 export function disableDemoMode(database: AppDatabase): void {
-  const settings = database.prepare('SELECT mode FROM app_settings WHERE id = 1').get() as { mode: string } | undefined;
-  if (settings?.mode !== 'demo') return;
-  resetWorkspaceData(database);
+  transaction(database, () => {
+    const settings = database.prepare('SELECT mode FROM app_settings WHERE id = 1').get() as { mode: string } | undefined;
+    if (settings?.mode !== 'demo') return;
+    const pending = database.prepare(`
+      SELECT EXISTS(
+        SELECT 1 FROM demo_seed_records WHERE seed_id = ?
+        UNION ALL SELECT 1 FROM market_snapshots WHERE source_type = 'mock'
+        UNION ALL SELECT 1 FROM product_snapshots WHERE source_type = 'mock'
+      ) AS found
+    `).get(DEMO_SEED_ID) as { found: number };
+    if (pending.found === 1) {
+      throw new Error('请先完成 Go Live 迁移中的备份与 Demo 清理，不能直接关闭 Demo 模式。');
+    }
+    database.prepare(`
+      UPDATE app_settings SET mode = 'empty', last_successful_sync = NULL WHERE id = 1
+    `).run();
+  });
 }
 
 export function resetWorkspaceData(database: AppDatabase): void {
@@ -292,18 +308,37 @@ export function resetWorkspaceData(database: AppDatabase): void {
   });
 }
 
+function hasNonDemoBusinessData(database: AppDatabase): boolean {
+  return businessTables.some((table) => {
+    const row = database.prepare(`
+      SELECT EXISTS(
+        SELECT 1 FROM ${table} item
+        WHERE NOT EXISTS (
+          SELECT 1 FROM demo_seed_records seed
+          WHERE seed.seed_id = ? AND seed.table_name = ? AND seed.record_id = item.id
+        )
+      ) AS found
+    `).get(DEMO_SEED_ID, table) as { found: number };
+    return row.found === 1;
+  });
+}
+
 export function seedDemoData(database: AppDatabase): void {
-  const settings = database.prepare('SELECT mode FROM app_settings WHERE id = 1').get() as { mode: string } | undefined;
-  if (settings?.mode !== 'demo' && hasBusinessData(database)) {
-    throw new Error('当前已有真实或导入数据，不能进入 Demo 模式。请保留现有数据并使用真实模式。');
-  }
   transaction(database, () => {
-    clearBusinessData(database);
+    const settings = database.prepare('SELECT mode FROM app_settings WHERE id = 1').get() as { mode: string } | undefined;
+    const seeded = database.prepare(`
+      SELECT EXISTS(SELECT 1 FROM demo_seed_records WHERE seed_id = ? LIMIT 1) AS found
+    `).get(DEMO_SEED_ID) as { found: number };
+    if (settings?.mode === 'demo' && seeded.found === 1) return;
+    if (settings?.mode === 'demo' ? hasNonDemoBusinessData(database) : hasBusinessData(database)) {
+      throw new Error('当前已有真实或导入数据，不能进入 Demo 模式。请保留现有数据并使用真实模式。');
+    }
     insertMarkets(database);
     insertProducts(database);
     insertRelations(database);
     insertInsights(database);
     insertGrowthData(database);
+    registerDemoSeedRecords(database);
     database.prepare(`
       UPDATE app_settings
       SET mode = 'demo', marketplace = 'US', currency = 'USD', default_market_id = 'mkt-memory-foam',
@@ -314,12 +349,44 @@ export function seedDemoData(database: AppDatabase): void {
   });
 }
 
-function hasBusinessData(database: AppDatabase): boolean {
-  const tables = [
-    'market_nodes', 'products', 'development_projects', 'opportunities', 'decisions',
-    'watchlist_items', 'research_jobs',
+function registerDemoSeedRecords(database: AppDatabase): void {
+  const registered: Array<[string, string[]]> = [
+    ['market_nodes', marketNodes.map(([id]) => id)],
+    ['products', demoProducts.map((product) => product.id)],
+    ['market_snapshots', [
+      ...mainMarketSnapshots.map(([date]) => `ms-mfm-${date}`),
+      ...childMarketCurrent.flatMap(([id]) => [`ms-${id}-prev`, `ms-${id}-current`]),
+    ]],
+    ['product_snapshots', demoProducts.flatMap((product) =>
+      product.snapshots.map((_, index) => `ps-${product.id}-${index + 1}`))],
+    ['competitor_relations', Array.from({ length: 12 }, (_, index) => `relation-${index + 1}`)],
+    ['ai_insights', demoInsights.map((item) => item.id)],
+    ['development_projects', ['dev-lumbar', 'dev-travel', 'dev-seat']],
+    ['opportunities', ['opp-school-kit', 'opp-travel-desk', 'opp-cooling-lumbar']],
+    ['research_results', ['research-demo-school']],
+    ['watchlist_items', ['watch-market', 'watch-sku03', 'watch-comp04', 'watch-lumbar']],
+    ['data_tasks', ['task-demo-1', 'task-demo-2', 'task-demo-3']],
   ];
-  return tables.some((table) => {
+  const insert = database.prepare(`
+    INSERT INTO demo_seed_records (seed_id, table_name, record_id, created_at) VALUES (?, ?, ?, ?)
+  `);
+  for (const [tableName, ids] of registered) {
+    for (const id of ids) insert.run(DEMO_SEED_ID, tableName, id, DEMO_NOW);
+  }
+}
+
+const businessTables = [
+  'market_nodes', 'market_snapshots', 'products', 'product_snapshots',
+  'competitor_relations', 'ai_insights', 'development_projects', 'decisions',
+  'opportunities', 'research_results', 'watchlist_items', 'data_tasks', 'import_batches',
+  'research_jobs', 'research_steps', 'normalized_records', 'keywords',
+  'keyword_snapshots', 'reviews', 'review_insights', 'missing_data_items',
+  'evidence_records', 'rule_executions', 'score_results', 'reverse_reviews',
+  'approvals', 'variation_families', 'competitor_candidates', 'metric_facts',
+] as const;
+
+function hasBusinessData(database: AppDatabase): boolean {
+  return businessTables.some((table) => {
     const row = database.prepare(`SELECT EXISTS(SELECT 1 FROM ${table} LIMIT 1) AS found`).get() as { found: number };
     return row.found === 1;
   });
@@ -341,8 +408,8 @@ function insertMarkets(database: AppDatabase): void {
       id, market_node_id, date, product_count, seller_count, brand_count, monthly_sales,
       monthly_revenue, avg_price, median_price, avg_rating, median_reviews, top10_share,
       top20_share, new_product_share, price_bands_json, concentration_json, source,
-      source_type, collected_at, period, is_estimated, confidence
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'mock', ?, '30D', 1, 0.91)
+      source_type, collected_at, period, is_estimated, confidence, observation_date, dedup_key
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'mock', ?, '30D', 1, 0.91, ?, ?)
   `);
 
   for (const snapshot of mainMarketSnapshots) {
@@ -351,7 +418,7 @@ function insertMarkets(database: AppDatabase): void {
       `ms-mfm-${date}`, 'mkt-memory-foam', date, productCount, sellerCount, brandCount,
       sales, revenue, avgPrice, medianPrice, rating, reviews, 26.8, 41.5, 16.1,
       JSON.stringify(mainPriceBands), JSON.stringify(mainConcentration), DEMO_SOURCE,
-      `${date}T10:20:00+08:00`,
+      `${date}T10:20:00+08:00`, date, `market|US|mkt-memory-foam|${date}|mock|${DEMO_SOURCE.trim().toLowerCase()}|30D`,
     );
   }
 
@@ -362,12 +429,12 @@ function insertMarkets(database: AppDatabase): void {
     snapshotStatement.run(
       `ms-${id}-prev`, id, previousDate, Math.max(1, productCount - 4), sellerCount, brandCount,
       previousSales, Math.round(previousSales * avgPrice), avgPrice, medianPrice, rating, Math.max(0, reviews - 20),
-      24.5, 39.2, 14.0, '[]', '[]', DEMO_SOURCE, `${previousDate}T10:20:00+08:00`,
+      24.5, 39.2, 14.0, '[]', '[]', DEMO_SOURCE, `${previousDate}T10:20:00+08:00`, previousDate, `market|US|${id}|${previousDate}|mock|${DEMO_SOURCE.trim().toLowerCase()}|30D`,
     );
     snapshotStatement.run(
       `ms-${id}-current`, id, currentDate, productCount, sellerCount, brandCount,
       sales, revenue, avgPrice, medianPrice, rating, reviews, 24.5, 39.2, 14.0,
-      '[]', '[]', DEMO_SOURCE, `${currentDate}T10:20:00+08:00`,
+      '[]', '[]', DEMO_SOURCE, `${currentDate}T10:20:00+08:00`, currentDate, `market|US|${id}|${currentDate}|mock|${DEMO_SOURCE.trim().toLowerCase()}|30D`,
     );
   }
 }
@@ -383,8 +450,8 @@ function insertProducts(database: AppDatabase): void {
     INSERT INTO product_snapshots (
       id, product_id, date, price, rating, review_count, bsr, estimated_sales,
       estimated_revenue, seller_count, growth_7d, growth_30d, growth_90d, source,
-      source_type, collected_at, period, is_estimated, confidence
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, 'mock', ?, '30D', 1, 0.88)
+      source_type, collected_at, period, is_estimated, confidence, observation_date, dedup_key
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, 'mock', ?, '30D', 1, 0.88, ?, ?)
   `);
 
   for (const product of demoProducts) {
@@ -398,7 +465,7 @@ function insertProducts(database: AppDatabase): void {
         `ps-${product.id}-${index + 1}`, product.id, snapshot.date, snapshot.price, snapshot.rating,
         snapshot.reviews, snapshot.bsr, snapshot.sales, Math.round(snapshot.sales * snapshot.price * 100) / 100,
         snapshot.growth7d, snapshot.growth30d, snapshot.growth90d, DEMO_SOURCE,
-        `${snapshot.date}T10:20:00+08:00`,
+        `${snapshot.date}T10:20:00+08:00`, snapshot.date, `product|US|${product.id}|${snapshot.date}|mock|${DEMO_SOURCE.trim().toLowerCase()}|30D`,
       );
     });
   }

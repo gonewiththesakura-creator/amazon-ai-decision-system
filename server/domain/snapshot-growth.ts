@@ -2,6 +2,15 @@ export interface DatedMetric {
   id: string;
   date: string;
   value: number | null | undefined;
+  periodState?: 'closed_month' | 'current_mtd';
+}
+
+/** Acquisition-time semantics are immutable: waiting cannot turn an MTD observation into a closed month. */
+export function monthlyPeriodState(date: string, collectedAt: string): 'closed_month' | 'current_mtd' {
+  if(!validDate(date)||!Number.isFinite(Date.parse(collectedAt)))return 'current_mtd';
+  const monthEnd = new Date(Date.UTC(Number(date.slice(0,4)), Number(date.slice(5,7)), 0)).toISOString().slice(0,10);
+  return validDate(date) && Number.isFinite(Date.parse(collectedAt)) && collectedAt.slice(0,10) >= monthEnd
+    ? 'closed_month' : 'current_mtd';
 }
 
 type FiniteDatedMetric = DatedMetric & { value: number };
@@ -20,7 +29,7 @@ export function deriveSnapshotGrowth(
   maximumDays = 45,
 ): SnapshotGrowthPair | null {
   const dated = points
-    .filter((point) => validDate(point.date))
+    .filter((point) => validDate(point.date) && point.periodState !== 'current_mtd')
     .sort((left, right) => right.date.localeCompare(left.date));
   const latestCandidate = dated[0];
   if (!latestCandidate || !isFiniteNumber(latestCandidate.value)) return null;

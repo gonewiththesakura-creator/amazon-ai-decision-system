@@ -66,7 +66,13 @@ export interface KeywordDataRecord {
 }
 
 export type FileImportFormat = 'csv' | 'xlsx';
-export type FileImportEntityType = 'product' | 'market' | 'review';
+export type FileImportEntityType = 'product' | 'market' | 'review' | 'owned_product_master';
+export type FileImportDetectedType =
+  | 'sellersprite_product'
+  | 'sellersprite_market'
+  | 'amazon_business_report'
+  | 'owned_product_master'
+  | 'unknown';
 export type FileImportSourceType = 'import' | 'amazon';
 
 export interface FileImportInput {
@@ -83,9 +89,13 @@ export interface NormalizedFileImportRow {
 
 export interface FileImportBatch {
   entityType: FileImportEntityType;
+  detectedType: FileImportDetectedType;
   rowCount: number;
   rows: NormalizedFileImportRow[];
 }
+
+/** Read-only Amazon business capabilities intentionally exposed in V2.2. */
+export type AmazonDataCapability = 'OwnedProductCatalog' | 'Orders' | 'Sales' | 'Traffic' | 'Inventory';
 
 /** Boundary for third-party files before any row reaches persistence services. */
 export interface FileDataAdapter extends MarketDataAdapter {

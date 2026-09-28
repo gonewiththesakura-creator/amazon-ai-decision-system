@@ -1,17 +1,19 @@
 import { AmazonImportAdapter, SellerSpriteImportAdapter } from './import-adapters.js';
 import { MockAdapter } from './mock-adapter.js';
 import { SellerSpriteMCPAdapter } from './sellersprite-mcp-adapter.js';
+import type { AppDatabase } from '../database/database.js';
 import type { FileDataAdapter, MarketDataAdapter } from './types.js';
 
 export class AdapterRegistry {
   private readonly adapters = new Map<string, MarketDataAdapter>();
 
-  constructor(adapters: MarketDataAdapter[] = [
-    new MockAdapter(),
-    new SellerSpriteImportAdapter(),
-    new AmazonImportAdapter(),
-    new SellerSpriteMCPAdapter(),
-  ]) {
+  constructor(adapters?: MarketDataAdapter[], options: { database?: AppDatabase } = {}) {
+    adapters ??= [
+      new MockAdapter(),
+      new SellerSpriteImportAdapter(),
+      new AmazonImportAdapter(),
+      new SellerSpriteMCPAdapter({ database: options.database }),
+    ];
     adapters.forEach((adapter) => this.adapters.set(adapter.id, adapter));
   }
 

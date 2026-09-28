@@ -69,6 +69,13 @@ const productTypeLabels: Record<string, string> = {
   orthopedic_pillow: '人体工学枕',
 };
 
+const marketMetricLabels: Record<string, string> = {
+  monthly_sales: '月销量', monthly_revenue: '月销售额', product_count: '产品数',
+  seller_count: '卖家数', brand_count: '品牌数', avg_price: '平均售价',
+  median_price: '中位售价', avg_rating: '平均 Rating', median_reviews: 'Review 中位数',
+  top10_share: 'TOP10 占比', top20_share: 'TOP20 占比', new_product_share: '新品占比',
+};
+
 function productTypeLabel(value: string): string {
   return productTypeLabels[value] ?? value.replaceAll('_', ' ');
 }
@@ -138,13 +145,13 @@ export default function MarketPage() {
   const previousMarketplace = useRef(settings.marketplace);
 
   const marketplaceQuery = encodeURIComponent(settings.marketplace);
-  const marketsQuery = useApi<MarketNode[]>(settings.mode === 'empty' ? null : `/api/markets?marketplace=${marketplaceQuery}`, refreshKey);
+  const marketsQuery = useApi<MarketNode[]>(`/api/markets?marketplace=${marketplaceQuery}`, refreshKey);
   const requestedMarket = searchParams.get('market');
   const selectedId = requestedMarket || settings.defaultMarketId || marketsQuery.data?.[0]?.id || '';
   const detailPath = selectedId ? `/api/markets/${encodeURIComponent(selectedId)}?range=${range}&marketplace=${marketplaceQuery}` : null;
-  const detailQuery = useApi<MarketDetail>(settings.mode === 'empty' ? null : detailPath, refreshKey);
+  const detailQuery = useApi<MarketDetail>(detailPath, refreshKey);
   const productsPath = selectedId ? `/api/markets/${encodeURIComponent(selectedId)}/products?marketplace=${marketplaceQuery}` : null;
-  const productsQuery = useApi<Product[]>(settings.mode === 'empty' ? null : productsPath, refreshKey);
+  const productsQuery = useApi<Product[]>(productsPath, refreshKey);
 
   useEffect(() => {
     if (!requestedMarket && selectedId) setSearchParams({ market: selectedId }, { replace: true });
@@ -188,7 +195,6 @@ export default function MarketPage() {
   }, [productSort, productsQuery.data]);
 
   if (settingsLoading) return <PageLoading label="正在检查市场数据源" />;
-  if (settings.mode === 'empty') return <Onboarding />;
   if ((marketsQuery.loading || detailQuery.loading) && !detailQuery.data) return <PageLoading label="正在读取市场历史快照" />;
   if ((marketsQuery.error || detailQuery.error) && !detailQuery.data) {
     return (
@@ -200,12 +206,17 @@ export default function MarketPage() {
     );
   }
   if (!marketsQuery.data?.length) {
+    if (settings.mode === 'empty') return <Onboarding />;
     return <EmptyState title="尚未建立市场" description="连接数据源或导入市场文件后，系统会自动生成可扩展的 MarketNode 市场树。" />;
   }
   if (!detailQuery.data) return null;
 
   const detail = detailQuery.data;
+  const concentration = detail.concentration.filter(tier=>Boolean(tier.tier) && typeof tier.share==='number' && Number.isFinite(tier.share));
+  const priceBands = detail.priceBands.filter(band=>Boolean(band.label) && typeof band.monthlySales==='number' && Number.isFinite(band.monthlySales));
   const { kpis, node, provenance } = detail;
+  const metricSources = Object.entries(detail.metricProvenance ?? {});
+  const hasMixedSources = new Set(metricSources.map(([, source]) => source.sourceRecordId)).size > 1;
   const hasTrustedData = hasTrustedMarketData(detail);
   const hasGrowthBaseline = hasMarketGrowthBaseline(detail);
 
@@ -247,12 +258,20 @@ export default function MarketPage() {
       </section>
 
       {hasTrustedData ? <div className="source-strip">
-        <span><Database size={15} aria-hidden="true" />{provenance.source}</span>
+        <span><Database size={15} aria-hidden="true" />{kpis.monthlySales === null ? '最新观察' : '月销量来源'}：{provenance.source}</span>
         <span><Clock3 size={15} aria-hidden="true" />采集于 {formatDateTime(provenance.collectedAt)}</span>
         <span>周期 {provenance.period}</span>
         {settings.mode === 'demo' ? <Badge tone="warning">Demo 数据</Badge> : provenance.isEstimated ? <Badge tone="warning">估算数据</Badge> : <Badge tone="positive">原始数据</Badge>}
         <span>可信度 {formatConfidence(provenance.confidence)}</span>
+        {hasMixedSources ? <span>多来源指标</span> : null}
       </div> : <div className="source-strip source-strip--pending"><span><DatabaseZap size={15} aria-hidden="true" />尚无市场快照</span><Badge tone="warning">待补数据</Badge></div>}
+      {hasTrustedData && metricSources.length > 0 ? <details className="metric-source-details">
+        <summary>逐项指标来源</summary>
+        <dl>{metricSources.map(([metric, source]) => <div key={metric}>
+          <dt>{marketMetricLabels[metric] ?? metric}</dt>
+          <dd>{source.source} · {source.sourceRecordType === 'metric_fact' ? '事实' : '快照'} {source.sourceRecordId}</dd>
+        </div>)}</dl>
+      </details> : null}
 
       {!hasTrustedData ? (
         <>
@@ -312,16 +331,16 @@ export default function MarketPage() {
       <div className="two-column-analysis market-structure-primary">
         <section className="analysis-section" id="market-price-bands">
           <header className="section-header"><div><span className="eyebrow">PRICE BANDS</span><h2>价格带机会</h2></div></header>
-          {detail.priceBands.length ? <>
+          {priceBands.length ? <>
             <div className="chart-frame chart-frame--medium">
               <ResponsiveContainer width="100%" height="100%">
-                <BarChart data={detail.priceBands} margin={{ top: 10, right: 8, left: 0, bottom: 0 }}>
+                <BarChart data={priceBands} margin={{ top: 10, right: 8, left: 0, bottom: 0 }}>
                   <CartesianGrid stroke="#e8eceb" strokeDasharray="3 4" vertical={false} />
                   <XAxis dataKey="label" tick={{ fill: '#73807d', fontSize: 11 }} axisLine={false} tickLine={false} />
                   <YAxis tickFormatter={formatCompact} tick={{ fill: '#73807d', fontSize: 11 }} axisLine={false} tickLine={false} width={46} />
                   <Tooltip formatter={(value) => [formatInteger(Number(value)), '月销量']} contentStyle={{ border: '1px solid #dfe5e3', borderRadius: 6 }} />
                   <Bar dataKey="monthlySales" radius={[3, 3, 0, 0]} isAnimationActive={false}>
-                    {detail.priceBands.map((band) => <Cell key={band.label} fill={band.growth >= 0 ? '#16836f' : '#c4504c'} />)}
+                    {priceBands.map((band) => <Cell key={band.label} fill={band.growth >= 0 ? '#16836f' : '#c4504c'} />)}
                   </Bar>
                 </BarChart>
               </ResponsiveContainer>
@@ -329,7 +348,7 @@ export default function MarketPage() {
             <div className="compact-table-wrap">
               <table className="data-table data-table--compact">
                 <thead><tr><th>价格带</th><th>产品</th><th>销量</th><th>新品</th><th>增长</th></tr></thead>
-                <tbody>{detail.priceBands.map((band) => <tr key={band.label}><td><strong>{band.label}</strong></td><td>{band.productCount}</td><td>{formatCompact(band.monthlySales)}</td><td>{band.newProducts}</td><td className={hasGrowthBaseline ? band.growth >= 0 ? 'text-positive' : 'text-critical' : ''}>{hasGrowthBaseline ? formatPercent(band.growth) : '—'}</td></tr>)}</tbody>
+                <tbody>{priceBands.map((band) => <tr key={band.label}><td><strong>{band.label}</strong></td><td>{band.productCount}</td><td>{formatCompact(band.monthlySales)}</td><td>{band.newProducts}</td><td className={hasGrowthBaseline ? band.growth >= 0 ? 'text-positive' : 'text-critical' : ''}>{hasGrowthBaseline ? formatPercent(band.growth) : '—'}</td></tr>)}</tbody>
               </table>
             </div>
           </> : <div className="empty-state compact"><DatabaseZap size={25} aria-hidden="true" /><h3>暂无价格带数据</h3><p>当前快照未提供可核验的价格带分布。</p></div>}
@@ -337,9 +356,9 @@ export default function MarketPage() {
 
         <section className="analysis-section" id="market-concentration">
           <header className="section-header"><div><span className="eyebrow">CONCENTRATION</span><h2>TOP 集中度</h2></div></header>
-          {detail.concentration.length ? <>
+          {concentration.length ? <>
             <div className="concentration-list">
-              {detail.concentration.map((tier, index) => (
+              {concentration.map((tier, index) => (
                 <div className="concentration-row" key={tier.tier}>
                   <div><strong>{tier.tier}</strong><span>均价 {formatCurrency(tier.avgPrice, settings.currency)} · 均销量 {formatInteger(tier.avgSales)}</span></div>
                   <div className="concentration-track"><span style={{ width: `${Math.min(tier.share, 100)}%`, backgroundColor: ['#1c7765', '#377caa', '#b17635', '#777c79'][index % 4] }} /></div>
@@ -351,7 +370,7 @@ export default function MarketPage() {
               <AreaChart size={18} aria-hidden="true" />
               <p><strong>如何解读</strong>集中度越高，头部品牌对流量和定价的控制越强；应结合新品占比与 Review 门槛判断进入窗口。</p>
             </div>
-          </> : <div className="empty-state compact"><DatabaseZap size={25} aria-hidden="true" /><h3>暂无集中度数据</h3><p>当前快照不足以计算头部份额。</p></div>}
+          </> : <div className="empty-state compact"><DatabaseZap size={25} aria-hidden="true" /><h3>当前没有合法全市场集中度数据</h3><p>现有 TOP100 样本未作为全市场指标使用。</p></div>}
         </section>
       </div>
 
@@ -456,8 +475,8 @@ export default function MarketPage() {
           <MetricCard label="品牌数" value={formatInteger(kpis.brandCount)} icon={Store} />
           <MetricCard label="平均售价" value={formatCurrency(kpis.avgPrice, settings.currency)} detail={`中位 ${formatCurrency(kpis.medianPrice, settings.currency)}`} icon={CircleDollarSign} />
           <MetricCard label="平均 Rating" value={formatDecimal(kpis.avgRating)} detail={`Review 中位 ${formatInteger(kpis.medianReviews)}`} icon={Star} />
-          <MetricCard label="TOP10 销量占比" value={formatPercent(kpis.top10Share, false)} icon={Layers3} tone={kpis.top10Share !== null && kpis.top10Share > 50 ? 'warning' : 'default'} />
-          <MetricCard label="TOP20 销量占比" value={formatPercent(kpis.top20Share, false)} icon={Users} />
+          {kpis.top10Share !== null && <MetricCard label="TOP10 销量占比" value={formatPercent(kpis.top10Share, false)} icon={Layers3} tone={kpis.top10Share > 50 ? 'warning' : 'default'} />}
+          {kpis.top20Share !== null && <MetricCard label="TOP20 销量占比" value={formatPercent(kpis.top20Share, false)} icon={Users} />}
           <MetricCard label="新品占比" value={formatPercent(kpis.newProductShare, false)} icon={PackageSearch} tone="positive" />
         </div>
       </section>

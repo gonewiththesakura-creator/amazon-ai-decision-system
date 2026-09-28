@@ -5,12 +5,12 @@ import { describe, expect, it } from 'vitest';
 const workflowAssets = [
   {
     jobType: 'existing_market',
-    prompts: ['market-analysis.v1.md'],
+    prompts: ['market-analysis.v1.md', 'market-analysis.v2.md'],
     skill: 'amazon-market-diagnosis',
   },
   {
     jobType: 'owned_product',
-    prompts: ['owned-sku-analysis.v1.md'],
+    prompts: ['owned-sku-analysis.v1.md','owned-sku-analysis.v2.md'],
     skill: 'owned-sku-analysis',
   },
   {
@@ -29,7 +29,7 @@ describe('versioned workflow assets', () => {
   it.each(workflowAssets)('resolves every prompt and primary skill for $jobType', ({ prompts, skill }) => {
     for (const prompt of prompts) {
       const content = readFileSync(resolve('prompts', prompt), 'utf8');
-      expect(content).toMatch(/^# .+v1/m);
+      expect(content).toMatch(/^# .+v[12]/m);
       expect(content).toMatch(/Evidence|evidence/);
     }
 

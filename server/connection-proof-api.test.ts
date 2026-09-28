@@ -1,0 +1,22 @@
+import {afterEach,expect,it,vi} from 'vitest';
+import request from 'supertest';
+import {createApp} from './app.js';
+import {openDatabase,type AppDatabase} from './database/database.js';
+import {addVerifiedMcpCoverage} from './test-utils/verified-mcp-coverage.js';
+let db:AppDatabase;
+afterEach(()=>{db?.close();vi.unstubAllGlobals();});
+it('reads current-run proof with expired connection cache, zero I/O and no database writes',async()=>{
+ db=openDatabase(':memory:');db.exec("INSERT INTO market_nodes(id,name,level,marketplace,source_type,status,created_at) VALUES('mkt-memory-foam','Synthetic',1,'US','import','active','2026-01-01')");
+ addVerifiedMcpCoverage(db);const run=String(db.prepare('SELECT id FROM data_coverage_runs LIMIT 1').get()!.id);
+ db.exec("UPDATE data_sources SET last_sync_at='2000-01-01',status='disconnected'");
+ db.prepare("UPDATE mcp_call_logs SET completed_at=started_at WHERE capability='LIST_TOOLS' AND sync_run_id=?").run(run);
+ const diagnostics={testConnection:vi.fn(()=>{throw new Error('Remote forbidden');})};
+ const app=createApp({database:db,sellerSpriteDiagnostics:diagnostics});
+ vi.stubGlobal('fetch',vi.fn(()=>{throw new Error('Network forbidden');}));
+ const changes=db.prepare('SELECT total_changes() n').get()!.n;
+ const result=await request(app).get(`/api/integrations/sellersprite/connection-proof?runId=${run}`);
+ expect(result.status).toBe(200);expect(result.body.data).toMatchObject({runId:run,provider:'sellersprite',status:'success',method:'fresh_list_tools'});
+ expect(db.prepare('SELECT total_changes() n').get()!.n).toBe(changes);
+ expect(fetch).not.toHaveBeenCalled();expect(diagnostics.testConnection).not.toHaveBeenCalled();
+ expect(db.prepare("SELECT count(*) n FROM mcp_call_logs WHERE sync_run_id=? AND capability='LIST_TOOLS' AND cache_hit=0").get(run)?.n).toBe(1);
+});

@@ -67,6 +67,64 @@ export const api = {
     apiRequest<T>(path, { method: 'POST', body: formData }),
 };
 
+export type ImportDetectedType =
+  | 'sellersprite_product'
+  | 'sellersprite_market'
+  | 'amazon_business_report'
+  | 'owned_product_master'
+  | 'unknown';
+
+export interface ImportPreviewResult {
+  token: string;
+  contentDigest: string;
+  detectedType: ImportDetectedType;
+  entityType: string | null;
+  totalCount: number;
+  newCount: number;
+  updateCount: number;
+  duplicateCount: number;
+  errorCount: number;
+  errors: string[];
+  mappings: Array<{ sourceHeader: string; targetField: string }>;
+  rows: Array<{ rowNumber: number; values: Record<string, unknown> }>;
+  previewRowLimit: number;
+  previewedCount: number;
+  rowsOmitted: number;
+  expiresAt: string;
+}
+
+export interface ConfirmedImportResult {
+  batchId: string;
+  entityType: string;
+  rowCount: number;
+  successCount: number;
+  failureCount: number;
+  errors: string[];
+}
+
+export function previewImport(file: File, options: {
+  sourceType?: 'import' | 'amazon';
+  marketplace?: string;
+  reportStartDate?: string;
+  reportEndDate?: string;
+} = {}): Promise<ImportPreviewResult> {
+  const format = file.name.toLowerCase().endsWith('.csv') ? 'csv' : 'xlsx';
+  const formData = new FormData();
+  formData.append('file', file);
+  for (const [key, value] of Object.entries(options)) {
+    if (value) formData.append(key, value);
+  }
+  return api.upload<ImportPreviewResult>(`/api/import/preview/${format}`, formData);
+}
+
+export function confirmImport(token: string, entityType?: string): Promise<ConfirmedImportResult> {
+  return api.post<ConfirmedImportResult>('/api/import/confirm', { token, entityType });
+}
+
+export function selectImportPreviewType(token: string, entityType: string): Promise<ImportPreviewResult> {
+  return api.post<ImportPreviewResult>('/api/import/preview/type', { token, entityType });
+}
+
 export interface ApiQuery<T> {
   data: T | null;
   error: Error | null;

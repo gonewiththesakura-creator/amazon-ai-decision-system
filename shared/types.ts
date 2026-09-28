@@ -68,6 +68,11 @@ export interface Provenance {
   confidence: number;
 }
 
+export interface MetricProvenance extends Provenance {
+  sourceRecordId: string;
+  sourceRecordType: 'metric_fact' | 'snapshot';
+}
+
 export interface EvidenceMetric {
   name: string;
   label: string;
@@ -82,7 +87,16 @@ export interface Evidence {
   provenance: Provenance[];
 }
 
+export interface MarketDataMaturity {
+  status: 'LIMITED' | 'READY';
+  historyDays: number;
+  observationDates: number;
+  hardBlocker: false;
+  message: string;
+}
+
 export interface Insight {
+  marketDataMaturity?: MarketDataMaturity;
   id: string;
   entityType: string;
   entityId: string;
@@ -116,6 +130,7 @@ export interface MarketNode {
   level: number;
   marketplace: string;
   categoryId?: string;
+  sellerSpriteNodePath?: string;
   keywords: string[];
   status: string;
   snapshotAvailable: boolean;
@@ -171,6 +186,7 @@ export interface MarketDetail {
   concentration: Array<{ tier: string; share: number; avgPrice: number; avgSales: number }>;
   insight: Insight;
   provenance: Provenance;
+  metricProvenance?: Record<string, MetricProvenance>;
 }
 
 export interface ProductSnapshot {
@@ -178,6 +194,8 @@ export interface ProductSnapshot {
   snapshotAvailable: boolean;
   productId: string;
   date: string;
+  periodState?: 'closed_month' | 'current_mtd';
+  periodMonth?: string;
   price: number | null;
   rating: number | null;
   reviewCount: number | null;
@@ -190,6 +208,7 @@ export interface ProductSnapshot {
   growth30dAvailable: boolean;
   growth90d: number | null;
   provenance: Provenance;
+  metricProvenance?: Record<string, MetricProvenance>;
 }
 
 export interface Product {
@@ -292,6 +311,7 @@ export interface DecisionRecord {
 }
 
 export interface ResearchJobSummary {
+  marketDataMaturity?: MarketDataMaturity;
   id: string;
   name: string;
   type: ResearchJobType;
@@ -362,6 +382,7 @@ export interface WorkflowEvidence {
   source: string;
   sourceType: 'mock' | 'import' | 'mcp' | 'amazon' | 'manual';
   sourceRecordId?: string;
+  syncRunId?: string | null;
   collectedAt: string;
   period: string;
   isEstimated: boolean;
@@ -535,6 +556,7 @@ export interface WatchlistItem {
 
 export interface DataTask {
   id: string;
+  syncRunId: string | null;
   name: string;
   taskType: string;
   target: string;
@@ -768,6 +790,9 @@ export interface ExecutiveSkuFocus {
   trendComparison: IndexedTrendSeries[];
   trendComparisonMeta: IndexedTrendComparisonMeta;
   operatingMetrics: {
+    periodState?: 'closed_month' | 'current_mtd';
+    periodMonth?: string;
+    collectedAt?: string;
     estimatedSales: number | null;
     estimatedRevenue: number | null;
     price: number | null;
@@ -784,6 +809,7 @@ export interface ExecutiveSkuFocus {
 }
 
 export interface ExecutiveDashboardViewModel {
+  directCompetitorCount?: number;
   generatedAt: string;
   range: TimeRange;
   marketplace: string;
@@ -791,6 +817,7 @@ export interface ExecutiveDashboardViewModel {
   kpis: ExecutiveDashboardKpis;
   trendComparison: IndexedTrendSeries[];
   trendComparisonMeta: IndexedTrendComparisonMeta;
+  comparisonSkuIds: string[];
   ownedSkuPerformance: ExecutiveSkuPerformance[];
   marketDistribution: ExecutiveMarketDistribution;
   fastGrowthCompetitors: ExecutiveCompetitorGrowth[];
@@ -802,7 +829,39 @@ export interface ExecutiveDashboardViewModel {
   skuFocus: ExecutiveSkuFocus | null;
 }
 
+export type DataCoverageStatus = 'complete' | 'partial' | 'missing' | 'not_applicable';
+
+export interface DataCoverageCounter {
+  covered: number;
+  total: number;
+  status: DataCoverageStatus;
+  label: '完整' | '部分覆盖' | '缺失' | '不适用';
+}
+
+export interface DirectCompetitorTargetCoverage extends DataCoverageCounter {
+  minimumPerOwnedProduct: number;
+  preferredMaximumPerOwnedProduct: number;
+}
+
+export interface DataCoverageReport {
+  marketDataMaturity?: MarketDataMaturity;
+  generatedAt: string;
+  marketplace: string;
+  primaryMarket: DataCoverageCounter;
+  activeOwnedProducts: DataCoverageCounter;
+  coreCompetitors: DataCoverageCounter;
+  history90d: DataCoverageCounter;
+  primaryMarketHistory90d: DataCoverageCounter;
+  ownedProductHistory90d: DataCoverageCounter;
+  ownedProductHistory180d: DataCoverageCounter;
+  coreCompetitorHistory90d: DataCoverageCounter;
+  coreDirectCompetitorTarget: DirectCompetitorTargetCoverage;
+  amazonActual: DataCoverageCounter;
+}
+
 export interface AppSettings {
+  latestSuccessfulCritical?: { runId: string; completedAt: string } | null;
+  connectionFreshness?: 'FRESH' | 'STALE' | 'UNKNOWN';
   mode: DataMode;
   role: Role;
   marketplace: string;

@@ -2,6 +2,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import type { Evidence, Insight, Provenance } from '../../shared/types.js';
 import { opportunityStatus } from '../domain/calculations.js';
 import { IntelligenceRepository } from '../repository/intelligence-repository.js';
+import { entityMarketMaturity, requires90DaySupport } from './market-data-maturity.js';
 
 const DETERMINISTIC_MODEL = 'rule-engine-v1';
 
@@ -107,6 +108,14 @@ export class DeterministicAIService {
   ): AIAnalysisResult {
     const contextualType = context?.entityType ? normalizeEntityType(context.entityType) : '';
     const contextualId = context?.entityId ?? '';
+    const maturity = entityMarketMaturity(this.repository.database,
+      contextualId && contextualId !== 'overview' ? contextualType : 'market',
+      contextualId && contextualId !== 'overview' ? contextualId : this.repository.getSettings().defaultMarketId);
+    if (maturity?.status === 'LIMITED' && requires90DaySupport(question)) {
+      const insight=this.repository.workflowRequiredInsight('market',this.repository.getSettings().defaultMarketId,'市场历史不足');
+      return {insight:{...insight,marketDataMaturity:maturity},answer:maturity.message,
+        cached:false,formal:false,notice:maturity.message};
+    }
     if (
       contextualId
       && contextualId !== 'overview'
@@ -115,8 +124,8 @@ export class DeterministicAIService {
       return this.answerFromWorkflow(contextualType, contextualId);
     }
     const lower = question.toLowerCase();
-    const owned = this.repository.getOwnedProducts();
-    const explicitlyNamedProducts = owned.filter((product) => [
+    const owned = this.repository.getSellableOwnedProducts();
+    const explicitlyNamedProducts = this.repository.getOwnedProducts().filter((product) => [
       product.id, product.asin, product.sku, product.internalName, product.title,
     ].some((alias) => alias && lower.includes(alias.toLowerCase())));
     if (explicitlyNamedProducts.length > 1) {
@@ -271,10 +280,14 @@ export class DeterministicAIService {
     const settings = this.repository.getSettings();
     const id = randomUUID();
     const dataVersion = `${settings.mode}-${hashAnalysisInput(payload).slice(0, 12)}`;
-    if (entityType === 'market') return this.generateMarket(id, entityId, insightType, dataVersion, now);
-    if (entityType === 'owned_product') return this.generateOwnedProduct(id, entityId, insightType, dataVersion, now);
-    if (entityType === 'development_project') return this.generateDevelopment(id, entityId, insightType, dataVersion, now);
-    return this.generateOpportunity(id, entityId, insightType, dataVersion, now);
+    const maturity = entityMarketMaturity(this.repository.database,entityType,entityId);
+    if (maturity?.status === 'LIMITED' && requires90DaySupport(insightType)) throw new Error(maturity.message);
+    const insight = entityType === 'market' ? this.generateMarket(id,entityId,insightType,dataVersion,now)
+      : entityType === 'owned_product' ? this.generateOwnedProduct(id,entityId,insightType,dataVersion,now)
+      : entityType === 'development_project' ? this.generateDevelopment(id,entityId,insightType,dataVersion,now)
+      : this.generateOpportunity(id,entityId,insightType,dataVersion,now);
+    return {...insight,marketDataMaturity:maturity,
+      risks:maturity?.status === 'LIMITED' ? [...insight.risks,maturity.message] : insight.risks};
   }
 
   private generateMarket(id: string, entityId: string, insightType: string, dataVersion: string, now: string): Insight {

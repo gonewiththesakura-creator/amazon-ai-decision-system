@@ -1,4 +1,6 @@
 import { type FormEvent, useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import {ProductPeriod} from '../components/ProductPeriod';
+import {salesLabel} from '../lib/productPeriod';
 import { Link, useNavigate, useParams, useSearchParams } from 'react-router-dom';
 import {
   ArrowDown,
@@ -6,6 +8,8 @@ import {
   ArrowUpDown,
   BarChart3,
   ChartNoAxesCombined,
+  ChevronLeft,
+  ChevronRight,
   Clock3,
   DatabaseZap,
   FileSpreadsheet,
@@ -14,6 +18,7 @@ import {
   LoaderCircle,
   Plus,
   PackagePlus,
+  RefreshCw,
   Trash2,
   Search,
   ShieldAlert,
@@ -42,6 +47,7 @@ import type {
   RelationType,
 } from '../../shared/types';
 import { Badge } from '../components/Badge';
+import CompetitorCandidateReview from '../components/CompetitorCandidateReview';
 import { EvidenceDrawer } from '../components/EvidenceDrawer';
 import { InsightPanel } from '../components/InsightPanel';
 import { Onboarding } from '../components/Onboarding';
@@ -66,6 +72,8 @@ type ProductTab = 'performance' | 'competitors' | 'diagnosis';
 type RelationFilter = 'all' | RelationType;
 type GrowthFilter = 'all' | 'growing' | 'declining';
 type SortKey = 'sales' | 'growth' | 'price' | 'reviews' | 'similarity';
+
+const PORTFOLIO_PAGE_SIZE = 12;
 
 interface CompetitorForm {
   asin: string;
@@ -121,7 +129,7 @@ function SkuSelector({ product, active }: { product: OwnedProductSummary; active
       ? '等待 SKU 30D 对照快照'
       : '等待市场 30D 对照快照';
   return (
-    <Link className={`sku-selector ${active ? 'is-active' : ''}`} to={`/owned-products/${product.id}`}>
+    <Link className={`sku-selector ${active ? 'is-active' : ''}`} aria-current={active ? 'page' : undefined} to={`/owned-products/${product.id}`}>
       <div className="sku-selector__top">
         <ProductImage src={product.imageUrl} alt={product.title} size="md" />
         <div>
@@ -131,7 +139,7 @@ function SkuSelector({ product, active }: { product: OwnedProductSummary; active
         <Badge tone={hasTrustedData ? performance.tone : 'warning'}>{hasTrustedData ? performance.label : hasProductData ? '基线不足' : '待补数据'}</Badge>
       </div>
       <div className="sku-selector__metrics">
-        <span><small>月销量</small><strong>{hasProductData ? formatInteger(product.latest.estimatedSales) : '—'}</strong></span>
+        <span><small>{salesLabel(product.latest)}</small><strong>{hasProductData ? formatInteger(product.latest.estimatedSales) : '—'}</strong><ProductPeriod snapshot={product.latest} /></span>
         <span><small>SKU 30D</small><strong className={hasTrustedData ? product.latest.growth30d >= 0 ? 'text-positive' : 'text-critical' : ''}>{hasTrustedData ? formatPercent(product.latest.growth30d) : '—'}</strong></span>
         <span><small>相对市场</small><strong className={hasTrustedData ? product.relativeDelta >= 0 ? 'text-positive' : 'text-critical' : ''}>{hasTrustedData ? formatPercent(product.relativeDelta) : '—'}</strong></span>
       </div>
@@ -166,6 +174,7 @@ function CompetitorTable({
   focusCompetitorId,
   onReclassify,
   onRemove,
+  onSync,
 }: {
   competitors: Competitor[];
   currency: string;
@@ -175,6 +184,7 @@ function CompetitorTable({
   focusCompetitorId?: string;
   onReclassify: (competitor: Competitor, relationType: RelationType) => void;
   onRemove: (competitor: Competitor) => void;
+  onSync: (competitor: Competitor) => void;
 }) {
   const [relation, setRelation] = useState<RelationFilter>('all');
   const [growth, setGrowth] = useState<GrowthFilter>('all');
@@ -276,8 +286,8 @@ function CompetitorTable({
                 <th>产品 / ASIN</th><th>竞品组</th>
                 <th><SortButton label="价格" value="price" active={sortKey} descending={descending} onClick={changeSort} /></th>
                 <th>Rating / Review</th><th>BSR</th>
-                <th><SortButton label="月销量" value="sales" active={sortKey} descending={descending} onClick={changeSort} /></th>
-                <th>月销售额</th><th>7D</th>
+                <th><SortButton label="销量（周期见明细）" value="sales" active={sortKey} descending={descending} onClick={changeSort} /></th>
+                <th>销售额（周期见明细）</th><th>7D</th>
                 <th><SortButton label="30D" value="growth" active={sortKey} descending={descending} onClick={changeSort} /></th>
                 <th>90D</th><th><SortButton label="相似度" value="similarity" active={sortKey} descending={descending} onClick={changeSort} /></th><th>AI 标签</th>{canEdit ? <th><span className="visually-hidden">管理</span></th> : null}
               </tr>
@@ -302,14 +312,14 @@ function CompetitorTable({
                   <td>{item.latest.snapshotAvailable ? formatCurrency(item.latest.price, currency) : '—'}</td>
                   <td>{item.latest.snapshotAvailable ? <span className="rating-cell">{item.latest.rating !== null ? <Star size={13} fill="currentColor" aria-hidden="true" /> : null}{formatDecimal(item.latest.rating)} <small>({formatCompact(item.latest.reviewCount)})</small></span> : <Badge tone="warning">待补数据</Badge>}</td>
                   <td>{item.latest.bsr !== null ? `#${formatInteger(item.latest.bsr)}` : '—'}</td>
-                  <td><strong>{formatInteger(item.latest.estimatedSales)}</strong></td>
-                  <td>{formatCurrency(item.latest.estimatedRevenue, currency, true)}</td>
+                  <td><small>{salesLabel(item.latest)}</small><strong>{formatInteger(item.latest.estimatedSales)}</strong><ProductPeriod snapshot={item.latest} /></td>
+                  <td><small>{salesLabel(item.latest,true)}</small>{formatCurrency(item.latest.estimatedRevenue, currency, true)}<ProductPeriod snapshot={item.latest} /></td>
                   <td className={item.latest.growth7d !== null ? item.latest.growth7d >= 0 ? 'text-positive' : 'text-critical' : ''}>{formatPercent(item.latest.growth7d)}</td>
                   <td className={item.latest.growth30dAvailable && item.latest.growth30d !== null ? item.latest.growth30d >= 0 ? 'text-positive' : 'text-critical' : ''}><strong>{item.latest.growth30dAvailable ? formatPercent(item.latest.growth30d) : '—'}</strong></td>
                   <td className={item.latest.growth90d !== null ? item.latest.growth90d >= 0 ? 'text-positive' : 'text-critical' : ''}>{formatPercent(item.latest.growth90d)}</td>
                   <td><span className="similarity-value">{Math.round(item.similarityScore)}%</span></td>
                   <td><div className="tag-list">{item.aiTags.slice(0, 2).map((tag) => <span key={tag}>{tag}</span>)}</div></td>
-                  {canEdit ? <td><div className="competitor-row-actions"><select aria-label={`调整 ${item.asin} 竞品分组`} value={item.relationType} disabled={updatingId !== null} onChange={(event) => onReclassify(item, event.target.value as RelationType)}>{relationOptions.filter((option) => option.value !== 'all').map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}</select><button className="icon-button" type="button" aria-label={`移除竞品 ${item.asin}`} title="移除竞品关系" disabled={updatingId !== null} onClick={() => onRemove(item)}>{updatingId === `${item.id}:${item.relationType}` ? <LoaderCircle className="spin" size={15} /> : <Trash2 size={15} />}</button></div></td> : null}
+                  {canEdit ? <td><div className="competitor-row-actions"><select aria-label={`调整 ${item.asin} 竞品分组`} value={item.relationType} disabled={updatingId !== null} onChange={(event) => onReclassify(item, event.target.value as RelationType)}>{relationOptions.filter((option) => option.value !== 'all').map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}</select><button className="icon-button" type="button" aria-label={`同步竞品 ${item.asin}`} title="从 SellerSprite 同步已确认竞品" disabled={updatingId !== null} onClick={() => onSync(item)}>{updatingId === `sync:${item.id}` ? <LoaderCircle className="spin" size={15} /> : <RefreshCw size={15} />}</button><button className="icon-button" type="button" aria-label={`移除竞品 ${item.asin}`} title="移除竞品关系" disabled={updatingId !== null} onClick={() => onRemove(item)}>{updatingId === `${item.id}:${item.relationType}` ? <LoaderCircle className="spin" size={15} /> : <Trash2 size={15} />}</button></div></td> : null}
                   </tr>
                 );
               })}
@@ -335,12 +345,20 @@ export default function OwnedProductsPage() {
   const [competitorSaving, setCompetitorSaving] = useState(false);
   const [competitorUpdatingId, setCompetitorUpdatingId] = useState<string | null>(null);
   const [competitorError, setCompetitorError] = useState<string | null>(null);
+  const [portfolioQuery, setPortfolioQuery] = useState('');
+  const [portfolioPage, setPortfolioPage] = useState(1);
   const marketplaceQuery = encodeURIComponent(settings.marketplace);
-  const listQuery = useApi<OwnedProductSummary[]>(settings.mode === 'empty' ? null : `/api/owned-products?marketplace=${marketplaceQuery}`, refreshKey);
+  const listQuery = useApi<OwnedProductSummary[]>(`/api/owned-products?marketplace=${marketplaceQuery}`, refreshKey);
   const selectedId = productId || listQuery.data?.[0]?.id || '';
   const requestedTab = searchParams.get('tab');
   const requestedCompetitorId = searchParams.get('competitor');
   const detailQuery = useApi<OwnedProductDetail>(selectedId ? `/api/owned-products/${encodeURIComponent(selectedId)}?marketplace=${marketplaceQuery}` : null, refreshKey);
+
+  useEffect(() => {
+    if (portfolioQuery.trim()) return;
+    const index = listQuery.data?.findIndex((product) => product.id === selectedId) ?? -1;
+    if (index >= 0) setPortfolioPage(Math.floor(index / PORTFOLIO_PAGE_SIZE) + 1);
+  }, [listQuery.data, portfolioQuery, selectedId]);
 
   useEffect(() => {
     if (!productId && selectedId) navigate(`/owned-products/${selectedId}`, { replace: true });
@@ -368,12 +386,12 @@ export default function OwnedProductsPage() {
   }, [competitorSaving, showCompetitorForm]);
 
   if (settingsLoading) return <PageLoading label="正在检查自有产品数据" />;
-  if (settings.mode === 'empty') return <Onboarding />;
   if ((listQuery.loading || detailQuery.loading) && !detailQuery.data) return <PageLoading label="正在建立 SKU 与市场对照" />;
   if ((listQuery.error || detailQuery.error) && !detailQuery.data) {
     return <ErrorState error={listQuery.error ?? detailQuery.error} onRetry={() => { listQuery.reload(); detailQuery.reload(); }} lastSuccessfulSync={settings.lastSuccessfulSync} />;
   }
   if (!listQuery.data?.length) {
+    if (settings.mode === 'empty') return <Onboarding />;
     return (
       <EmptyState
         title="尚未录入自有 SKU"
@@ -385,6 +403,21 @@ export default function OwnedProductsPage() {
   if (!detailQuery.data) return null;
 
   const detail = detailQuery.data;
+  const normalizedPortfolioQuery = portfolioQuery.trim().toLocaleLowerCase();
+  const filteredPortfolio = listQuery.data.filter((product) => (
+    !normalizedPortfolioQuery
+    || [product.sku, product.asin, product.internalName, product.brand, product.title]
+      .filter(Boolean)
+      .join(' ')
+      .toLocaleLowerCase()
+      .includes(normalizedPortfolioQuery)
+  ));
+  const portfolioPageCount = Math.max(1, Math.ceil(filteredPortfolio.length / PORTFOLIO_PAGE_SIZE));
+  const safePortfolioPage = Math.min(portfolioPage, portfolioPageCount);
+  const visiblePortfolio = filteredPortfolio.slice(
+    (safePortfolioPage - 1) * PORTFOLIO_PAGE_SIZE,
+    safePortfolioPage * PORTFOLIO_PAGE_SIZE,
+  );
   const performance = performanceMeta[detail.performance];
   const hasTrustedData = hasTrustedRelativePerformance(detail, detail.snapshots);
   const hasProductData = detail.latest.snapshotAvailable
@@ -464,6 +497,20 @@ export default function OwnedProductsPage() {
     }
   };
 
+  const syncCompetitor = async (competitor: Competitor) => {
+    setCompetitorUpdatingId(`sync:${competitor.id}`);
+    setCompetitorError(null);
+    try {
+      await api.post('/api/integrations/sellersprite/sync/competitor', {
+        ownedProductId: detail.id,
+        competitorProductId: competitor.id,
+      });
+      detailQuery.reload();
+    } catch (requestError) {
+      setCompetitorError(requestError instanceof Error ? requestError.message : '竞品同步失败');
+    } finally { setCompetitorUpdatingId(null); }
+  };
+
   return (
     <div className="page-stack owned-products-page">
       {detailQuery.error ? <ErrorState compact error={detailQuery.error} onRetry={detailQuery.reload} lastSuccessfulSync={settings.lastSuccessfulSync} /> : null}
@@ -474,12 +521,35 @@ export default function OwnedProductsPage() {
           <h1>自有 SKU 相对市场表现</h1>
           <p>不要只看绝对涨跌；先判断每个 SKU 是否跑赢它所在的市场。</p>
         </div>
-        <Badge tone={listQuery.data.length > 0 ? 'positive' : 'warning'}>{listQuery.data.length} 个 SKU 已启用</Badge>
+        <Badge tone={listQuery.data.length > 0 ? 'positive' : 'warning'}>{listQuery.data.length} 个产品</Badge>
       </section>
 
-      <section className="sku-selector-grid" aria-label="选择自有 SKU">
-        {listQuery.data.map((product) => <SkuSelector key={product.id} product={product} active={product.id === detail.id} />)}
-      </section>
+      <div className="toolbar portfolio-toolbar">
+        <label className="search-field">
+          <Search size={16} aria-hidden="true" />
+          <input
+            type="search"
+            aria-label="搜索自有 SKU"
+            placeholder="搜索 SKU、ASIN 或产品名"
+            value={portfolioQuery}
+            onChange={(event) => {
+              setPortfolioQuery(event.target.value);
+              setPortfolioPage(1);
+            }}
+          />
+        </label>
+        <span className="result-count" role="status" aria-live="polite">显示 {filteredPortfolio.length} / {listQuery.data.length}</span>
+        {portfolioPageCount > 1 ? (
+          <nav className="portfolio-pagination" aria-label="自有 SKU 分页">
+            <button className="icon-button" type="button" aria-label="上一页" disabled={safePortfolioPage === 1} onClick={() => setPortfolioPage((page) => Math.max(1, page - 1))}><ChevronLeft size={16} /></button>
+            <span role="status" aria-live="polite" aria-label="自有 SKU 分页状态">{safePortfolioPage} / {portfolioPageCount}</span>
+            <button className="icon-button" type="button" aria-label="下一页" disabled={safePortfolioPage === portfolioPageCount} onClick={() => setPortfolioPage((page) => Math.min(portfolioPageCount, page + 1))}><ChevronRight size={16} /></button>
+          </nav>
+        ) : null}
+      </div>
+      <nav className="sku-selector-grid" aria-label="选择自有 SKU">
+        {visiblePortfolio.map((product) => <SkuSelector key={product.id} product={product} active={product.id === detail.id} />)}
+      </nav>
 
       <section className="product-identity-band">
         <ProductImage src={detail.imageUrl} alt={detail.title} size="lg" />
@@ -496,8 +566,8 @@ export default function OwnedProductsPage() {
           <div><span>Rating</span><strong>{hasProductData ? <>{formatDecimal(detail.latest.rating)} <Star size={13} fill="currentColor" aria-hidden="true" /></> : '—'}</strong></div>
           <div><span>Review</span><strong>{hasProductData ? formatInteger(detail.latest.reviewCount) : '—'}</strong></div>
           <div><span>BSR</span><strong>{hasProductData ? `#${formatInteger(detail.latest.bsr)}` : '—'}</strong></div>
-          <div><span>月销量</span><strong>{hasProductData ? formatInteger(detail.latest.estimatedSales) : '—'}</strong></div>
-          <div><span>月销售额</span><strong>{hasProductData ? formatCurrency(detail.latest.estimatedRevenue, settings.currency, true) : '—'}</strong></div>
+          <div><span>{salesLabel(detail.latest)}</span><strong>{hasProductData ? formatInteger(detail.latest.estimatedSales) : '—'}</strong><ProductPeriod snapshot={detail.latest} /></div>
+          <div><span>{salesLabel(detail.latest,true)}</span><strong>{hasProductData ? formatCurrency(detail.latest.estimatedRevenue, settings.currency, true) : '—'}</strong><ProductPeriod snapshot={detail.latest} /></div>
         </div>
       </section>
 
@@ -582,12 +652,12 @@ export default function OwnedProductsPage() {
                     <YAxis yAxisId="price" orientation="right" tickFormatter={(value: number) => formatCurrency(value, settings.currency)} tick={{ fill: '#73807d', fontSize: 11 }} axisLine={false} tickLine={false} width={58} />
                     <Tooltip labelFormatter={(value) => formatDate(String(value), 'yyyy-MM-dd')} contentStyle={{ border: '1px solid #dfe5e3', borderRadius: 6 }} />
                     <Legend iconType="plainline" wrapperStyle={{ fontSize: 12 }} />
-                    <Line yAxisId="sales" type="monotone" dataKey="estimatedSales" name="预估月销量" stroke="#16836f" strokeWidth={2.2} dot={false} connectNulls={false} />
+                    <Line yAxisId="sales" type="monotone" dataKey="estimatedSales" name={salesLabel(detail.latest)} stroke="#16836f" strokeWidth={2.2} dot={false} connectNulls={false} />
                     <Line yAxisId="price" type="stepAfter" dataKey="price" name="价格" stroke="#b46a24" strokeWidth={1.8} dot={false} connectNulls={false} />
                   </LineChart>
                 </ResponsiveContainer>
               </div>
-              <footer className="snapshot-footer"><Clock3 size={14} aria-hidden="true" />最近快照 {formatDateTime(detail.latest.provenance.collectedAt)} · {detail.latest.provenance.source}{detail.latest.provenance.isEstimated ? ' · 估算' : ''}</footer>
+              <footer className="snapshot-footer"><Clock3 size={14} aria-hidden="true" /><ProductPeriod snapshot={detail.latest} />最近快照 {formatDateTime(detail.latest.provenance.collectedAt)} · {detail.latest.estimatedSales === null ? '快照来源' : salesLabel(detail.latest)+'来源'}：{detail.latest.provenance.source}{detail.latest.provenance.isEstimated ? ' · 估算' : ''}{new Set(Object.values(detail.latest.metricProvenance ?? {}).map((source) => source.sourceRecordId)).size > 1 ? ' · 多来源指标' : ''}</footer>
             </section>
           </div>
         </>
@@ -615,6 +685,8 @@ export default function OwnedProductsPage() {
             ) : <Badge tone="neutral">Viewer 只读</Badge>}
           </div>
           {competitorError && !showCompetitorForm ? <p className="form-error" role="alert">{competitorError}</p> : null}
+          <CompetitorCandidateReview key={detail.id} productId={detail.id}
+            isViewer={settings.role !== 'admin'} onConfirmed={detailQuery.reload} />
           <CompetitorTable
             competitors={detail.competitors}
             currency={settings.currency}
@@ -624,6 +696,7 @@ export default function OwnedProductsPage() {
             focusCompetitorId={requestedCompetitorId ?? undefined}
             onReclassify={(competitor, relationType) => void reclassifyCompetitor(competitor, relationType)}
             onRemove={(competitor) => void removeCompetitor(competitor)}
+            onSync={(competitor) => void syncCompetitor(competitor)}
           />
         </>
       ) : null}

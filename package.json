@@ -14,9 +14,11 @@
     "test": "vitest run",
     "test:v2": "vitest run server/app.test.ts server/workflow-api.test.ts server/workflow-security.test.ts server/review-import-workflow.test.ts server/review-gap-evidence.test.ts server/versioned-assets.test.ts server/adapters/import-adapters.test.ts server/database/migrations.test.ts server/domain/research-job-state-machine.test.ts server/domain/snapshot-growth.test.ts server/domain/workflow-rule-engine.test.ts server/domain/reverse-review-engine.test.ts src/components/AIComposer.test.tsx src/components/ResearchApprovalPanel.test.tsx src/lib/researchJobMissingData.test.ts src/lib/reviewInput.test.ts",
     "test:watch": "vitest",
+    "acceptance:real": "tsx server/scripts/real-acceptance.ts",
     "db:reset": "tsx server/scripts/reset-db.ts"
   },
   "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.30.0",
     "clsx": "^2.1.1",
     "date-fns": "^4.1.0",
     "dotenv": "^17.2.2",
@@ -51,6 +53,6 @@
     "typescript": "~5.8.3",
     "typescript-eslint": "^8.42.0",
     "vite": "^7.1.4",
-    "vitest": "^3.2.4"
+    "vitest": "^4.1.11"
   }
 }

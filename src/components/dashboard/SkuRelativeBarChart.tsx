@@ -1,4 +1,5 @@
 import { useMemo } from 'react';
+import { Link } from 'react-router-dom';
 import {
   Bar,
   BarChart,
@@ -30,10 +31,27 @@ export interface SkuRelativeBarChartProps {
 }
 
 export function SkuRelativeBarChart({ items, onSelectSku }: SkuRelativeBarChartProps) {
-  const plotted = useMemo(() => items
-    .filter((item): item is SkuRelativePerformanceItem & { relativeDelta: number } => item.relativeDelta !== null && Number.isFinite(item.relativeDelta))
-    .sort((left, right) => right.relativeDelta - left.relativeDelta), [items]);
-  const pendingCount = items.length - plotted.length;
+  const comparable = useMemo(() => items
+    .filter((item): item is SkuRelativePerformanceItem & { relativeDelta: number } => item.relativeDelta !== null && Number.isFinite(item.relativeDelta)), [items]);
+  const isSummary = items.length >= 13;
+  const plotted = useMemo(() => {
+    const sorted = [...comparable].sort(compareByRelativeDeltaDescending);
+    if (!isSummary) return sorted;
+
+    const extremeItems = [
+      ...sorted.slice(0, 5),
+      ...[...comparable].sort(compareByRelativeDeltaAscending).slice(0, 5),
+    ];
+    const extremeIds = new Set(extremeItems.map((item) => item.id));
+    const additionalAttention = [...comparable]
+      .filter((item) => item.attention && !extremeIds.has(item.id))
+      .sort(compareByRelativeDeltaAscending)
+      .slice(0, 5);
+    const selectedIds = new Set([...extremeItems, ...additionalAttention].map((item) => item.id));
+
+    return sorted.filter((item) => selectedIds.has(item.id));
+  }, [comparable, isSummary]);
+  const pendingCount = items.length - comparable.length;
   const pending = items.filter((item) => item.relativeDelta === null || !Number.isFinite(item.relativeDelta));
 
   return (
@@ -41,7 +59,12 @@ export function SkuRelativeBarChart({ items, onSelectSku }: SkuRelativeBarChartP
       title="自有 SKU 相对市场表现"
       eyebrow="RELATIVE PERFORMANCE"
       description="SKU 30D 增长减去所属市场 30D 增长。"
-      footer={pendingCount ? <span className="dashboard-chart-note">{pendingCount} 个 SKU 因历史数据不足未参与比较</span> : null}
+      footer={pendingCount || isSummary ? (
+        <span className="dashboard-chart-note">
+          {pendingCount ? `${pendingCount} 个 SKU 因历史数据不足未参与比较` : null}
+          {isSummary ? <>{pendingCount ? '；' : null}{comparable.length ? '已显示相对表现最高和最低及最多 5 个重点监控 SKU，' : null}<Link to="/owned-products">查看完整产品组合</Link></> : null}
+        </span>
+      ) : null}
     >
       {plotted.length ? (
         <>
@@ -84,7 +107,7 @@ export function SkuRelativeBarChart({ items, onSelectSku }: SkuRelativeBarChartP
             ))}
           </div>
           <table className="dashboard-chart-data-table">
-            <caption>自有 SKU 相对市场表现完整数据</caption>
+            <caption>自有 SKU 相对市场表现{isSummary ? '摘要数据' : '完整数据'}</caption>
             <thead>
               <tr>
                 <th scope="col">SKU</th>
@@ -100,7 +123,7 @@ export function SkuRelativeBarChart({ items, onSelectSku }: SkuRelativeBarChartP
                   <td>{performanceMeta[item.performance].label}</td>
                 </tr>
               ))}
-              {pending.map((item) => (
+              {!isSummary && pending.map((item) => (
                 <tr key={item.id}>
                   <th scope="row">{item.name}</th>
                   <td>不可用</td>
@@ -115,4 +138,18 @@ export function SkuRelativeBarChart({ items, onSelectSku }: SkuRelativeBarChartP
       )}
     </ChartCard>
   );
+}
+
+function compareByRelativeDeltaDescending(
+  left: SkuRelativePerformanceItem & { relativeDelta: number },
+  right: SkuRelativePerformanceItem & { relativeDelta: number },
+): number {
+  return right.relativeDelta - left.relativeDelta || left.id.localeCompare(right.id);
+}
+
+function compareByRelativeDeltaAscending(
+  left: SkuRelativePerformanceItem & { relativeDelta: number },
+  right: SkuRelativePerformanceItem & { relativeDelta: number },
+): number {
+  return left.relativeDelta - right.relativeDelta || left.id.localeCompare(right.id);
 }

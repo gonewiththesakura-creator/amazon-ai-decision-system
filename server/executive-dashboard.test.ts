@@ -4,12 +4,14 @@ import request from 'supertest';
 import { afterEach, describe, expect, it } from 'vitest';
 import type {
   ExecutiveDashboardViewModel,
+  ExecutiveSkuPerformance,
+  OwnedProductSummary,
   ResearchJobDetail,
 } from '../shared/types.js';
 import { createApp } from './app.js';
 import { openDatabase, type AppDatabase } from './database/database.js';
 import { DashboardFreshnessService } from './services/dashboard-freshness-service.js';
-import { buildIndexedSeries, indexTrendSeries } from './services/executive-dashboard-service.js';
+import { buildIndexedSeries, indexTrendSeries, selectOverviewProducts } from './services/executive-dashboard-service.js';
 
 let database: AppDatabase | undefined;
 
@@ -25,6 +27,48 @@ function testApp(): Express {
 
 async function enableDemo(app: Express): Promise<void> {
   await request(app).post('/api/settings/demo').send({ enabled: true }).expect(200);
+}
+
+function configureActivePortfolio(total: number): void {
+  if (!database) throw new Error('Test database is not open.');
+  const existing = database.prepare(`
+    SELECT id FROM products WHERE marketplace = 'US' AND is_owned = 1 ORDER BY id
+  `).all() as unknown as Array<{ id: string }>;
+  database.prepare(`UPDATE products SET status = 'inactive' WHERE marketplace = 'US' AND is_owned = 1`).run();
+  const activate = database.prepare(`UPDATE products SET status = 'active' WHERE id = ?`);
+  existing.slice(0, total).forEach((row) => activate.run(row.id));
+
+  const insertProduct = database.prepare(`
+    INSERT INTO products (
+      id, asin, sku, internal_name, brand, title, image_url, marketplace, product_type,
+      is_owned, market_node_id, keywords_json, monitoring_enabled, source_type, created_at, status
+    ) VALUES (?, ?, ?, ?, 'Portfolio Brand', ?, '', 'US', 'memory_foam_pillow',
+      1, 'mkt-memory-foam', '[]', 1, 'import', '2026-09-10T00:00:00.000Z', 'active')
+  `);
+  const insertSnapshot = database.prepare(`
+    INSERT INTO product_snapshots (
+      id, product_id, date, price, rating, review_count, bsr, estimated_sales,
+      estimated_revenue, seller_count, growth_7d, growth_30d, growth_90d,
+      source, source_type, collected_at, period, is_estimated, confidence,
+      observation_date, dedup_key
+    ) VALUES (?, ?, ?, 39, 4.3, 500, 100, ?, ?, 1, NULL, NULL, NULL,
+      'Portfolio fixture', 'import', ?, '30D', 1, 0.9, ?, ?)
+  `);
+  for (let index = existing.length; index < total; index += 1) {
+    const suffix = String(index + 1).padStart(2, '0');
+    const productId = `portfolio-sku-${suffix}`;
+    insertProduct.run(productId, `B0PORT${suffix}`, `PORT-${suffix}`, `Portfolio SKU ${suffix}`, `Portfolio SKU ${suffix}`);
+    const baselineSales = 1_000;
+    const latestSales = index % 2 === 0 ? 1_500 + index : 650 - index;
+    insertSnapshot.run(
+      `${productId}-old`, productId, '2026-08-10', baselineSales, baselineSales * 39,
+      '2026-08-10T08:00:00.000Z', '2026-08-10', `${productId}|old`,
+    );
+    insertSnapshot.run(
+      `${productId}-new`, productId, '2026-09-09', latestSales, latestSales * 39,
+      '2026-09-09T08:00:00.000Z', '2026-09-09', `${productId}|new`,
+    );
+  }
 }
 
 function uShapedFixture(): Record<string, unknown> {
@@ -310,7 +354,164 @@ describe('executive dashboard indexing', () => {
   });
 });
 
+describe('executive dashboard portfolio selection', () => {
+  it('selects focus, attention, strongest, and weakest deterministically from 13 products', () => {
+    const definitions = [
+      ['focus', 0, false],
+      ['attention-b', -20, true],
+      ['attention-a', -20, true],
+      ['strong-b', 30, false],
+      ['strong-a', 30, false],
+      ['weak-b', -15, false],
+      ['weak-a', -15, false],
+      ['middle-a', 5, false],
+      ['middle-b', 4, false],
+      ['middle-c', 3, false],
+      ['middle-d', 2, false],
+      ['middle-e', 1, false],
+      ['unknown', null, false],
+    ] as const;
+    const owned = definitions.map(([id]) => ({ id } as unknown as OwnedProductSummary));
+    const performance = definitions.map(([id, relativeDelta, attention]) => ({
+      id, relativeDelta, attention,
+    } as unknown as ExecutiveSkuPerformance));
+    const select = () => selectOverviewProducts(owned, performance, 'focus').map((item) => item.id);
+
+    expect(select()).toEqual(['focus', 'attention-a', 'attention-b', 'strong-a', 'weak-a']);
+    expect(select()).toEqual(['focus', 'attention-a', 'attention-b', 'strong-a', 'weak-a']);
+  });
+
+  it('uses only explicitly selected SKU IDs in their supplied order', () => {
+    const owned = ['sku-a', 'sku-b', 'sku-c', 'sku-d', 'sku-e', 'sku-f']
+      .map((id) => ({ id } as unknown as OwnedProductSummary));
+    const performance = owned.map((product) => ({
+      id: product.id, relativeDelta: 0, attention: false,
+    } as unknown as ExecutiveSkuPerformance));
+
+    expect(selectOverviewProducts(owned, performance, undefined, ['sku-f', 'sku-b']))
+      .toEqual([owned[5], owned[1]]);
+  });
+
+  it('keeps every SKU in a five-or-fewer portfolio despite an explicit subset', () => {
+    const owned = ['sku-a', 'sku-b', 'sku-c', 'sku-d']
+      .map((id) => ({ id } as unknown as OwnedProductSummary));
+    const performance = owned.map((product) => ({
+      id: product.id, relativeDelta: 0, attention: false,
+    } as unknown as ExecutiveSkuPerformance));
+
+    expect(selectOverviewProducts(owned, performance, undefined, ['sku-d'])).toEqual(owned);
+  });
+});
+
 describe('GET /api/dashboard/executive', () => {
+  it.each([0, 1, 4, 5, 12, 50])(
+    'uses all %i active products for KPIs while limiting the overview to five owned series',
+    async (total) => {
+      const app = testApp();
+      await enableDemo(app);
+      configureActivePortfolio(total);
+
+      const dashboard = (await request(app).get('/api/dashboard/executive').expect(200))
+        .body.data as ExecutiveDashboardViewModel;
+      const ownedSeries = dashboard.trendComparison.filter((item) => item.kind === 'owned_sku');
+
+      expect(dashboard.kpis.totalSkus).toBe(total);
+      expect(dashboard.ownedSkuPerformance).toHaveLength(total);
+      expect(ownedSeries).toHaveLength(Math.min(total, 5));
+      expect(dashboard.trendComparison).toHaveLength(total === 0 ? 0 : Math.min(total, 5) + 1);
+      expect(dashboard.comparisonSkuIds).toHaveLength(Math.min(total, 5));
+      expect(new Set(ownedSeries.map((item) => item.id)).size).toBe(ownedSeries.length);
+    },
+  );
+
+  it('keeps an explicit focus SKU in the five-series overview selection', async () => {
+    const app = testApp();
+    await enableDemo(app);
+    configureActivePortfolio(12);
+
+    const dashboard = (await request(app)
+      .get('/api/dashboard/executive?skuId=portfolio-sku-12')
+      .expect(200)).body.data as ExecutiveDashboardViewModel;
+
+    expect(dashboard.trendComparison.filter((item) => item.kind === 'owned_sku')).toHaveLength(5);
+    expect(dashboard.trendComparison.map((item) => item.id)).toContain('sku:portfolio-sku-12');
+  });
+
+  it('uses the explicitly selected owned SKUs in request order after deduplicating IDs', async () => {
+    const app = testApp();
+    await enableDemo(app);
+    configureActivePortfolio(12);
+
+    const dashboard = (await request(app)
+      .get('/api/dashboard/executive?compareSkuIds=portfolio-sku-12,owned-sku-02,portfolio-sku-12')
+      .expect(200)).body.data as ExecutiveDashboardViewModel;
+
+    expect(dashboard.trendComparison.filter((item) => item.kind === 'owned_sku').map((item) => item.id))
+      .toEqual(['sku:portfolio-sku-12', 'sku:owned-sku-02']);
+    expect(dashboard.comparisonSkuIds).toEqual(['portfolio-sku-12', 'owned-sku-02']);
+  });
+
+  it('ignores an explicit comparison subset when five or fewer sellable SKUs are active', async () => {
+    const app = testApp();
+    await enableDemo(app);
+    configureActivePortfolio(4);
+
+    const dashboard = (await request(app)
+      .get('/api/dashboard/executive?compareSkuIds=owned-sku-01')
+      .expect(200)).body.data as ExecutiveDashboardViewModel;
+
+    expect(dashboard.comparisonSkuIds).toHaveLength(4);
+    expect(dashboard.comparisonSkuIds).toContain('owned-sku-01');
+    expect(dashboard.trendComparison.filter((item) => item.kind === 'owned_sku')).toHaveLength(4);
+  });
+
+  it('retains explicitly selected SKU IDs when a SKU is excluded for insufficient history', async () => {
+    const app = testApp();
+    await enableDemo(app);
+    configureActivePortfolio(12);
+    database!.prepare("DELETE FROM product_snapshots WHERE product_id = 'portfolio-sku-12'").run();
+
+    const dashboard = (await request(app)
+      .get('/api/dashboard/executive?compareSkuIds=portfolio-sku-12,owned-sku-02')
+      .expect(200)).body.data as ExecutiveDashboardViewModel;
+
+    expect(dashboard.comparisonSkuIds).toEqual(['portfolio-sku-12', 'owned-sku-02']);
+    expect(dashboard.trendComparison.map((series) => series.id)).not.toContain('sku:portfolio-sku-12');
+    expect(dashboard.trendComparisonMeta.excludedSeries.map((series) => series.id))
+      .toContain('sku:portfolio-sku-12');
+  });
+
+  it('rejects comparison selections beyond five and inactive or unknown owned SKUs', async () => {
+    const app = testApp();
+    await enableDemo(app);
+    configureActivePortfolio(12);
+    database!.prepare("UPDATE products SET status = 'inactive' WHERE id = 'portfolio-sku-03'").run();
+
+    await request(app).get('/api/dashboard/executive?compareSkuIds=portfolio-sku-01,portfolio-sku-02,portfolio-sku-04,portfolio-sku-05,portfolio-sku-06,portfolio-sku-07')
+      .expect(400);
+    await request(app).get('/api/dashboard/executive?compareSkuIds=portfolio-sku-03').expect(404);
+    await request(app).get('/api/dashboard/executive?compareSkuIds=missing-sku').expect(404);
+  });
+
+  it('excludes inactive products from current KPIs without deleting their historical snapshots', async () => {
+    const app = testApp();
+    await enableDemo(app);
+    const before = Number((database!.prepare(`
+      SELECT COUNT(*) AS count FROM product_snapshots WHERE product_id = 'owned-sku-01'
+    `).get() as { count: number }).count);
+    database!.prepare(`UPDATE products SET status = 'inactive' WHERE id = 'owned-sku-01'`).run();
+
+    const dashboard = (await request(app).get('/api/dashboard/executive').expect(200))
+      .body.data as ExecutiveDashboardViewModel;
+    const after = Number((database!.prepare(`
+      SELECT COUNT(*) AS count FROM product_snapshots WHERE product_id = 'owned-sku-01'
+    `).get() as { count: number }).count);
+
+    expect(dashboard.kpis.totalSkus).toBe(3);
+    expect(dashboard.ownedSkuPerformance.map((item) => item.id)).not.toContain('owned-sku-01');
+    expect(after).toBe(before);
+  });
+
   it('returns an explicit unconfigured state when no primary market exists', async () => {
     const app = testApp();
 
@@ -542,13 +743,13 @@ describe('GET /api/dashboard/executive', () => {
         id, market_node_id, date, product_count, seller_count, brand_count, monthly_sales,
         monthly_revenue, avg_price, median_price, avg_rating, median_reviews, top10_share,
         top20_share, new_product_share, price_bands_json, concentration_json, source,
-        source_type, collected_at, period, is_estimated, confidence
+        source_type, collected_at, period, is_estimated, confidence, observation_date, dedup_key
       )
       SELECT 'market-recovery-snapshot', market_node_id, date, product_count, seller_count,
         brand_count, monthly_sales, monthly_revenue, avg_price, median_price, avg_rating,
         median_reviews, top10_share, top20_share, new_product_share, price_bands_json,
         concentration_json, source, source_type, '2026-09-09T11:02:00+08:00',
-        period, is_estimated, confidence
+        period, is_estimated, confidence, date, 'market-recovery-snapshot'
       FROM market_snapshots WHERE market_node_id = 'mkt-memory-foam'
       ORDER BY date(date) DESC, rowid DESC LIMIT 1
     `).run();
@@ -581,12 +782,12 @@ describe('GET /api/dashboard/executive', () => {
       INSERT INTO product_snapshots (
         id, product_id, date, price, rating, review_count, bsr, estimated_sales,
         estimated_revenue, seller_count, growth_7d, growth_30d, growth_90d, source,
-        source_type, collected_at, period, is_estimated, confidence
+        source_type, collected_at, period, is_estimated, confidence, observation_date, dedup_key
       )
       SELECT 'competitor-product-recovered', product_id, date, price, rating, review_count,
         bsr, estimated_sales, estimated_revenue, seller_count, growth_7d, growth_30d,
         growth_90d, source, source_type, '2026-09-09T10:22:00+08:00', period,
-        is_estimated, confidence
+        is_estimated, confidence, date, 'competitor-product-recovered'
       FROM product_snapshots WHERE product_id = 'competitor-03'
       ORDER BY date(date) DESC, julianday(collected_at) DESC, rowid DESC LIMIT 1
     `).run();
@@ -617,13 +818,13 @@ describe('GET /api/dashboard/executive', () => {
         id, market_node_id, date, product_count, seller_count, brand_count, monthly_sales,
         monthly_revenue, avg_price, median_price, avg_rating, median_reviews, top10_share,
         top20_share, new_product_share, price_bands_json, concentration_json, source,
-        source_type, collected_at, period, is_estimated, confidence
+        source_type, collected_at, period, is_estimated, confidence, observation_date, dedup_key
       )
       SELECT 'core-batch-market-recovered', market_node_id, date, product_count, seller_count,
         brand_count, monthly_sales, monthly_revenue, avg_price, median_price, avg_rating,
         median_reviews, top10_share, top20_share, new_product_share, price_bands_json,
         concentration_json, source, source_type, '2026-09-09T10:22:00+08:00',
-        period, is_estimated, confidence
+        period, is_estimated, confidence, date, 'core-batch-market-recovered'
       FROM market_snapshots WHERE market_node_id = 'mkt-memory-foam'
       ORDER BY date(date) DESC, julianday(collected_at) DESC, rowid DESC LIMIT 1
     `).run();
@@ -658,12 +859,12 @@ describe('GET /api/dashboard/executive', () => {
       INSERT INTO product_snapshots (
         id, product_id, date, price, rating, review_count, bsr, estimated_sales,
         estimated_revenue, seller_count, growth_7d, growth_30d, growth_90d, source,
-        source_type, collected_at, period, is_estimated, confidence
+        source_type, collected_at, period, is_estimated, confidence, observation_date, dedup_key
       )
       SELECT 'core-batch-recovered-' || product_id, product_id, date, price, rating,
         review_count, bsr, estimated_sales, estimated_revenue, seller_count, growth_7d,
         growth_30d, growth_90d, source, source_type, '2026-09-09T10:23:00+08:00',
-        period, is_estimated, confidence
+        period, is_estimated, confidence, date, 'core-batch-recovered|' || product_id
       FROM ranked WHERE snapshot_rank = 1
     `).run();
 
@@ -690,13 +891,13 @@ describe('GET /api/dashboard/executive', () => {
         id, market_node_id, date, product_count, seller_count, brand_count, monthly_sales,
         monthly_revenue, avg_price, median_price, avg_rating, median_reviews, top10_share,
         top20_share, new_product_share, price_bands_json, concentration_json, source,
-        source_type, collected_at, period, is_estimated, confidence
+        source_type, collected_at, period, is_estimated, confidence, observation_date, dedup_key
       )
       SELECT 'invalid-market-clock', market_node_id, '2099-01-01', product_count, seller_count,
         brand_count, monthly_sales, monthly_revenue, avg_price, median_price, avg_rating,
         median_reviews, top10_share, top20_share, new_product_share, price_bands_json,
         concentration_json, source, source_type, 'not-a-timestamp', period, is_estimated,
-        confidence
+        confidence, '2099-01-01', 'invalid-market-clock'
       FROM market_snapshots WHERE market_node_id = 'mkt-memory-foam'
       ORDER BY date(date) DESC, rowid DESC LIMIT 1
     `).run();
@@ -709,13 +910,14 @@ describe('GET /api/dashboard/executive', () => {
         id, market_node_id, date, product_count, seller_count, brand_count, monthly_sales,
         monthly_revenue, avg_price, median_price, avg_rating, median_reviews, top10_share,
         top20_share, new_product_share, price_bands_json, concentration_json, source,
-        source_type, collected_at, period, is_estimated, confidence
+        source_type, collected_at, period, is_estimated, confidence, observation_date, dedup_key
       )
       SELECT 'valid-later-market-clock', market_node_id, '2026-08-01', product_count,
         seller_count, brand_count, monthly_sales, monthly_revenue, avg_price, median_price,
         avg_rating, median_reviews, top10_share, top20_share, new_product_share,
         price_bands_json, concentration_json, source, source_type,
-        '2026-09-09T10:25:00+08:00', period, is_estimated, confidence
+        '2026-09-09T10:25:00+08:00', period, is_estimated, confidence,
+        '2026-08-01', 'valid-later-market-clock'
       FROM market_snapshots WHERE market_node_id = 'mkt-memory-foam'
       ORDER BY date(date) DESC, julianday(collected_at) DESC, rowid DESC LIMIT 1
     `).run();
@@ -732,13 +934,13 @@ describe('GET /api/dashboard/executive', () => {
         id, market_node_id, date, product_count, seller_count, brand_count, monthly_sales,
         monthly_revenue, avg_price, median_price, avg_rating, median_reviews, top10_share,
         top20_share, new_product_share, price_bands_json, concentration_json, source,
-        source_type, collected_at, period, is_estimated, confidence
+        source_type, collected_at, period, is_estimated, confidence, observation_date, dedup_key
       )
       SELECT 'stale-skew-market', market_node_id, date, product_count, seller_count,
         brand_count, monthly_sales, monthly_revenue, avg_price, median_price, avg_rating,
         median_reviews, top10_share, top20_share, new_product_share, price_bands_json,
         concentration_json, source, source_type, '2026-09-11T10:20:00+08:00',
-        period, is_estimated, confidence
+        period, is_estimated, confidence, date, 'stale-skew-market'
       FROM market_snapshots WHERE market_node_id = 'mkt-memory-foam'
       ORDER BY date(date) DESC, julianday(collected_at) DESC, rowid DESC LIMIT 1
     `).run();
@@ -761,12 +963,12 @@ describe('GET /api/dashboard/executive', () => {
       INSERT INTO product_snapshots (
         id, product_id, date, price, rating, review_count, bsr, estimated_sales,
         estimated_revenue, seller_count, growth_7d, growth_30d, growth_90d, source,
-        source_type, collected_at, period, is_estimated, confidence
+        source_type, collected_at, period, is_estimated, confidence, observation_date, dedup_key
       )
       SELECT 'freshness-owned-sku-01', product_id, '2026-09-10', price, rating,
         review_count, bsr, estimated_sales, estimated_revenue, seller_count, growth_7d,
         growth_30d, growth_90d, source, source_type, '2026-09-10T09:00:00+08:00',
-        period, is_estimated, confidence
+        period, is_estimated, confidence, '2026-09-10', 'freshness-owned-sku-01'
       FROM product_snapshots
       WHERE product_id = 'owned-sku-01'
       ORDER BY date(date) DESC, rowid DESC LIMIT 1
